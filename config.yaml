@@ -1,0 +1,42 @@
+server:
+  port: 8080
+  read_timeout: 30s
+  write_timeout: 60s
+
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+    base_url: https://api.openai.com/v1
+    timeout: 30s
+    models:
+      - gpt-4o
+      - gpt-4o-mini
+  anthropic:
+    api_key: ${ANTHROPIC_API_KEY}
+    base_url: https://api.anthropic.com
+    timeout: 30s
+    models:
+      - claude-opus-4-8
+      - claude-sonnet-4-6
+      - claude-haiku-4-5-20251001
+  gemini:
+    api_key: ${GEMINI_API_KEY}
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    timeout: 30s
+    models:
+      - gemini-2.5-flash
+      - gemini-2.5-pro
+
+fallback_chain:
+  - openai
+  - anthropic
+  - gemini
+
+rate_limit:
+  enabled: true
+  requests_per_minute: 60
+  burst: 10
+
+logging:
+  level: info
+  format: json
