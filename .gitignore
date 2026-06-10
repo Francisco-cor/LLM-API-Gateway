@@ -4,3 +4,8 @@ bin/
 .env.*
 !.env.example
 config.local.yaml
+
+# Local handoff/pending notes and Claude Code project files
+HANDOFF.md
+PENDING.md
+.claude/
