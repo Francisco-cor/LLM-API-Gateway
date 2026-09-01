@@ -61,13 +61,23 @@ func TestHandler_ChatCompletions(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
-			name:   "unknown model returns 502",
+			name:   "unknown model returns 404",
 			method: http.MethodPost,
 			body: map[string]any{
 				"model":    "llama-3-70b",
 				"messages": []map[string]string{{"role": "user", "content": "hi"}},
 			},
-			wantStatus: http.StatusBadGateway,
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:   "stream true is now handled (not rejected as 400)",
+			method: http.MethodPost,
+			body: map[string]any{
+				"model":    "gpt-4o",
+				"messages": []map[string]string{{"role": "user", "content": "hi"}},
+				"stream":   true,
+			},
+			wantStatus: http.StatusOK,
 		},
 	}
 
