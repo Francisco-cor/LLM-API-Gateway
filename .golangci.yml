@@ -1,0 +1,33 @@
+version: "2"
+run:
+  timeout: 3m
+  go: "1.23"
+
+linters:
+  default: standard
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - ineffassign
+    - misspell
+    - importas
+    - gocritic
+    - gosec
+  settings:
+    govet:
+      enable:
+        - shadow
+    errcheck:
+      check-type-assertions: false
+      check-blank: false
+
+exclusions:
+  rules:
+    - linters: [gosec]
+      path: tests/.*\.go
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

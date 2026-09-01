@@ -35,7 +35,7 @@ func NewRegistry(providers []provider.Provider) *Registry {
 func (r *Registry) Resolve(model string) (provider.Provider, error) {
 	p, ok := r.byModel[model]
 	if !ok {
-		return nil, fmt.Errorf("no provider configured for model %q", model)
+		return nil, fmt.Errorf("%w: model %q", provider.ErrNoProvider, model)
 	}
 	return p, nil
 }

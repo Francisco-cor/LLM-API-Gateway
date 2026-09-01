@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -117,6 +119,105 @@ func (g *Gemini) Send(ctx context.Context, req ChatRequest) (ChatResponse, error
 		return ChatResponse{}, fmt.Errorf("parse response: %w", err)
 	}
 	return translateFromGemini(native, req.Model), nil
+}
+
+func (g *Gemini) SendStream(ctx context.Context, req ChatRequest) (<-chan StreamChunk, <-chan error) {
+	ch := make(chan StreamChunk, 16)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(ch)
+		defer close(errCh)
+
+		body, err := json.Marshal(translateToGemini(req))
+		if err != nil {
+			errCh <- fmt.Errorf("marshal request: %w", err)
+			return
+		}
+		endpoint := fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse&key=%s", g.baseURL, req.Model, url.QueryEscape(g.apiKey))
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			errCh <- fmt.Errorf("build request: %w", err)
+			return
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+
+		resp, err := g.client.Do(httpReq)
+		if err != nil {
+			errCh <- &ProviderError{ProviderName: g.Name(), Message: err.Error(), Retryable: true}
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			data, _ := io.ReadAll(resp.Body)
+			errCh <- &ProviderError{
+				ProviderName: g.Name(),
+				StatusCode:   resp.StatusCode,
+				Message:      geminiErrorMessage(data),
+				Retryable:    resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500,
+			}
+			return
+		}
+
+		scanner := bufio.NewScanner(resp.Body)
+		buf := make([]byte, 0, 4096)
+		scanner.Buffer(buf, 1<<20)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if payload == "" {
+				continue
+			}
+			var native geminiResponse
+			if err := json.Unmarshal([]byte(payload), &native); err != nil {
+				continue
+			}
+			if len(native.Candidates) == 0 || len(native.Candidates[0].Content.Parts) == 0 {
+				continue
+			}
+			text := native.Candidates[0].Content.Parts[0].Text
+			chunk := StreamChunk{
+				ID:      "chatcmpl-gemini",
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   req.Model,
+				Choices: []StreamChoice{{
+					Index: 0,
+					Delta: ChatMessage{Role: "assistant", Content: text},
+				}},
+			}
+			// Map finishReason if present
+			if native.Candidates[0].FinishReason == "STOP" || native.Candidates[0].FinishReason == "MAX_TOKENS" {
+				fr := "stop"
+				if native.Candidates[0].FinishReason == "MAX_TOKENS" {
+					fr = "length"
+				}
+				chunk.Choices[0].FinishReason = &fr
+			}
+			select {
+			case ch <- chunk:
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			}
+			if chunk.Choices[0].FinishReason != nil {
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil && err != io.EOF {
+			errCh <- err
+		}
+	}()
+
+	return ch, errCh
 }
 
 func (g *Gemini) HealthCheck(ctx context.Context) error {

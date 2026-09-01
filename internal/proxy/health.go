@@ -4,12 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sync"
 	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // healthCheckTimeout bounds how long GET /health/providers waits for all
 // providers to respond.
 const healthCheckTimeout = 10 * time.Second
+
+// perProviderTimeout bounds each individual provider health check.
+const perProviderTimeout = 3 * time.Second
 
 // HealthHandler serves GET /health, a liveness probe for the gateway itself.
 type HealthHandler struct{}
@@ -43,15 +49,47 @@ func (h *HealthProvidersHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	ctx, cancel := context.WithTimeout(r.Context(), healthCheckTimeout)
 	defer cancel()
 
+	var mu sync.Mutex
 	results := make(map[string]providerStatus)
+
+	g, ctx := errgroup.WithContext(ctx)
 	for _, p := range h.registry.All() {
-		if err := p.HealthCheck(ctx); err != nil {
-			results[p.Name()] = providerStatus{Status: "unhealthy", Error: err.Error()}
-		} else {
-			results[p.Name()] = providerStatus{Status: "healthy"}
+		p := p
+		g.Go(func() error {
+			pCtx, pCancel := context.WithTimeout(ctx, perProviderTimeout)
+			defer pCancel()
+			err := p.HealthCheck(pCtx)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				results[p.Name()] = providerStatus{Status: "unhealthy", Error: err.Error()}
+			} else {
+				results[p.Name()] = providerStatus{Status: "healthy"}
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	// Determine overall status
+	overall := "healthy"
+	for _, v := range results {
+		if v.Status != "healthy" {
+			overall = "degraded"
+			break
 		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
+	// Backwards compat: top-level map with per-provider keys plus "overall" if degraded
+	if overall == "degraded" {
+		out := make(map[string]any, len(results)+1)
+		for k, v := range results {
+			out[k] = v
+		}
+		out["overall"] = overall
+		_ = json.NewEncoder(w).Encode(out)
+		return
+	}
 	_ = json.NewEncoder(w).Encode(results)
 }

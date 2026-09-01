@@ -27,4 +27,12 @@ func (m *mockProvider) Send(_ context.Context, _ provider.ChatRequest) (provider
 	return m.resp, nil
 }
 
+func (m *mockProvider) SendStream(_ context.Context, _ provider.ChatRequest) (<-chan provider.StreamChunk, <-chan error) {
+	ch := make(chan provider.StreamChunk)
+	errCh := make(chan error)
+	close(ch)
+	close(errCh)
+	return ch, errCh
+}
+
 func (m *mockProvider) HealthCheck(_ context.Context) error { return nil }

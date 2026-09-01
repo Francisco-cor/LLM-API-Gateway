@@ -1,12 +1,14 @@
 package provider
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -118,6 +120,114 @@ func (a *Anthropic) Send(ctx context.Context, req ChatRequest) (ChatResponse, er
 		return ChatResponse{}, fmt.Errorf("parse response: %w", err)
 	}
 	return translateFromAnthropic(native), nil
+}
+
+func (a *Anthropic) SendStream(ctx context.Context, req ChatRequest) (<-chan StreamChunk, <-chan error) {
+	ch := make(chan StreamChunk, 16)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(ch)
+		defer close(errCh)
+
+		native := translateToAnthropic(req)
+		// enable streaming via native field
+		type streamReq struct {
+			anthropicRequest
+			Stream bool `json:"stream"`
+		}
+		sr := streamReq{anthropicRequest: native, Stream: true}
+		body, err := json.Marshal(sr)
+		if err != nil {
+			errCh <- fmt.Errorf("marshal request: %w", err)
+			return
+		}
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/v1/messages", bytes.NewReader(body))
+		if err != nil {
+			errCh <- fmt.Errorf("build request: %w", err)
+			return
+		}
+		httpReq.Header.Set("x-api-key", a.apiKey)
+		httpReq.Header.Set("anthropic-version", anthropicVersion)
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+
+		resp, err := a.client.Do(httpReq)
+		if err != nil {
+			errCh <- &ProviderError{ProviderName: a.Name(), Message: err.Error(), Retryable: true}
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			data, _ := io.ReadAll(resp.Body)
+			errCh <- &ProviderError{
+				ProviderName: a.Name(),
+				StatusCode:   resp.StatusCode,
+				Message:      anthropicErrorMessage(data),
+				Retryable:    resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500,
+			}
+			return
+		}
+
+		scanner := bufio.NewScanner(resp.Body)
+		buf := make([]byte, 0, 4096)
+		scanner.Buffer(buf, 1<<20)
+		var currentEvent string
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "event:") {
+				currentEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+				continue
+			}
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if payload == "" {
+				continue
+			}
+			switch currentEvent {
+			case "content_block_delta":
+				var evt struct {
+					Delta struct {
+						Text string `json:"text"`
+					} `json:"delta"`
+					Index int `json:"index"`
+				}
+				if err := json.Unmarshal([]byte(payload), &evt); err != nil {
+					continue
+				}
+				delta := evt.Delta.Text
+				if delta == "" {
+					continue
+				}
+				chunk := StreamChunk{
+					ID:      "chatcmpl-anthropic",
+					Object:  "chat.completion.chunk",
+					Created: time.Now().Unix(),
+					Model:   req.Model,
+					Choices: []StreamChoice{{
+						Index: 0,
+						Delta: ChatMessage{Role: "assistant", Content: delta},
+					}},
+				}
+				select {
+				case ch <- chunk:
+				case <-ctx.Done():
+					errCh <- ctx.Err()
+					return
+				}
+			case "message_stop":
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil && err != io.EOF {
+			errCh <- err
+		}
+	}()
+
+	return ch, errCh
 }
 
 func (a *Anthropic) HealthCheck(ctx context.Context) error {

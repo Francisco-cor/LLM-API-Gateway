@@ -2,13 +2,31 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
+
+// StreamChunk is an OpenAI-compatible SSE chunk.
+type StreamChunk struct {
+	ID      string         `json:"id"`
+	Object  string         `json:"object"`
+	Created int64          `json:"created"`
+	Model   string         `json:"model"`
+	Choices []StreamChoice `json:"choices"`
+	Usage   *Usage         `json:"usage,omitempty"`
+}
+
+type StreamChoice struct {
+	Index        int         `json:"index"`
+	Delta        ChatMessage `json:"delta"`
+	FinishReason *string     `json:"finish_reason"`
+}
 
 // Provider is the contract every LLM backend must implement.
 type Provider interface {
 	Name() string
 	Send(ctx context.Context, req ChatRequest) (ChatResponse, error)
+	SendStream(ctx context.Context, req ChatRequest) (<-chan StreamChunk, <-chan error)
 	Models() []string
 	HealthCheck(ctx context.Context) error
 }
@@ -22,11 +40,39 @@ type ChatMessage struct {
 // ChatRequest is the normalized request format accepted by the gateway and
 // translated to each provider's native format.
 type ChatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []ChatMessage `json:"messages"`
-	Temperature *float64      `json:"temperature,omitempty"`
-	MaxTokens   *int          `json:"max_tokens,omitempty"`
-	Stream      bool          `json:"stream,omitempty"`
+	Model          string         `json:"model"`
+	Messages       []ChatMessage  `json:"messages"`
+	Temperature    *float64       `json:"temperature,omitempty"`
+	MaxTokens      *int           `json:"max_tokens,omitempty"`
+	Stream         bool           `json:"stream,omitempty"`
+	Tools          []Tool         `json:"tools,omitempty"`
+	ToolChoice     any            `json:"tool_choice,omitempty"`
+	ResponseFormat *ResponseFormat `json:"response_format,omitempty"`
+	Stop           any            `json:"stop,omitempty"`
+	N              *int           `json:"n,omitempty"`
+	StreamOptions  *StreamOptions `json:"stream_options,omitempty"`
+}
+
+// Tool is OpenAI-compatible tool definition (passthrough).
+type Tool struct {
+	Type     string   `json:"type"`
+	Function ToolFunc `json:"function"`
+}
+
+type ToolFunc struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Parameters  any    `json:"parameters,omitempty"`
+}
+
+// ResponseFormat controls output formatting.
+type ResponseFormat struct {
+	Type string `json:"type"` // "text" | "json_object" | "json_schema"
+}
+
+// StreamOptions mirrors OpenAI stream_options.
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage,omitempty"`
 }
 
 // ChatResponse is the normalized OpenAI-compatible response returned to clients.
@@ -65,6 +111,9 @@ type ErrorResponse struct {
 	Error Error `json:"error"`
 }
 
+// ErrNoProvider is returned when no provider is configured for a model.
+var ErrNoProvider = fmt.Errorf("no provider configured")
+
 // ProviderError carries provider-specific error context, including whether
 // the gateway should attempt a fallback provider.
 type ProviderError struct {
@@ -84,4 +133,9 @@ func IsRetryable(err error) bool {
 		return pe.Retryable
 	}
 	return false
+}
+
+// IsNoProvider reports whether err indicates an unknown model.
+func IsNoProvider(err error) bool {
+	return errors.Is(err, ErrNoProvider)
 }

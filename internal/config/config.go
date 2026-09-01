@@ -14,6 +14,8 @@ type Config struct {
 	FallbackChain []string                  `yaml:"fallback_chain"`
 	RateLimit     RateLimitConfig           `yaml:"rate_limit"`
 	Logging       LoggingConfig             `yaml:"logging"`
+	CORS          CORSConfig                `yaml:"cors"`
+	Auth          AuthConfig                `yaml:"auth"`
 }
 
 type ServerConfig struct {
@@ -40,6 +42,22 @@ type LoggingConfig struct {
 	Format string `yaml:"format"`
 }
 
+type CORSConfig struct {
+	AllowedOrigins []string `yaml:"allowed_origins"`
+}
+
+type AuthConfig struct {
+	Enabled bool           `yaml:"enabled"`
+	Keys    []APIKeyConfig `yaml:"keys"`
+}
+
+type APIKeyConfig struct {
+	Key       string     `yaml:"key"`
+	Tenant    string     `yaml:"tenant"`
+	Scopes    []string   `yaml:"scopes"`
+	ExpiresAt *time.Time `yaml:"expires_at"`
+}
+
 func Load(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -56,7 +74,79 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
 	setDefaults(&cfg)
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
 	return &cfg, nil
+}
+
+func (c *Config) Validate() error {
+	if c.Server.Port < 1 || c.Server.Port > 65535 {
+		return fmt.Errorf("server.port must be between 1 and 65535, got %d", c.Server.Port)
+	}
+	if c.Server.ReadTimeout <= 0 {
+		return fmt.Errorf("server.read_timeout must be > 0")
+	}
+	if c.Server.WriteTimeout <= 0 {
+		return fmt.Errorf("server.write_timeout must be > 0")
+	}
+	allowedLevels := map[string]bool{"debug": true, "info": true, "warn": true, "error": true}
+	if c.Logging.Level != "" && !allowedLevels[c.Logging.Level] {
+		return fmt.Errorf("logging.level must be one of debug/info/warn/error, got %q", c.Logging.Level)
+	}
+	if c.Logging.Format != "" && c.Logging.Format != "json" && c.Logging.Format != "text" {
+		return fmt.Errorf("logging.format must be json or text, got %q", c.Logging.Format)
+	}
+	if c.RateLimit.RequestsPerMinute < 0 {
+		return fmt.Errorf("rate_limit.requests_per_minute must be >= 0")
+	}
+	if c.RateLimit.Burst < 0 {
+		return fmt.Errorf("rate_limit.burst must be >= 0")
+	}
+	if c.RateLimit.Enabled && c.RateLimit.RequestsPerMinute == 0 {
+		return fmt.Errorf("rate_limit.requests_per_minute must be > 0 when enabled")
+	}
+	if c.RateLimit.Enabled && c.RateLimit.Burst == 0 {
+		return fmt.Errorf("rate_limit.burst must be > 0 when enabled")
+	}
+	// Providers validation — APIKey may be empty or unexpanded "${...}" (treated as disabled, not an error)
+	if len(c.Providers) == 0 {
+		return fmt.Errorf("at least one provider must be configured")
+	}
+	for name, p := range c.Providers {
+		isDisabled := p.APIKey == "" || (len(p.APIKey) > 3 && p.APIKey[:2] == "${")
+		if p.BaseURL == "" && !isDisabled {
+			return fmt.Errorf("providers.%s.base_url is required", name)
+		}
+		if p.Timeout <= 0 {
+			return fmt.Errorf("providers.%s.timeout must be > 0", name)
+		}
+		if len(p.Models) == 0 {
+			return fmt.Errorf("providers.%s.models must be non-empty", name)
+		}
+	}
+	// fallback_chain must reference known providers
+	for _, name := range c.FallbackChain {
+		if _, ok := c.Providers[name]; !ok {
+			return fmt.Errorf("fallback_chain references unknown provider %q", name)
+		}
+	}
+	// auth validation
+	if c.Auth.Enabled && len(c.Auth.Keys) == 0 {
+		return fmt.Errorf("auth.enabled is true but no keys configured")
+	}
+	for i, k := range c.Auth.Keys {
+		if k.Key == "" || (len(k.Key) > 3 && k.Key[:2] == "${") {
+			// unexpanded env var — treat as missing but error if auth enabled and key empty
+			if c.Auth.Enabled {
+				return fmt.Errorf("auth.keys[%d].key is required", i)
+			}
+		}
+		if k.ExpiresAt != nil && k.ExpiresAt.IsZero() {
+			return fmt.Errorf("auth.keys[%d].expires_at is invalid", i)
+		}
+	}
+	return nil
 }
 
 func setDefaults(cfg *Config) {
@@ -80,5 +170,11 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.RateLimit.Burst == 0 {
 		cfg.RateLimit.Burst = 10
+	}
+	if cfg.Logging.Level == "" {
+		cfg.Logging.Level = "info"
+	}
+	if cfg.Logging.Format == "" {
+		cfg.Logging.Format = "json"
 	}
 }

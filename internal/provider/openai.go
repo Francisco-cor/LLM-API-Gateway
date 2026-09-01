@@ -1,12 +1,14 @@
 package provider
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -75,6 +77,83 @@ func (o *OpenAI) Send(ctx context.Context, req ChatRequest) (ChatResponse, error
 		return ChatResponse{}, fmt.Errorf("parse response: %w", err)
 	}
 	return result, nil
+}
+
+func (o *OpenAI) SendStream(ctx context.Context, req ChatRequest) (<-chan StreamChunk, <-chan error) {
+	ch := make(chan StreamChunk, 16)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(ch)
+		defer close(errCh)
+
+		req.Stream = true
+		body, err := json.Marshal(req)
+		if err != nil {
+			errCh <- fmt.Errorf("marshal request: %w", err)
+			return
+		}
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, o.baseURL+"/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			errCh <- fmt.Errorf("build request: %w", err)
+			return
+		}
+		httpReq.Header.Set("Authorization", "Bearer "+o.apiKey)
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Accept", "text/event-stream")
+
+		resp, err := o.client.Do(httpReq)
+		if err != nil {
+			errCh <- &ProviderError{ProviderName: o.Name(), Message: err.Error(), Retryable: true}
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			data, _ := io.ReadAll(resp.Body)
+			errCh <- &ProviderError{
+				ProviderName: o.Name(),
+				StatusCode:   resp.StatusCode,
+				Message:      string(data),
+				Retryable:    resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500,
+			}
+			return
+		}
+
+		scanner := bufio.NewScanner(resp.Body)
+		// increase buffer for large chunks
+		buf := make([]byte, 0, 4096)
+		scanner.Buffer(buf, 1<<20)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			if !strings.HasPrefix(line, "data:") {
+				continue
+			}
+			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if payload == "[DONE]" {
+				return
+			}
+			var chunk StreamChunk
+			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+				// skip malformed chunk, log via errCh but continue
+				continue
+			}
+			select {
+			case ch <- chunk:
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil && err != io.EOF {
+			errCh <- err
+		}
+	}()
+
+	return ch, errCh
 }
 
 func (o *OpenAI) HealthCheck(ctx context.Context) error {

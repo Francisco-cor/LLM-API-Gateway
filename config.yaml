@@ -37,6 +37,18 @@ rate_limit:
   requests_per_minute: 60
   burst: 10
 
+cors:
+  allowed_origins: [] # e.g. ["https://app.example.com", "*"]
+
+auth:
+  enabled: false
+  keys:
+    # Example: uncomment and set GATEWAY_API_KEY or add more tenants
+    # - key: ${GATEWAY_API_KEY}
+    #   tenant: default
+    #   scopes: ["chat:write", "models:read"]
+    #   expires_at: 2027-01-01T00:00:00Z
+
 logging:
   level: info
   format: json

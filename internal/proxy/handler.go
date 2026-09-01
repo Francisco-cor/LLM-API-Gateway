@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -25,16 +27,25 @@ func NewHandler(registry *Registry, fallbackChain []string, log *slog.Logger) *H
 	return &Handler{registry: registry, fallbackChain: fallbackChain, log: log}
 }
 
+const maxBodySize = 1 << 20 // 1 MiB
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		if err.Error() == "http: request body too large" {
+			writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large (max 1MiB)")
+			return
+		}
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "cannot read request body")
 		return
 	}
 
 	var req provider.ChatRequest
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON body")
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON body: "+err.Error())
 		return
 	}
 	if req.Model == "" {
@@ -47,9 +58,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestID := r.Header.Get("X-Request-ID")
+	ctx := r.Context()
 
-	resp, providerName, err := h.dispatch(r.Context(), req, requestID)
+	if req.Stream {
+		h.handleStream(w, r, req, requestID, ctx)
+		return
+	}
+
+	resp, providerName, err := h.dispatch(ctx, req, requestID)
 	if err != nil {
+		if errors.Is(err, provider.ErrNoProvider) {
+			h.log.Warn("unknown model",
+				"model", req.Model,
+				"request_id", requestID,
+				"error", err,
+			)
+			writeError(w, http.StatusNotFound, "model_not_found", err.Error())
+			return
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			writeError(w, http.StatusGatewayTimeout, "provider_error", "request timed out")
+			return
+		}
 		h.log.Error("dispatch failed",
 			"model", req.Model,
 			"request_id", requestID,
@@ -68,7 +98,74 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Gateway-Provider", providerName)
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req provider.ChatRequest, requestID string, ctx context.Context) {
+	primary, err := h.registry.Resolve(req.Model)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "model_not_found", err.Error())
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "server_error", "streaming not supported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Gateway-Provider", primary.Name())
+	w.WriteHeader(http.StatusOK)
+
+	ch, errCh := primary.SendStream(ctx, req)
+
+	enc := json.NewEncoder(w)
+	_ = enc
+
+	for {
+		select {
+		case chunk, ok := <-ch:
+			if !ok {
+				ch = nil
+				// check errCh before closing
+				select {
+				case err := <-errCh:
+					if err != nil {
+						h.log.Error("stream error", "provider", primary.Name(), "request_id", requestID, "error", err)
+					}
+				default:
+				}
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+				flusher.Flush()
+				h.log.Info("stream completed", "model", req.Model, "provider", primary.Name(), "request_id", requestID)
+				return
+			}
+			data, _ := json.Marshal(chunk)
+			_, _ = w.Write([]byte("data: "))
+			_, _ = w.Write(data)
+			_, _ = w.Write([]byte("\n\n"))
+			flusher.Flush()
+		case err := <-errCh:
+			if err != nil {
+				if provider.IsRetryable(err) {
+					h.log.Warn("stream primary failed, fallback not yet implemented for streams", "provider", primary.Name(), "request_id", requestID, "error", err)
+				}
+				h.log.Error("stream provider error", "provider", primary.Name(), "request_id", requestID, "error", err)
+			}
+			errCh = nil
+		case <-ctx.Done():
+			return
+		}
+		if ch == nil && errCh == nil {
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			flusher.Flush()
+			return
+		}
+	}
 }
 
 // dispatch sends req to the provider that owns req.Model. If that provider

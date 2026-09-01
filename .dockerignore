@@ -1,0 +1,13 @@
+bin/
+.git/
+.gitignore
+.env
+.env.*
+*.md
+!README.md
+tests/
+.github/
+.claude/
+HANDOFF.md
+PENDING.md
+PLAN.md

@@ -57,6 +57,46 @@ func Logging(log *slog.Logger, next http.Handler) http.Handler {
 	})
 }
 
+// SecurityHeaders adds baseline security headers.
+func SecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// CORS returns middleware that handles CORS headers. If allowedOrigins is empty, CORS is disabled.
+func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
+	allowed := make(map[string]bool, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		allowed[o] = true
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if len(allowedOrigins) == 0 {
+				next.ServeHTTP(w, r)
+				return
+			}
+			origin := r.Header.Get("Origin")
+			if allowed["*"] || allowed[origin] {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				if origin == "" && allowed["*"] {
+					w.Header().Set("Access-Control-Allow-Origin", "*")
+				}
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID")
+			}
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // RateLimit enforces a per-API-key token bucket, identifying clients by their
 // Authorization header (falling back to remote address if absent).
 func RateLimit(limiter *ratelimit.Limiter, next http.Handler) http.Handler {
