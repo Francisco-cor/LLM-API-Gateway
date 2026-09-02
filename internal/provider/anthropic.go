@@ -10,13 +10,21 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/fcordero/llm-api-gateway/internal/translate"
 )
 
-const anthropicVersion = "2023-06-01"
+const anthropicVersion = translate.AnthropicVersion
 
 // defaultMaxTokens is used when the request does not specify max_tokens,
 // which the Anthropic Messages API requires.
-const defaultMaxTokens = 4096
+const defaultMaxTokens = translate.DefaultMaxTokens
+
+// Keep local type aliases for backward compat and JSON compatibility;
+// actual logic delegated to internal/translate.
+type anthropicRequest = translate.AnthropicRequest
+type anthropicMessage = translate.AnthropicMessage
+type anthropicResponse = translate.AnthropicResponse
 
 // Anthropic implements Provider for the Anthropic Messages API, translating
 // to and from the gateway's OpenAI-compatible format.
@@ -40,34 +48,7 @@ func (a *Anthropic) Name() string { return "anthropic" }
 
 func (a *Anthropic) Models() []string { return a.models }
 
-// anthropicRequest is the native Anthropic Messages API request body.
-type anthropicRequest struct {
-	Model       string             `json:"model"`
-	MaxTokens   int                `json:"max_tokens"`
-	System      string             `json:"system,omitempty"`
-	Messages    []anthropicMessage `json:"messages"`
-	Temperature *float64           `json:"temperature,omitempty"`
-}
-
-type anthropicMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-// anthropicResponse is the native Anthropic Messages API response body.
-type anthropicResponse struct {
-	ID      string `json:"id"`
-	Model   string `json:"model"`
-	Content []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	} `json:"content"`
-	StopReason string `json:"stop_reason"`
-	Usage      struct {
-		InputTokens  int `json:"input_tokens"`
-		OutputTokens int `json:"output_tokens"`
-	} `json:"usage"`
-}
+func (a *Anthropic) SetModels(models []string) { a.models = models }
 
 // anthropicErrorResponse is the native Anthropic error body.
 type anthropicErrorResponse struct {
@@ -78,7 +59,7 @@ type anthropicErrorResponse struct {
 }
 
 func (a *Anthropic) Send(ctx context.Context, req ChatRequest) (ChatResponse, error) {
-	body, err := json.Marshal(translateToAnthropic(req))
+	body, err := json.Marshal(translate.ToAnthropic(req))
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("marshal request: %w", err)
 	}
@@ -120,7 +101,7 @@ func (a *Anthropic) Send(ctx context.Context, req ChatRequest) (ChatResponse, er
 	if err := json.Unmarshal(data, &native); err != nil {
 		return ChatResponse{}, fmt.Errorf("parse response: %w", err)
 	}
-	return translateFromAnthropic(native), nil
+	return translate.FromAnthropic(native), nil
 }
 
 func (a *Anthropic) SendStream(ctx context.Context, req ChatRequest) (<-chan StreamChunk, <-chan error) {
@@ -131,7 +112,7 @@ func (a *Anthropic) SendStream(ctx context.Context, req ChatRequest) (<-chan Str
 		defer close(ch)
 		defer close(errCh)
 
-		native := translateToAnthropic(req)
+		native := translate.ToAnthropic(req)
 		// enable streaming via native field
 		type streamReq struct {
 			anthropicRequest
@@ -261,64 +242,21 @@ func (a *Anthropic) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
-// translateToAnthropic converts the gateway's OpenAI-compatible request into
-// the Anthropic Messages API format. System messages are extracted into the
-// top-level "system" field since Anthropic does not accept a "system" role
-// inside the messages array.
-func translateToAnthropic(req ChatRequest) anthropicRequest {
-	maxTokens := defaultMaxTokens
-	if req.MaxTokens != nil {
-		maxTokens = *req.MaxTokens
-	}
-
-	native := anthropicRequest{
-		Model:       req.Model,
-		MaxTokens:   maxTokens,
-		Temperature: req.Temperature,
-	}
-
-	for _, msg := range req.Messages {
-		if msg.Role == "system" {
-			native.System = msg.Content
-			continue
-		}
-		native.Messages = append(native.Messages, anthropicMessage{
-			Role:    msg.Role,
-			Content: msg.Content,
-		})
-	}
-	return native
-}
-
-// translateFromAnthropic converts an Anthropic Messages API response back
-// into the gateway's OpenAI-compatible format.
-func translateFromAnthropic(resp anthropicResponse) ChatResponse {
-	text := ""
-	if len(resp.Content) > 0 {
-		text = resp.Content[0].Text
-	}
-
-	finishReason := "stop"
-	if resp.StopReason == "max_tokens" {
-		finishReason = "length"
-	}
-
-	return ChatResponse{
-		ID:     resp.ID,
-		Object: "chat.completion",
-		Model:  resp.Model,
-		Choices: []Choice{{
-			Index:        0,
-			Message:      ChatMessage{Role: "assistant", Content: text},
-			FinishReason: finishReason,
-		}},
-		Usage: Usage{
-			PromptTokens:     resp.Usage.InputTokens,
-			CompletionTokens: resp.Usage.OutputTokens,
-			TotalTokens:      resp.Usage.InputTokens + resp.Usage.OutputTokens,
-		},
+// Embed is not supported by Anthropic (no embedding models); returns 404.
+func (a *Anthropic) Embed(_ context.Context, _ EmbeddingRequest) (EmbeddingResponse, error) {
+	return EmbeddingResponse{}, &ProviderError{
+		ProviderName: a.Name(),
+		StatusCode:   404,
+		Message:      "embeddings not supported for anthropic",
+		Retryable:    false,
 	}
 }
+
+// translateToAnthropic retained for backward compat (delegates to translate package).
+func translateToAnthropic(req ChatRequest) anthropicRequest { return translate.ToAnthropic(req) }
+
+// translateFromAnthropic retained for backward compat (delegates to translate package).
+func translateFromAnthropic(resp anthropicResponse) ChatResponse { return translate.FromAnthropic(resp) }
 
 func anthropicErrorMessage(body []byte) string {
 	var errResp anthropicErrorResponse

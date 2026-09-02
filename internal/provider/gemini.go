@@ -11,7 +11,16 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/fcordero/llm-api-gateway/internal/translate"
 )
+
+// Keep local type aliases for JSON compatibility; logic delegated to translate.
+type geminiRequest = translate.GeminiRequest
+type geminiContent = translate.GeminiContent
+type geminiPart = translate.GeminiPart
+type geminiGenConfig = translate.GeminiGenConfig
+type geminiResponse = translate.GeminiResponse
 
 // Gemini implements Provider for the Google Gemini generateContent API,
 // translating to and from the gateway's OpenAI-compatible format.
@@ -35,39 +44,7 @@ func (g *Gemini) Name() string { return "gemini" }
 
 func (g *Gemini) Models() []string { return g.models }
 
-// geminiRequest is the native Gemini generateContent request body.
-type geminiRequest struct {
-	Contents          []geminiContent  `json:"contents"`
-	SystemInstruction *geminiContent   `json:"systemInstruction,omitempty"`
-	GenerationConfig  *geminiGenConfig `json:"generationConfig,omitempty"`
-}
-
-type geminiContent struct {
-	Role  string       `json:"role,omitempty"`
-	Parts []geminiPart `json:"parts"`
-}
-
-type geminiPart struct {
-	Text string `json:"text"`
-}
-
-type geminiGenConfig struct {
-	Temperature     *float64 `json:"temperature,omitempty"`
-	MaxOutputTokens *int     `json:"maxOutputTokens,omitempty"`
-}
-
-// geminiResponse is the native Gemini generateContent response body.
-type geminiResponse struct {
-	Candidates []struct {
-		Content      geminiContent `json:"content"`
-		FinishReason string        `json:"finishReason"`
-	} `json:"candidates"`
-	UsageMetadata struct {
-		PromptTokenCount     int `json:"promptTokenCount"`
-		CandidatesTokenCount int `json:"candidatesTokenCount"`
-		TotalTokenCount      int `json:"totalTokenCount"`
-	} `json:"usageMetadata"`
-}
+func (g *Gemini) SetModels(models []string) { g.models = models }
 
 // geminiErrorResponse is the native Gemini error body.
 type geminiErrorResponse struct {
@@ -77,7 +54,7 @@ type geminiErrorResponse struct {
 }
 
 func (g *Gemini) Send(ctx context.Context, req ChatRequest) (ChatResponse, error) {
-	body, err := json.Marshal(translateToGemini(req))
+	body, err := json.Marshal(translate.ToGemini(req))
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("marshal request: %w", err)
 	}
@@ -119,7 +96,7 @@ func (g *Gemini) Send(ctx context.Context, req ChatRequest) (ChatResponse, error
 	if err := json.Unmarshal(data, &native); err != nil {
 		return ChatResponse{}, fmt.Errorf("parse response: %w", err)
 	}
-	return translateFromGemini(native, req.Model), nil
+	return translate.FromGemini(native, req.Model), nil
 }
 
 func (g *Gemini) SendStream(ctx context.Context, req ChatRequest) (<-chan StreamChunk, <-chan error) {
@@ -130,7 +107,7 @@ func (g *Gemini) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 		defer close(ch)
 		defer close(errCh)
 
-		body, err := json.Marshal(translateToGemini(req))
+		body, err := json.Marshal(translate.ToGemini(req))
 		if err != nil {
 			errCh <- fmt.Errorf("marshal request: %w", err)
 			return
@@ -242,66 +219,124 @@ func (g *Gemini) HealthCheck(ctx context.Context) error {
 	return nil
 }
 
-// translateToGemini converts the gateway's OpenAI-compatible request into the
-// Gemini generateContent format. System messages become "systemInstruction"
-// and the assistant role is renamed to "model" as required by the Gemini API.
-func translateToGemini(req ChatRequest) geminiRequest {
-	native := geminiRequest{
-		GenerationConfig: &geminiGenConfig{
-			Temperature:     req.Temperature,
-			MaxOutputTokens: req.MaxTokens,
-		},
+func (g *Gemini) Embed(ctx context.Context, req EmbeddingRequest) (EmbeddingResponse, error) {
+	inputs := normalizeEmbeddingInput(req.Input)
+	if len(inputs) == 0 {
+		return EmbeddingResponse{}, fmt.Errorf("input is required")
 	}
-
-	for _, msg := range req.Messages {
-		if msg.Role == "system" {
-			native.SystemInstruction = &geminiContent{
-				Parts: []geminiPart{{Text: msg.Content}},
+	var data []EmbeddingData
+	for i, input := range inputs {
+		gemReq := translate.ToGeminiEmbedding(input)
+		body, err := json.Marshal(gemReq)
+		if err != nil {
+			return EmbeddingResponse{}, fmt.Errorf("marshal request: %w", err)
+		}
+		endpoint := fmt.Sprintf("%s/models/%s:embedContent?key=%s", g.baseURL, req.Model, url.QueryEscape(g.apiKey))
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		if err != nil {
+			return EmbeddingResponse{}, fmt.Errorf("build request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		resp, err := g.client.Do(httpReq)
+		if err != nil {
+			return EmbeddingResponse{}, &ProviderError{ProviderName: g.Name(), Message: err.Error(), Retryable: true}
+		}
+		dataBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return EmbeddingResponse{}, fmt.Errorf("read response: %w", err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			return EmbeddingResponse{}, &ProviderError{
+				ProviderName: g.Name(),
+				StatusCode:   resp.StatusCode,
+				Message:      geminiErrorMessage(dataBytes),
+				Retryable:    resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500,
+				RetryAfter:   parseRetryAfter(resp.Header.Get("Retry-After")),
 			}
-			continue
 		}
-		role := "user"
-		if msg.Role == "assistant" {
-			role = "model"
+		var gemResp translate.GeminiEmbeddingResponse
+		if err := json.Unmarshal(dataBytes, &gemResp); err != nil {
+			return EmbeddingResponse{}, fmt.Errorf("parse response: %w", err)
 		}
-		native.Contents = append(native.Contents, geminiContent{
-			Role:  role,
-			Parts: []geminiPart{{Text: msg.Content}},
-		})
+		data = append(data, translate.FromGeminiEmbedding(gemResp, req.Model, i))
 	}
-	return native
+	// estimate usage: ~ len(input)/4 tokens
+	tokens := 0
+	for _, s := range inputs {
+		tokens += len(s) / 4
+	}
+	return EmbeddingResponse{
+		Object: "list",
+		Data:   data,
+		Model:  req.Model,
+		Usage: EmbeddingUsage{
+			PromptTokens: tokens,
+			TotalTokens:  tokens,
+		},
+	}, nil
 }
 
-// translateFromGemini converts a Gemini generateContent response back into
-// the gateway's OpenAI-compatible format.
+// DiscoverModels fetches available models from Gemini /v1beta/models
+func (g *Gemini) DiscoverModels(ctx context.Context) ([]string, error) {
+	endpoint := fmt.Sprintf("%s/models?key=%s", g.baseURL, url.QueryEscape(g.apiKey))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := g.client.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+	var body struct {
+		Models []struct {
+			Name string `json:"name"` // e.g. "models/gemini-2.5-flash"
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+	var models []string
+	for _, m := range body.Models {
+		name := m.Name
+		if strings.HasPrefix(name, "models/") {
+			name = strings.TrimPrefix(name, "models/")
+		}
+		models = append(models, name)
+	}
+	return models, nil
+}
+
+func normalizeEmbeddingInput(input any) []string {
+	switch v := input.(type) {
+	case string:
+		return []string{v}
+	case []string:
+		return v
+	case []any:
+		var out []string
+		for _, e := range v {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	default:
+		// try to handle json.RawMessage or fallback
+		return nil
+	}
+}
+
+// translateToGemini retained for backward compat (delegates to translate package).
+func translateToGemini(req ChatRequest) geminiRequest { return translate.ToGemini(req) }
+
+// translateFromGemini retained for backward compat (delegates to translate package).
 func translateFromGemini(resp geminiResponse, model string) ChatResponse {
-	text := ""
-	finishReason := "stop"
-
-	if len(resp.Candidates) > 0 {
-		candidate := resp.Candidates[0]
-		if len(candidate.Content.Parts) > 0 {
-			text = candidate.Content.Parts[0].Text
-		}
-		if candidate.FinishReason == "MAX_TOKENS" {
-			finishReason = "length"
-		}
-	}
-
-	return ChatResponse{
-		Object: "chat.completion",
-		Model:  model,
-		Choices: []Choice{{
-			Index:        0,
-			Message:      ChatMessage{Role: "assistant", Content: text},
-			FinishReason: finishReason,
-		}},
-		Usage: Usage{
-			PromptTokens:     resp.UsageMetadata.PromptTokenCount,
-			CompletionTokens: resp.UsageMetadata.CandidatesTokenCount,
-			TotalTokens:      resp.UsageMetadata.TotalTokenCount,
-		},
-	}
+	return translate.FromGemini(resp, model)
 }
 
 func geminiErrorMessage(body []byte) string {
