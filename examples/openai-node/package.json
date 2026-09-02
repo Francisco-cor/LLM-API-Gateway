@@ -1,0 +1,10 @@
+{
+  "type": "module",
+  "dependencies": {
+    "openai": "^4.70.0"
+  },
+  "scripts": {
+    "chat": "node chat.mjs",
+    "stream": "node stream.mjs"
+  }
+}

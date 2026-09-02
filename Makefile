@@ -34,7 +34,12 @@ docker-run: docker
 	docker-compose up -d
 
 dev:
-	go run ./cmd/gateway -config config.yaml
+	@if command -v air >/dev/null 2>&1; then \
+		air; \
+	else \
+		echo "air not found, falling back to go run (install: go install github.com/air-verse/air@latest)"; \
+		go run ./cmd/gateway -config config.yaml; \
+	fi
 
 clean:
-	rm -rf bin/ coverage.out
+	rm -rf bin/ coverage.out tmp/
