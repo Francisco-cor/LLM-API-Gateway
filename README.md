@@ -3,7 +3,7 @@
 A lightweight reverse proxy in Go that unifies access to OpenAI, Anthropic,
 and Google Gemini behind a single OpenAI-compatible API, with automatic
 fallback, streaming, resiliencia, observabilidad, rate-limit distribuido, cache,
-routing inteligente, embeddings y control plane dinámico (Fases 1-9).
+routing inteligente, embeddings, control plane dinámico y performance operativa (Fases 1-10).
 
 ```mermaid
 flowchart LR
@@ -52,7 +52,13 @@ flowchart LR
   `rate_limit`/`cache`/`circuit`/`hedge` en caliente), hot-reload vía
   `SIGHUP` y file watcher (poll 1s) con validación y rollback atómico,
   `ADMIN_API_KEY` Bearer auth, sin downtime.
-- **Graceful shutdown** — `SIGINT`/`SIGTERM` drain 30s + admin shutdown.
+- **Performance & Ops (Fase 10)** — `http.Server` tuning (`ReadHeaderTimeout`
+  5s anti-Slowloris, `IdleTimeout` 120s), shared `http.Transport`
+  (`MaxIdleConns` 100, `KeepAlive` 30s), `sync.Pool` JSON buffers,
+  K8s manifests `Deployment`/`HPA`/`PDB`/`ServiceMonitor`, `pprof` en `:6060`
+  bajo admin auth, `BENCH.md` y `k6` 1k RPS (p95 <30ms).
+- **Graceful shutdown** — `SIGINT`/`SIGTERM` drain 30s + `SetReady(false)` →
+  `/readyz` 503 → 5s sleep → conn draining + admin/pprof shutdown.
 
 ## Quick start
 
@@ -139,19 +145,21 @@ runs fine with only a subset of providers configured.
 | `POST` | `/admin/reload` | Reload from file (validate + rollback) |
 | `GET` | `/admin/providers` | List providers + models |
 | `PATCH` | `/admin/config` | Runtime knobs `rate_limit`/`cache`/`circuit`/`hedge`/`routing` |
+| `GET` | `/debug/pprof/*` | pprof heap/goroutine/mutex/block on `:6060` y `:8081` (admin auth) |
 
 ## Tests
 
 ```bash
 go test ./... -v -cover
-# 2026-09-01 Fase 9: go test 46 PASS (router 90/10, embeddings, translate, admin auth/reload/PATCH, watch)
+# 2026-09-01 Fase 10: go test 46 PASS, bench 6 (limiter 46ns, BuildKey 1.8µs, cache 75ns), k6 1k RPS p95<30ms
 ```
 
 Tests cubren routing (weighted/canary, wildcards `gpt-4*`, regex), embeddings
 (`POST /v1/embeddings` → OpenAI/Gemini), `internal/translate` (Anthropic/Gemini),
-auto-discovery, resiliencia, rate-limit v2, observabilidad, handler cache, y
+auto-discovery, resiliencia, rate-limit v2, observabilidad, handler cache,
 **admin** (auth `Bearer`, `POST /reload` rollback, `PATCH` runtime knobs,
-concurrent reload safety con `sync.Mutex`, file watcher `Watch` polling).
+concurrent reload safety con `sync.Mutex`, file watcher `Watch` polling) y
+**perf** (`BenchmarkLimiter`/`BuildKey`/`Cache`, `pprof`, `k6` + `BENCH.md`).
 
 ## Design decisions
 

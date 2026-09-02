@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: llm-api-gateway
+  labels:
+    app: llm-api-gateway
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: llm-api-gateway
