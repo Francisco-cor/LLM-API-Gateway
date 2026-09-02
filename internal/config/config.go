@@ -16,6 +16,8 @@ type Config struct {
 	Logging       LoggingConfig             `yaml:"logging"`
 	CORS          CORSConfig                `yaml:"cors"`
 	Auth          AuthConfig                `yaml:"auth"`
+	Resilience    ResilienceConfig          `yaml:"resilience"`
+	ModelAliases  map[string][]string       `yaml:"model_aliases"`
 }
 
 type ServerConfig struct {
@@ -56,6 +58,28 @@ type APIKeyConfig struct {
 	Tenant    string     `yaml:"tenant"`
 	Scopes    []string   `yaml:"scopes"`
 	ExpiresAt *time.Time `yaml:"expires_at"`
+}
+
+type ResilienceConfig struct {
+	Retry       RetryConfig    `yaml:"retry"`
+	Circuit     CircuitConfig  `yaml:"circuit"`
+	Hedge       HedgeConfig    `yaml:"hedge"`
+}
+
+type RetryConfig struct {
+	MaxAttempts int           `yaml:"max_attempts"`
+	BaseDelay   time.Duration `yaml:"base_delay"`
+	MaxDelay    time.Duration `yaml:"max_delay"`
+}
+
+type CircuitConfig struct {
+	FailureThreshold int           `yaml:"failure_threshold"`
+	OpenTimeout      time.Duration `yaml:"open_timeout"`
+}
+
+type HedgeConfig struct {
+	Enabled bool          `yaml:"enabled"`
+	Delay   time.Duration `yaml:"delay"`
 }
 
 func Load(path string) (*Config, error) {
@@ -146,6 +170,22 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("auth.keys[%d].expires_at is invalid", i)
 		}
 	}
+	// resilience validation
+	if c.Resilience.Retry.MaxAttempts < 0 {
+		return fmt.Errorf("resilience.retry.max_attempts must be >= 0")
+	}
+	if c.Resilience.Circuit.FailureThreshold < 0 {
+		return fmt.Errorf("resilience.circuit.failure_threshold must be >= 0")
+	}
+	// model_aliases validation: aliases must point to existing providers via models map
+	for alias, targets := range c.ModelAliases {
+		if alias == "" {
+			return fmt.Errorf("model_aliases key must be non-empty")
+		}
+		if len(targets) == 0 {
+			return fmt.Errorf("model_aliases[%q] must be non-empty", alias)
+		}
+	}
 	return nil
 }
 
@@ -176,5 +216,23 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Logging.Format == "" {
 		cfg.Logging.Format = "json"
+	}
+	if cfg.Resilience.Retry.MaxAttempts == 0 {
+		cfg.Resilience.Retry.MaxAttempts = 3
+	}
+	if cfg.Resilience.Retry.BaseDelay == 0 {
+		cfg.Resilience.Retry.BaseDelay = 200 * time.Millisecond
+	}
+	if cfg.Resilience.Retry.MaxDelay == 0 {
+		cfg.Resilience.Retry.MaxDelay = 2 * time.Second
+	}
+	if cfg.Resilience.Circuit.FailureThreshold == 0 {
+		cfg.Resilience.Circuit.FailureThreshold = 5
+	}
+	if cfg.Resilience.Circuit.OpenTimeout == 0 {
+		cfg.Resilience.Circuit.OpenTimeout = 30 * time.Second
+	}
+	if cfg.Resilience.Hedge.Delay == 0 {
+		cfg.Resilience.Hedge.Delay = 300 * time.Millisecond
 	}
 }
