@@ -8,6 +8,7 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - REDIS_URL=redis://redis:6379/0
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
       - OTEL_TRACES_EXPORTER=otlp
     volumes:
@@ -19,8 +20,22 @@ services:
       retries: 3
     restart: unless-stopped
     depends_on:
+      - redis
       - prometheus
       - jaeger
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   prometheus:
     image: prom/prometheus:v3.0.0
@@ -59,3 +74,4 @@ services:
 
 volumes:
   grafana-storage:
+  redis-data:

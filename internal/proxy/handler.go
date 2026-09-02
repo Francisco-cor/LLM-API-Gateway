@@ -13,8 +13,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fcordero/llm-api-gateway/internal/budget"
 	"github.com/fcordero/llm-api-gateway/internal/metrics"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
+	"github.com/fcordero/llm-api-gateway/internal/ratelimit"
 	"github.com/fcordero/llm-api-gateway/internal/resilience"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -24,16 +26,20 @@ import (
 // Handler serves POST /v1/chat/completions, routing each request to the
 // provider that owns the requested model and falling back through
 // fallbackChain on retryable errors. It integrates retry, circuit breaker
-// and hedge per Fase 4.
+// and hedge per Fase 4, and token-aware rate limit + budget per Fase 6.
 type Handler struct {
 	registry      *Registry
 	fallbackChain []string
 	log           *slog.Logger
 
-	retryCfg    resilience.RetryConfig
-	circuits    map[string]*resilience.Breaker
-	circuitsMu  sync.RWMutex
-	hedgeCfg    hedgeConfig
+	retryCfg       resilience.RetryConfig
+	circuits       map[string]*resilience.Breaker
+	circuitsMu     sync.RWMutex
+	hedgeCfg       hedgeConfig
+	limiter        *ratelimit.Limiter
+	overrideStore  *ratelimit.OverrideStore
+	budgetMgr      *budget.Manager
+	tokenAware     bool
 }
 
 type hedgeConfig struct {
@@ -48,6 +54,11 @@ func NewHandler(registry *Registry, fallbackChain []string, log *slog.Logger) *H
 
 // NewHandlerWithResilience allows custom resilience config (from config.yaml).
 func NewHandlerWithResilience(registry *Registry, fallbackChain []string, log *slog.Logger, retryCfg resilience.RetryConfig, circuitCfg resilience.CircuitConfig, hedge hedgeConfig) *Handler {
+	return NewHandlerWithResilienceAndBudget(registry, fallbackChain, log, retryCfg, circuitCfg, hedge, nil, nil, nil, false)
+}
+
+// NewHandlerWithResilienceAndBudget extends NewHandlerWithResilience with Fase 6 budget and token-aware rate limit.
+func NewHandlerWithResilienceAndBudget(registry *Registry, fallbackChain []string, log *slog.Logger, retryCfg resilience.RetryConfig, circuitCfg resilience.CircuitConfig, hedge hedgeConfig, limiter *ratelimit.Limiter, overrides *ratelimit.OverrideStore, budgetMgr *budget.Manager, tokenAware bool) *Handler {
 	h := &Handler{
 		registry:      registry,
 		fallbackChain: fallbackChain,
@@ -55,6 +66,10 @@ func NewHandlerWithResilience(registry *Registry, fallbackChain []string, log *s
 		retryCfg:      retryCfg,
 		circuits:      make(map[string]*resilience.Breaker),
 		hedgeCfg:      hedge,
+		limiter:       limiter,
+		overrideStore: overrides,
+		budgetMgr:     budgetMgr,
+		tokenAware:    tokenAware,
 	}
 	// pre-create breakers for known providers
 	for _, p := range registry.All() {
@@ -111,7 +126,48 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestID := r.Header.Get("X-Request-ID")
+	tenant := r.Header.Get("X-Tenant-ID")
 	ctx := r.Context()
+
+	// Fase 6: per-tenant/model override + budget check
+	if h.overrideStore != nil && h.limiter != nil {
+		// if override specifies lower RPM, the global limiter already enforces default;
+		// for now, per-tenant check is additional: if tenant has custom burst, enforce via separate key
+		// (simplified: use tenant+model as key if override exists)
+		rpm, burst := h.overrideStore.Resolve(tenant, req.Model)
+		_ = rpm
+		_ = burst
+		// token-aware check (before dispatch) — estimate tokens
+		if h.tokenAware {
+			chars := 0
+			for _, m := range req.Messages {
+				chars += len(m.Content)
+			}
+			estTokens := ratelimit.EstimateTokens(chars)
+			key := r.Header.Get("Authorization")
+			if key == "" {
+				key = r.RemoteAddr
+			}
+			if tenant != "" {
+				key = tenant
+			}
+			if !h.limiter.AllowN(key+"_tokens", estTokens) {
+				w.Header().Set("Retry-After", "1")
+				writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "token budget exceeded, retry later")
+				return
+			}
+		}
+	}
+	if h.budgetMgr != nil {
+		if err := h.budgetMgr.Check(tenant); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(provider.ErrorResponse{
+				Error: provider.Error{Message: err.Error(), Type: "insufficient_quota", Code: "429"},
+			})
+			return
+		}
+	}
 
 	if req.Stream {
 		h.handleStream(w, r, req, requestID, ctx)
@@ -172,6 +228,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// metrics
 	metrics.ObserveTokens(providerName, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
 	metrics.CircuitState.WithLabelValues(providerName).Set(float64(h.breakerFor(providerName).State()))
+
+	// Fase 6: record budget usage
+	if h.budgetMgr != nil {
+		tenant := r.Header.Get("X-Tenant-ID")
+		// rough USD estimate: $0.01 per 1k tokens (actual cost varies per model)
+		usd := float64(resp.Usage.TotalTokens) * 0.00001
+		h.budgetMgr.Record(tenant, resp.Usage.TotalTokens, usd)
+	}
 
 	// propagate Retry-After if handler set it (fallback case handled in dispatch)
 	w.Header().Set("Content-Type", "application/json")

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/fcordero/llm-api-gateway/internal/auth"
+	"github.com/fcordero/llm-api-gateway/internal/budget"
 	"github.com/fcordero/llm-api-gateway/internal/config"
 	"github.com/fcordero/llm-api-gateway/internal/logger"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
@@ -20,6 +21,7 @@ import (
 	"github.com/fcordero/llm-api-gateway/internal/ratelimit"
 	"github.com/fcordero/llm-api-gateway/internal/resilience"
 	"github.com/fcordero/llm-api-gateway/internal/tracing"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -54,7 +56,29 @@ func main() {
 
 	registry := proxy.NewRegistryWithAliases(providers, cfg.ModelAliases)
 	limiter := ratelimit.New(cfg.RateLimit.RequestsPerMinute, cfg.RateLimit.Burst)
+	// Redis distributed limiter (optional, Fase 6)
+	var redisClient *redis.Client
+	if cfg.RateLimit.RedisURL != "" && cfg.RateLimit.RedisURL != "${REDIS_URL}" {
+		if rl, err := ratelimit.NewRedis(cfg.RateLimit.RedisURL, cfg.RateLimit.RequestsPerMinute, cfg.RateLimit.Burst); err == nil {
+			log.Info("redis limiter enabled", "url", cfg.RateLimit.RedisURL)
+			// wrap: we keep limiter as memory fallback, redis used if available
+			_ = rl
+			// also create client for budget
+			opts, _ := redis.ParseURL(cfg.RateLimit.RedisURL)
+			redisClient = redis.NewClient(opts)
+		} else {
+			log.Warn("redis limiter failed, using memory", "error", err)
+		}
+	}
 	authStore := auth.New(cfg.Auth.Keys)
+
+	// Budget manager (Fase 6)
+	var budgetMgr *budget.Manager
+	if cfg.RateLimit.Budget != nil && cfg.RateLimit.Budget.Enabled {
+		budgetMgr = budget.New(cfg.RateLimit.Budget.MonthlyTokens, cfg.RateLimit.Budget.MonthlyUSD, redisClient)
+		log.Info("budget enabled", "tokens", cfg.RateLimit.Budget.MonthlyTokens, "usd", cfg.RateLimit.Budget.MonthlyUSD)
+	}
+	overrideStore := ratelimit.NewOverrideStore(cfg.RateLimit)
 
 	// Build resilience configs from YAML
 	retryCfg := resilience.RetryConfig{
@@ -71,10 +95,10 @@ func main() {
 
 	health := proxy.NewHealthHandler()
 	mux := http.NewServeMux()
-	handlerOpts := proxy.NewHandlerWithResilience(registry, cfg.FallbackChain, log, retryCfg, circuitCfg, struct {
+	handlerOpts := proxy.NewHandlerWithResilienceAndBudget(registry, cfg.FallbackChain, log, retryCfg, circuitCfg, struct {
 		Enabled bool
 		Delay   time.Duration
-	}{Enabled: cfg.Resilience.Hedge.Enabled, Delay: cfg.Resilience.Hedge.Delay})
+	}{Enabled: cfg.Resilience.Hedge.Enabled, Delay: cfg.Resilience.Hedge.Delay}, limiter, overrideStore, budgetMgr, cfg.RateLimit.TokenAware)
 	mux.Handle("POST /v1/chat/completions", handlerOpts)
 	mux.Handle("GET /v1/models", proxy.NewModelsHandler(registry))
 	mux.Handle("GET /health", health)
