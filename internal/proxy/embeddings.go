@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"go.opentelemetry.io/otel"
@@ -18,18 +19,33 @@ import (
 // EmbeddingsHandler serves POST /v1/embeddings (OpenAI-compatible).
 // It routes to the provider that owns the requested embedding model and falls
 // back on retryable errors, translating Gemini embedContent format.
+// Supports hot-reload via mutex-protected fallbackChain.
 type EmbeddingsHandler struct {
-	registry      *Registry
+	registry *Registry
+	log      *slog.Logger
+
+	mu            sync.RWMutex
 	fallbackChain []string
-	log           *slog.Logger
 }
 
 func NewEmbeddingsHandler(registry *Registry, fallbackChain []string, log *slog.Logger) *EmbeddingsHandler {
 	return &EmbeddingsHandler{
 		registry:      registry,
-		fallbackChain: fallbackChain,
+		fallbackChain: append([]string(nil), fallbackChain...),
 		log:           log,
 	}
+}
+
+func (h *EmbeddingsHandler) SetFallbackChain(chain []string) {
+	h.mu.Lock()
+	h.fallbackChain = append([]string(nil), chain...)
+	h.mu.Unlock()
+}
+
+func (h *EmbeddingsHandler) getFallbackChain() []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return append([]string(nil), h.fallbackChain...)
 }
 
 func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -130,7 +146,8 @@ func (h *EmbeddingsHandler) dispatch(ctx context.Context, req provider.Embedding
 		h.log.Warn("provider does not support embeddings, trying fallback", "provider", primary.Name(), "request_id", requestID)
 	}
 
-	for _, name := range h.fallbackChain {
+	fallbackChain := h.getFallbackChain()
+	for _, name := range fallbackChain {
 		if name == primary.Name() {
 			continue
 		}

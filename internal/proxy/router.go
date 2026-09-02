@@ -18,17 +18,17 @@ import (
 // - weighted routing per model (routing.weighted in config) for canary/blue-green
 // - model_aliases (e.g. "gpt-4o" -> ["claude-sonnet-4-6"]) for fallback remapping.
 type Registry struct {
+	mu      sync.RWMutex
 	byName  map[string]provider.Provider
 	byModel map[string]provider.Provider // legacy exact map (single provider per model) for backward compat
 	order   []provider.Provider
 	aliases map[string][]string
 
 	// extended routing
-	weighted  map[string][]weightedEntry
-	patterns  []patternEntry
-	weightedMu sync.RWMutex
-	randMu     sync.Mutex
-	rnd        *rand.Rand
+	weighted map[string][]weightedEntry
+	patterns []patternEntry
+	randMu   sync.Mutex
+	rnd      *rand.Rand
 }
 
 type weightedEntry struct {
@@ -168,6 +168,8 @@ func (r *Registry) matchesPattern(entry patternEntry, model string) bool {
 // 4. pattern/wildcard match (first match, or random among multiple)
 // 5. error
 func (r *Registry) Resolve(model string) (provider.Provider, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	// 1. weighted exact
 	if we, ok := r.weighted[model]; ok && len(we) > 0 {
 		return r.pickWeighted(we), nil
@@ -231,18 +233,49 @@ func (r *Registry) pickWeighted(entries []weightedEntry) provider.Provider {
 
 // Get returns the provider registered under name, if any.
 func (r *Registry) Get(name string) (provider.Provider, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	p, ok := r.byName[name]
 	return p, ok
 }
 
 // All returns every registered provider in registration order.
 func (r *Registry) All() []provider.Provider {
-	return r.order
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]provider.Provider, len(r.order))
+	copy(out, r.order)
+	return out
 }
 
 // Aliases returns alias targets for model, if any.
 func (r *Registry) Aliases(model string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.aliases[model]
+}
+
+// Reload atomically replaces registry contents with new providers/aliases/weighted.
+// Used for hot-reload without replacing the *Registry pointer (so all handlers see update).
+func (r *Registry) Reload(providers []provider.Provider, aliases map[string][]string, weighted map[string][]WeightedConfig) {
+	newR := NewRegistryWithWeighted(providers, aliases, weighted)
+	// preserve RNG seed
+	newR.rnd = r.rnd
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.byName = newR.byName
+	r.byModel = newR.byModel
+	r.order = newR.order
+	r.aliases = newR.aliases
+	r.weighted = newR.weighted
+	r.patterns = newR.patterns
+}
+
+// UpdateAliases atomically updates aliases (for PATCH runtime).
+func (r *Registry) UpdateAliases(aliases map[string][]string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.aliases = aliases
 }
 
 // RemapForFallback returns a ChatRequest with Model remapped to fallback's model

@@ -164,3 +164,25 @@ func (b *Breaker) Reset() {
 	b.halfOpenPend = 0
 	b.mu.Unlock()
 }
+
+// UpdateConfig updates breaker thresholds atomically (for hot-reload).
+func (b *Breaker) UpdateConfig(cfg CircuitConfig) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if cfg.FailureThreshold > 0 {
+		b.cfg.FailureThreshold = cfg.FailureThreshold
+	}
+	if cfg.OpenTimeout > 0 {
+		b.cfg.OpenTimeout = cfg.OpenTimeout
+	}
+	if cfg.HalfOpenMax > 0 {
+		b.cfg.HalfOpenMax = cfg.HalfOpenMax
+	}
+}
+
+// Config returns current config (for admin introspection).
+func (b *Breaker) Config() CircuitConfig {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.cfg
+}

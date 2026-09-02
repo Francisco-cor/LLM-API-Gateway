@@ -29,12 +29,15 @@ import (
 // fallbackChain on retryable errors. It integrates retry, circuit breaker
 // and hedge per Fase 4, and token-aware rate limit + budget per Fase 6,
 // and response caching per Fase 7.
+// It supports hot-reload via Update* methods protected by mu.
 type Handler struct {
 	registry      *Registry
-	fallbackChain []string
 	log           *slog.Logger
 
+	mu            sync.RWMutex
+	fallbackChain []string
 	retryCfg       resilience.RetryConfig
+	circuitCfg     resilience.CircuitConfig
 	circuits       map[string]*resilience.Breaker
 	circuitsMu     sync.RWMutex
 	hedgeCfg       hedgeConfig
@@ -73,6 +76,7 @@ func NewHandlerWithCache(registry *Registry, fallbackChain []string, log *slog.L
 		fallbackChain: fallbackChain,
 		log:           log,
 		retryCfg:      retryCfg,
+		circuitCfg:    circuitCfg,
 		circuits:      make(map[string]*resilience.Breaker),
 		hedgeCfg:      hedge,
 		limiter:       limiter,
@@ -89,6 +93,87 @@ func NewHandlerWithCache(registry *Registry, fallbackChain []string, log *slog.L
 	return h
 }
 
+// Hot-reload helpers (Fase 9) — all protected by mu.
+
+// SetFallbackChain updates fallback chain atomically.
+func (h *Handler) SetFallbackChain(chain []string) {
+	h.mu.Lock()
+	h.fallbackChain = append([]string(nil), chain...)
+	h.mu.Unlock()
+}
+
+// SetRetryConfig updates retry config.
+func (h *Handler) SetRetryConfig(cfg resilience.RetryConfig) {
+	h.mu.Lock()
+	h.retryCfg = cfg
+	h.mu.Unlock()
+}
+
+// SetCircuitConfig updates circuit breaker thresholds for all breakers and future ones.
+func (h *Handler) SetCircuitConfig(cfg resilience.CircuitConfig) {
+	h.mu.Lock()
+	h.circuitCfg = cfg
+	h.mu.Unlock()
+	h.circuitsMu.RLock()
+	for _, b := range h.circuits {
+		b.UpdateConfig(cfg)
+	}
+	h.circuitsMu.RUnlock()
+}
+
+// SetHedgeConfig updates hedge config.
+func (h *Handler) SetHedgeConfig(cfg hedgeConfig) {
+	h.mu.Lock()
+	h.hedgeCfg = cfg
+	h.mu.Unlock()
+}
+
+// SetCache updates cache instance and TTL atomically.
+func (h *Handler) SetCache(c cache.Cache, ttl time.Duration) {
+	h.mu.Lock()
+	h.cache = c
+	h.cacheTTL = ttl
+	h.mu.Unlock()
+}
+
+// SetCacheTTL updates only TTL.
+func (h *Handler) SetCacheTTL(ttl time.Duration) {
+	h.mu.Lock()
+	h.cacheTTL = ttl
+	h.mu.Unlock()
+}
+
+// getFallbackChain returns a copy under RLock.
+func (h *Handler) getFallbackChain() []string {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return append([]string(nil), h.fallbackChain...)
+}
+
+func (h *Handler) getRetryConfig() resilience.RetryConfig {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.retryCfg
+}
+
+func (h *Handler) getHedgeConfig() hedgeConfig {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.hedgeCfg
+}
+
+func (h *Handler) getCache() (cache.Cache, time.Duration) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.cache, h.cacheTTL
+}
+
+func (h *Handler) getCircuitConfig() resilience.CircuitConfig {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.circuitCfg
+}
+
 func (h *Handler) breakerFor(name string) *resilience.Breaker {
 	h.circuitsMu.RLock()
 	b, ok := h.circuits[name]
@@ -101,7 +186,11 @@ func (h *Handler) breakerFor(name string) *resilience.Breaker {
 	if b, ok := h.circuits[name]; ok {
 		return b
 	}
-	b = resilience.NewBreaker(resilience.DefaultCircuitConfig())
+	cfg := h.getCircuitConfig()
+	if cfg.FailureThreshold == 0 {
+		cfg = resilience.DefaultCircuitConfig()
+	}
+	b = resilience.NewBreaker(cfg)
 	h.circuits[name] = b
 	return b
 }
@@ -179,20 +268,21 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Fase 7: cache lookup (only non-streaming 200 responses are cached)
 	var cacheKey string
 	var cacheTTL time.Duration
-	if h.cache != nil && !req.Stream && r.Header.Get("X-Cache-Skip") != "true" {
+	cached, ttl := h.getCache()
+	if cached != nil && !req.Stream && r.Header.Get("X-Cache-Skip") != "true" {
 		if ttlStr := r.Header.Get("X-Cache-TTL"); ttlStr != "" {
 			if d, err := time.ParseDuration(ttlStr); err == nil && d > 0 {
 				cacheTTL = d
 			}
 		}
 		if cacheTTL == 0 {
-			cacheTTL = h.cacheTTL
+			cacheTTL = ttl
 			if cacheTTL == 0 {
 				cacheTTL = 5 * time.Minute
 			}
 		}
 		cacheKey = cache.BuildKey(req)
-		if data, ok := h.cache.Get(cacheKey); ok {
+		if data, ok := cached.Get(cacheKey); ok {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Cache", "HIT")
 			w.Header().Set("X-Gateway-Provider", "cache")
@@ -272,14 +362,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Fase 7: cache store (only cache successful non-streaming)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Gateway-Provider", providerName)
-	if h.cache != nil && cacheKey != "" {
+	cch, _ := h.getCache()
+	if cch != nil && cacheKey != "" {
 		data, _ := json.Marshal(resp)
-		h.cache.Set(cacheKey, data, cacheTTL)
+		cch.Set(cacheKey, data, cacheTTL)
 		w.Header().Set("X-Cache", "MISS")
-		metrics.CacheSize.Set(float64(h.cache.Stats().Size))
+		metrics.CacheSize.Set(float64(cch.Stats().Size))
 		_, _ = w.Write(data)
 		return
-	} else if h.cache != nil {
+	} else if cch != nil {
 		w.Header().Set("X-Cache", "MISS")
 	}
 	_ = json.NewEncoder(w).Encode(resp)
@@ -392,13 +483,15 @@ func (h *Handler) dispatch(ctx context.Context, req provider.ChatRequest, reques
 	}
 
 	// hedge: if enabled and at least 2 fallbacks, race first fallback after delay
-	if h.hedgeCfg.Enabled && len(h.fallbackChain) > 1 {
+	hedgeCfg := h.getHedgeConfig()
+	fallbackChain := h.getFallbackChain()
+	if hedgeCfg.Enabled && len(fallbackChain) > 1 {
 		if resp, name, ok := h.dispatchHedge(ctx, req, requestID, primary.Name()); ok {
 			return resp, name, nil
 		}
 	}
 
-	for _, name := range h.fallbackChain {
+	for _, name := range fallbackChain {
 		if name == primary.Name() {
 			continue
 		}
@@ -439,7 +532,8 @@ func (h *Handler) dispatch(ctx context.Context, req provider.ChatRequest, reques
 func (h *Handler) sendWithRetry(ctx context.Context, p provider.Provider, req provider.ChatRequest) (provider.ChatResponse, error) {
 	var resp provider.ChatResponse
 	var lastErr error
-	err := resilience.Do(ctx, h.retryCfg, provider.IsRetryable, func() error {
+	retryCfg := h.getRetryConfig()
+	err := resilience.Do(ctx, retryCfg, provider.IsRetryable, func() error {
 		var err error
 		resp, err = p.Send(ctx, req)
 		lastErr = err
@@ -453,8 +547,11 @@ func (h *Handler) sendWithRetry(ctx context.Context, p provider.Provider, req pr
 
 func (h *Handler) dispatchHedge(ctx context.Context, req provider.ChatRequest, requestID, primaryName string) (provider.ChatResponse, string, bool) {
 	// pick first two fallbacks
+	fallbackChain := h.getFallbackChain()
+	hedgeCfg := h.getHedgeConfig()
+	retryCfg := h.getRetryConfig()
 	var candidates []provider.Provider
-	for _, name := range h.fallbackChain {
+	for _, name := range fallbackChain {
 		if name == primaryName {
 			continue
 		}
@@ -469,9 +566,9 @@ func (h *Handler) dispatchHedge(ctx context.Context, req provider.ChatRequest, r
 		return provider.ChatResponse{}, "", false
 	}
 	h.log.Info("hedge enabled, racing fallbacks", "request_id", requestID, "p1", candidates[0].Name(), "p2", candidates[1].Name())
-	ctx, cancel := context.WithTimeout(ctx, h.retryCfg.MaxDelay*2+5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, retryCfg.MaxDelay*2+5*time.Second)
 	defer cancel()
-	val, err := resilience.DoHedge(ctx, h.hedgeCfg.Delay,
+	val, err := resilience.DoHedge(ctx, hedgeCfg.Delay,
 		func() (any, error) {
 			mapped := h.registry.RemapForFallback(req, candidates[0])
 			resp, e := h.sendWithRetry(ctx, candidates[0], mapped)

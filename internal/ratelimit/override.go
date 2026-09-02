@@ -2,12 +2,14 @@ package ratelimit
 
 import (
 	"strings"
+	"sync"
 
 	"github.com/fcordero/llm-api-gateway/internal/config"
 )
 
 // OverrideStore resolves per-tenant/model RPM overrides.
 type OverrideStore struct {
+	mu           sync.RWMutex
 	defaultRPM   int
 	defaultBurst int
 	overrides    []config.RateLimitOverride
@@ -21,8 +23,19 @@ func NewOverrideStore(cfg config.RateLimitConfig) *OverrideStore {
 	}
 }
 
+// Reload atomically updates overrides from new config (for hot-reload).
+func (o *OverrideStore) Reload(cfg config.RateLimitConfig) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.defaultRPM = cfg.RequestsPerMinute
+	o.defaultBurst = cfg.Burst
+	o.overrides = cfg.Overrides
+}
+
 // Resolve returns effective RPM/Burst for tenant+model.
 func (o *OverrideStore) Resolve(tenant, model string) (rpm, burst int) {
+	o.mu.RLock()
+	defer o.mu.RUnlock()
 	rpm = o.defaultRPM
 	burst = o.defaultBurst
 	for _, ov := range o.overrides {

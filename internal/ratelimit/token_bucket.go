@@ -10,6 +10,7 @@ import (
 // and TTL expiration (10m) to avoid unbounded memory and contention.
 type Limiter struct {
 	shards [16]*shard
+	mu     sync.RWMutex
 	rate   float64
 	burst  float64
 	ttl    time.Duration
@@ -70,6 +71,32 @@ func (l *Limiter) AllowN(key string, n int) bool {
 	return true
 }
 
+// UpdateLimits atomically updates rate and burst (for hot-reload via admin).
+func (l *Limiter) UpdateLimits(requestsPerMinute, burst int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if requestsPerMinute > 0 {
+		l.rate = float64(requestsPerMinute) / 60.0
+	}
+	if burst > 0 {
+		l.burst = float64(burst)
+	}
+}
+
+// GetLimits returns current RPM and burst.
+func (l *Limiter) GetLimits() (int, int) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return int(l.rate * 60), int(l.burst)
+}
+
+// SetBurstForTesting allows tests to set burst directly.
+func (l *Limiter) SetBurstForTesting(burst int) {
+	l.mu.Lock()
+	l.burst = float64(burst)
+	l.mu.Unlock()
+}
+
 // RetryAfter returns how long the caller should wait before key's bucket has
 // at least one token available again.
 func (l *Limiter) RetryAfter(key string) time.Duration {
@@ -81,7 +108,10 @@ func (l *Limiter) RetryAfter(key string) time.Duration {
 	if b.tokens >= 1 {
 		return 0
 	}
-	seconds := (1 - b.tokens) / l.rate
+	l.mu.RLock()
+	rate := l.rate
+	l.mu.RUnlock()
+	seconds := (1 - b.tokens) / rate
 	return time.Duration(seconds * float64(time.Second))
 }
 
@@ -96,18 +126,22 @@ func (l *Limiter) Tokens(key string) float64 {
 
 // refillLocked applies elapsed-time refill to key's bucket. Callers must hold shard mu.
 func (l *Limiter) refillLocked(sh *shard, key string) *bucket {
+	l.mu.RLock()
+	rate := l.rate
+	burst := l.burst
+	l.mu.RUnlock()
 	now := time.Now()
 	b, ok := sh.buckets[key]
 	if !ok {
-		b = &bucket{tokens: l.burst, lastRefill: now, lastSeen: now}
+		b = &bucket{tokens: burst, lastRefill: now, lastSeen: now}
 		sh.buckets[key] = b
 		return b
 	}
 
 	elapsed := now.Sub(b.lastRefill).Seconds()
-	b.tokens += elapsed * l.rate
-	if b.tokens > l.burst {
-		b.tokens = l.burst
+	b.tokens += elapsed * rate
+	if b.tokens > burst {
+		b.tokens = burst
 	}
 	b.lastRefill = now
 	b.lastSeen = now
