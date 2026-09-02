@@ -19,6 +19,26 @@ type Config struct {
 	Resilience    ResilienceConfig          `yaml:"resilience"`
 	ModelAliases  map[string][]string       `yaml:"model_aliases"`
 	Cache         CacheConfig               `yaml:"cache"`
+	Routing       RoutingConfig             `yaml:"routing"`
+}
+
+type RoutingConfig struct {
+	// Weighted routing per model: model -> list of provider weights.
+	// Example: gpt-4o: [{provider: openai, weight: 90}, {provider: anthropic, weight: 10}]
+	Weighted map[string][]WeightedEntry `yaml:"weighted"`
+}
+
+type WeightedEntry struct {
+	Provider string `yaml:"provider"`
+	Name     string `yaml:"name"` // alias for provider (compat with PLAN example)
+	Weight   int    `yaml:"weight"`
+}
+
+func (w WeightedEntry) ProviderName() string {
+	if w.Provider != "" {
+		return w.Provider
+	}
+	return w.Name
 }
 
 type ServerConfig struct {
@@ -184,8 +204,9 @@ func (c *Config) Validate() error {
 		if p.Timeout <= 0 {
 			return fmt.Errorf("providers.%s.timeout must be > 0", name)
 		}
-		if len(p.Models) == 0 {
-			return fmt.Errorf("providers.%s.models must be non-empty", name)
+		// models may be empty -> auto-discovery (Fase 8) will fetch upstream
+		if len(p.Models) == 0 && !isDisabled {
+			// allow empty for auto-discovery; no error
 		}
 	}
 	// fallback_chain must reference known providers
@@ -233,6 +254,31 @@ func (c *Config) Validate() error {
 	}
 	if c.Cache.SemanticThreshold < 0 || c.Cache.SemanticThreshold > 1 {
 		return fmt.Errorf("cache.semantic_threshold must be between 0 and 1")
+	}
+	for model, entries := range c.Routing.Weighted {
+		if model == "" {
+			return fmt.Errorf("routing.weighted key must be non-empty")
+		}
+		if len(entries) == 0 {
+			return fmt.Errorf("routing.weighted[%q] must be non-empty", model)
+		}
+		total := 0
+		for i, e := range entries {
+			name := e.ProviderName()
+			if name == "" {
+				return fmt.Errorf("routing.weighted[%q][%d] provider/name required", model, i)
+			}
+			if _, ok := c.Providers[name]; !ok {
+				return fmt.Errorf("routing.weighted[%q][%d] references unknown provider %q", model, i, name)
+			}
+			if e.Weight <= 0 {
+				return fmt.Errorf("routing.weighted[%q][%d] weight must be >0", model, i)
+			}
+			total += e.Weight
+		}
+		if total == 0 {
+			return fmt.Errorf("routing.weighted[%q] total weight must be >0", model)
+		}
 	}
 	return nil
 }
