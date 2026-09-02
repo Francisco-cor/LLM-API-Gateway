@@ -13,8 +13,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fcordero/llm-api-gateway/internal/metrics"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/resilience"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 )
 
 // Handler serves POST /v1/chat/completions, routing each request to the
@@ -114,8 +118,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// OTEL span per chat completion
+	tracer := otel.Tracer("gateway.handler")
+	ctx, span := tracer.Start(ctx, "chat.completions",
+	)
+	span.SetAttributes(
+		attribute.String("model", req.Model),
+		attribute.String("request_id", requestID),
+	)
+	defer span.End()
+
 	resp, providerName, err := h.dispatch(ctx, req, requestID)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+		span.RecordError(err)
 		if errors.Is(err, provider.ErrNoProvider) {
 			h.log.Warn("unknown model",
 				"model", req.Model,
@@ -139,6 +155,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	span.SetAttributes(
+		attribute.String("provider", providerName),
+		attribute.Int("tokens.prompt", resp.Usage.PromptTokens),
+		attribute.Int("tokens.completion", resp.Usage.CompletionTokens),
+	)
+
 	h.log.Info("chat completion",
 		"model", req.Model,
 		"provider", providerName,
@@ -146,6 +168,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"prompt_tokens", resp.Usage.PromptTokens,
 		"completion_tokens", resp.Usage.CompletionTokens,
 	)
+
+	// metrics
+	metrics.ObserveTokens(providerName, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+	metrics.CircuitState.WithLabelValues(providerName).Set(float64(h.breakerFor(providerName).State()))
 
 	// propagate Retry-After if handler set it (fallback case handled in dispatch)
 	w.Header().Set("Content-Type", "application/json")

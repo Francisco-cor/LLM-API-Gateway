@@ -18,15 +18,90 @@ const healthCheckTimeout = 10 * time.Second
 const perProviderTimeout = 3 * time.Second
 
 // HealthHandler serves GET /health, a liveness probe for the gateway itself.
-type HealthHandler struct{}
+type HealthHandler struct {
+	startTime time.Time
+}
 
 func NewHealthHandler() *HealthHandler {
-	return &HealthHandler{}
+	return &HealthHandler{startTime: time.Now()}
 }
 
 func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":         "ok",
+		"uptime_seconds": time.Since(time.Now().Add(-time.Since(h.startTime))).Seconds(),
+		"start_time":     h.startTime.Format(time.RFC3339),
+	})
+}
+
+// LivenessHandler is GET /livez (k8s liveness).
+type LivenessHandler struct {
+	health *HealthHandler
+}
+
+func NewLivenessHandler(health *HealthHandler) *LivenessHandler {
+	return &LivenessHandler{health: health}
+}
+
+func (h *LivenessHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.health.ServeHTTP(w, r)
+}
+
+// ReadinessHandler is GET /readyz (k8s readiness) - checks providers are at least one healthy.
+type ReadinessHandler struct {
+	registry *Registry
+}
+
+func NewReadinessHandler(registry *Registry) *ReadinessHandler {
+	return &ReadinessHandler{registry: registry}
+}
+
+func (h *ReadinessHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), healthCheckTimeout)
+	defer cancel()
+
+	var mu sync.Mutex
+	healthy := 0
+	results := make(map[string]providerStatus)
+
+	g, ctx := errgroup.WithContext(ctx)
+	for _, p := range h.registry.All() {
+		p := p
+		g.Go(func() error {
+			pCtx, pCancel := context.WithTimeout(ctx, perProviderTimeout)
+			defer pCancel()
+			err := p.HealthCheck(pCtx)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				results[p.Name()] = providerStatus{Status: "unhealthy", Error: err.Error()}
+			} else {
+				results[p.Name()] = providerStatus{Status: "healthy"}
+				healthy++
+			}
+			return nil
+		})
+	}
+	_ = g.Wait()
+
+	w.Header().Set("Content-Type", "application/json")
+	if healthy == 0 && len(h.registry.All()) > 0 {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":    "not_ready",
+			"healthy":   0,
+			"total":     len(h.registry.All()),
+			"providers": results,
+		})
+		return
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"status":    "ready",
+		"healthy":   healthy,
+		"total":     len(h.registry.All()),
+		"providers": results,
+	})
 }
 
 // providerStatus describes the outcome of a single provider's health check.

@@ -7,10 +7,17 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"time"
 
+	"github.com/fcordero/llm-api-gateway/internal/metrics"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/ratelimit"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // statusRecorder captures the status code written by the wrapped handler so
@@ -40,6 +47,7 @@ func RequestID(next http.Handler) http.Handler {
 }
 
 // Logging logs each request's method, path, status, latency, and request ID.
+// It also extracts tenant/provider/trace_id for contextual observability (Fase 5).
 func Logging(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -47,13 +55,25 @@ func Logging(log *slog.Logger, next http.Handler) http.Handler {
 
 		next.ServeHTTP(rec, r)
 
-		log.Info("request",
+		attrs := []any{
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rec.status,
 			"latency_ms", time.Since(start).Milliseconds(),
 			"request_id", r.Header.Get("X-Request-ID"),
-		)
+		}
+		if tenant := r.Header.Get("X-Tenant-ID"); tenant != "" {
+			attrs = append(attrs, "tenant", tenant)
+		}
+		if prov := rec.Header().Get("X-Gateway-Provider"); prov != "" {
+			attrs = append(attrs, "provider", prov)
+		} else if prov := w.Header().Get("X-Gateway-Provider"); prov != "" {
+			attrs = append(attrs, "provider", prov)
+		}
+		if span := trace.SpanFromContext(r.Context()); span.SpanContext().IsValid() {
+			attrs = append(attrs, "trace_id", span.SpanContext().TraceID().String())
+		}
+		log.Info("request", attrs...)
 	})
 }
 
@@ -93,6 +113,62 @@ func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
 				return
 			}
 			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// Metrics records Prometheus metrics per request (Fase 5).
+func Metrics(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+		duration := time.Since(start).Seconds()
+		provider := rec.Header().Get("X-Gateway-Provider")
+		if provider == "" {
+			provider = w.Header().Get("X-Gateway-Provider")
+		}
+		if provider == "" {
+			provider = "unknown"
+		}
+		path := r.URL.Path
+		// Normalize path to avoid cardinality explosion: keep /v1/chat/completions, /health*, /metrics
+		metrics.RequestsTotal.WithLabelValues(r.Method, path, strconv.Itoa(rec.status), provider).Inc()
+		metrics.RequestDuration.WithLabelValues(r.Method, path, provider).Observe(duration)
+		if rec.status >= 500 {
+			metrics.ProviderErrors.WithLabelValues(provider, strconv.Itoa(rec.status)).Inc()
+		}
+	})
+}
+
+// Tracing creates an OTEL span per HTTP request and propagates traceparent (Fase 5).
+func Tracing(serviceName string) func(http.Handler) http.Handler {
+	tracer := otel.Tracer(serviceName)
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+			ctx, span := tracer.Start(ctx, r.Method+" "+r.URL.Path,
+				trace.WithAttributes(
+					attribute.String("http.method", r.Method),
+					attribute.String("http.route", r.URL.Path),
+				),
+				trace.WithSpanKind(trace.SpanKindServer),
+			)
+			defer span.End()
+
+			// Inject traceparent into response for debugging
+			otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(w.Header()))
+
+			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			next.ServeHTTP(rec, r.WithContext(ctx))
+
+			span.SetAttributes(
+				attribute.Int("http.status_code", rec.status),
+				attribute.String("gateway.provider", rec.Header().Get("X-Gateway-Provider")),
+			)
+			if rec.status >= 500 {
+				span.SetStatus(codes.Error, fmt.Sprintf("HTTP %d", rec.status))
+			}
 		})
 	}
 }

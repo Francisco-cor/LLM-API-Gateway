@@ -19,6 +19,7 @@ import (
 	"github.com/fcordero/llm-api-gateway/internal/proxy"
 	"github.com/fcordero/llm-api-gateway/internal/ratelimit"
 	"github.com/fcordero/llm-api-gateway/internal/resilience"
+	"github.com/fcordero/llm-api-gateway/internal/tracing"
 )
 
 func main() {
@@ -32,6 +33,18 @@ func main() {
 	}
 
 	log := logger.New(cfg.Logging.Level, cfg.Logging.Format)
+
+	// tracing init (Fase 5) — noop if OTEL env not set
+	shutdownTracing, err := tracing.Init("llm-api-gateway")
+	if err != nil {
+		log.Warn("tracing init failed", "error", err)
+	} else {
+		defer func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = shutdownTracing(ctx)
+		}()
+	}
 
 	providers, err := buildProviders(cfg, log)
 	if err != nil {
@@ -56,6 +69,7 @@ func main() {
 		HalfOpenMax:      1,
 	}
 
+	health := proxy.NewHealthHandler()
 	mux := http.NewServeMux()
 	handlerOpts := proxy.NewHandlerWithResilience(registry, cfg.FallbackChain, log, retryCfg, circuitCfg, struct {
 		Enabled bool
@@ -63,8 +77,10 @@ func main() {
 	}{Enabled: cfg.Resilience.Hedge.Enabled, Delay: cfg.Resilience.Hedge.Delay})
 	mux.Handle("POST /v1/chat/completions", handlerOpts)
 	mux.Handle("GET /v1/models", proxy.NewModelsHandler(registry))
-	mux.Handle("GET /health", proxy.NewHealthHandler())
+	mux.Handle("GET /health", health)
 	mux.Handle("GET /health/providers", proxy.NewHealthProvidersHandler(registry))
+	mux.Handle("GET /livez", proxy.NewLivenessHandler(health))
+	mux.Handle("GET /readyz", proxy.NewReadinessHandler(registry))
 	mux.Handle("GET /metrics", proxy.NewMetricsHandler())
 
 	var handler http.Handler = mux
@@ -78,6 +94,8 @@ func main() {
 	if len(cfg.CORS.AllowedOrigins) > 0 {
 		handler = proxy.CORS(cfg.CORS.AllowedOrigins)(handler)
 	}
+	handler = proxy.Metrics(handler)
+	handler = proxy.Tracing("llm-api-gateway")(handler)
 	handler = proxy.SecurityHeaders(handler)
 	handler = proxy.Logging(log, handler)
 	handler = proxy.RequestID(handler)
