@@ -18,6 +18,7 @@ import (
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/proxy"
 	"github.com/fcordero/llm-api-gateway/internal/ratelimit"
+	"github.com/fcordero/llm-api-gateway/internal/resilience"
 )
 
 func main() {
@@ -38,12 +39,29 @@ func main() {
 		os.Exit(1)
 	}
 
-	registry := proxy.NewRegistry(providers)
+	registry := proxy.NewRegistryWithAliases(providers, cfg.ModelAliases)
 	limiter := ratelimit.New(cfg.RateLimit.RequestsPerMinute, cfg.RateLimit.Burst)
 	authStore := auth.New(cfg.Auth.Keys)
 
+	// Build resilience configs from YAML
+	retryCfg := resilience.RetryConfig{
+		MaxAttempts: cfg.Resilience.Retry.MaxAttempts,
+		BaseDelay:   cfg.Resilience.Retry.BaseDelay,
+		MaxDelay:    cfg.Resilience.Retry.MaxDelay,
+		Jitter:      true,
+	}
+	circuitCfg := resilience.CircuitConfig{
+		FailureThreshold: cfg.Resilience.Circuit.FailureThreshold,
+		OpenTimeout:      cfg.Resilience.Circuit.OpenTimeout,
+		HalfOpenMax:      1,
+	}
+
 	mux := http.NewServeMux()
-	mux.Handle("POST /v1/chat/completions", proxy.NewHandler(registry, cfg.FallbackChain, log))
+	handlerOpts := proxy.NewHandlerWithResilience(registry, cfg.FallbackChain, log, retryCfg, circuitCfg, struct {
+		Enabled bool
+		Delay   time.Duration
+	}{Enabled: cfg.Resilience.Hedge.Enabled, Delay: cfg.Resilience.Hedge.Delay})
+	mux.Handle("POST /v1/chat/completions", handlerOpts)
 	mux.Handle("GET /v1/models", proxy.NewModelsHandler(registry))
 	mux.Handle("GET /health", proxy.NewHealthHandler())
 	mux.Handle("GET /health/providers", proxy.NewHealthProvidersHandler(registry))
