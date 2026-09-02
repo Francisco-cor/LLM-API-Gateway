@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"time"
@@ -20,6 +21,12 @@ type Config struct {
 	ModelAliases  map[string][]string       `yaml:"model_aliases"`
 	Cache         CacheConfig               `yaml:"cache"`
 	Routing       RoutingConfig             `yaml:"routing"`
+	Admin         AdminConfig               `yaml:"admin"`
+}
+
+type AdminConfig struct {
+	Port   int    `yaml:"port"`
+	APIKey string `yaml:"api_key"`
 }
 
 type RoutingConfig struct {
@@ -280,6 +287,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("routing.weighted[%q] total weight must be >0", model)
 		}
 	}
+	if c.Admin.Port != 0 && (c.Admin.Port < 1 || c.Admin.Port > 65535) {
+		return fmt.Errorf("admin.port must be between 1 and 65535, got %d", c.Admin.Port)
+	}
 	return nil
 }
 
@@ -337,5 +347,60 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Cache.SemanticThreshold == 0 {
 		cfg.Cache.SemanticThreshold = 0.97
+	}
+	if cfg.Admin.Port == 0 {
+		cfg.Admin.Port = 8081
+	}
+	if cfg.Admin.APIKey == "" {
+		// allow env var ADMIN_API_KEY as fallback
+		if v := os.Getenv("ADMIN_API_KEY"); v != "" {
+			cfg.Admin.APIKey = v
+		}
+	}
+}
+
+// Clone returns a deep copy via YAML round-trip (used for atomic swap + rollback).
+func (c *Config) Clone() *Config {
+	data, _ := yaml.Marshal(c)
+	var out Config
+	_ = yaml.Unmarshal(data, &out)
+	return &out
+}
+
+// Watch polls the config file for changes and calls onChange with the new validated config.
+// It respects context cancellation. It polls every interval (default 1s) checking mtime.
+// On invalid reload, it logs and keeps old config (caller should log). It returns when context done.
+func Watch(ctx context.Context, path string, interval time.Duration, onChange func(*Config) error) error {
+	if interval <= 0 {
+		interval = time.Second
+	}
+	var lastMod time.Time
+	if st, err := os.Stat(path); err == nil {
+		lastMod = st.ModTime()
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			st, err := os.Stat(path)
+			if err != nil {
+				continue
+			}
+			if !st.ModTime().After(lastMod) {
+				continue
+			}
+			lastMod = st.ModTime()
+			// small debounce: wait 100ms for file write to settle
+			time.Sleep(100 * time.Millisecond)
+			newCfg, err := Load(path)
+			if err != nil {
+				// invalid config -> keep old, caller will have logged
+				continue
+			}
+			_ = onChange(newCfg)
+		}
 	}
 }
