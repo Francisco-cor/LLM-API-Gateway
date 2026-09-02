@@ -14,6 +14,7 @@ import (
 
 	"github.com/fcordero/llm-api-gateway/internal/auth"
 	"github.com/fcordero/llm-api-gateway/internal/budget"
+	"github.com/fcordero/llm-api-gateway/internal/cache"
 	"github.com/fcordero/llm-api-gateway/internal/config"
 	"github.com/fcordero/llm-api-gateway/internal/logger"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
@@ -80,6 +81,23 @@ func main() {
 	}
 	overrideStore := ratelimit.NewOverrideStore(cfg.RateLimit)
 
+	// Cache (Fase 7)
+	var cacheInst cache.Cache
+	if cfg.Cache.Enabled {
+		var baseCache cache.Cache = cache.NewMemory(cfg.Cache.MaxSize)
+		if redisClient != nil {
+			// use Redis as primary if available, wrap with memory fallback via semantic wrapper
+			baseCache = cache.NewRedis(redisClient)
+			log.Info("cache redis enabled", "ttl", cfg.Cache.TTL)
+		}
+		if cfg.Cache.SemanticEnabled {
+			baseCache = cache.NewSemantic(baseCache, true, cfg.Cache.SemanticThreshold)
+			log.Info("semantic cache enabled", "threshold", cfg.Cache.SemanticThreshold)
+		}
+		cacheInst = baseCache
+		log.Info("cache enabled", "ttl", cfg.Cache.TTL, "max_size", cfg.Cache.MaxSize)
+	}
+
 	// Build resilience configs from YAML
 	retryCfg := resilience.RetryConfig{
 		MaxAttempts: cfg.Resilience.Retry.MaxAttempts,
@@ -95,10 +113,10 @@ func main() {
 
 	health := proxy.NewHealthHandler()
 	mux := http.NewServeMux()
-	handlerOpts := proxy.NewHandlerWithResilienceAndBudget(registry, cfg.FallbackChain, log, retryCfg, circuitCfg, struct {
+	handlerOpts := proxy.NewHandlerWithCache(registry, cfg.FallbackChain, log, retryCfg, circuitCfg, struct {
 		Enabled bool
 		Delay   time.Duration
-	}{Enabled: cfg.Resilience.Hedge.Enabled, Delay: cfg.Resilience.Hedge.Delay}, limiter, overrideStore, budgetMgr, cfg.RateLimit.TokenAware)
+	}{Enabled: cfg.Resilience.Hedge.Enabled, Delay: cfg.Resilience.Hedge.Delay}, limiter, overrideStore, budgetMgr, cfg.RateLimit.TokenAware, cacheInst, cfg.Cache.TTL)
 	mux.Handle("POST /v1/chat/completions", handlerOpts)
 	mux.Handle("GET /v1/models", proxy.NewModelsHandler(registry))
 	mux.Handle("GET /health", health)

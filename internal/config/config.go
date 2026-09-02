@@ -18,6 +18,7 @@ type Config struct {
 	Auth          AuthConfig                `yaml:"auth"`
 	Resilience    ResilienceConfig          `yaml:"resilience"`
 	ModelAliases  map[string][]string       `yaml:"model_aliases"`
+	Cache         CacheConfig               `yaml:"cache"`
 }
 
 type ServerConfig struct {
@@ -97,6 +98,14 @@ type CircuitConfig struct {
 type HedgeConfig struct {
 	Enabled bool          `yaml:"enabled"`
 	Delay   time.Duration `yaml:"delay"`
+}
+
+type CacheConfig struct {
+	Enabled           bool          `yaml:"enabled"`
+	TTL               time.Duration `yaml:"ttl"`
+	MaxSize           int           `yaml:"max_size"`
+	SemanticEnabled   bool          `yaml:"semantic_enabled"`
+	SemanticThreshold float64       `yaml:"semantic_threshold"`
 }
 
 func Load(path string) (*Config, error) {
@@ -216,6 +225,15 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("model_aliases[%q] must be non-empty", alias)
 		}
 	}
+	if c.Cache.TTL < 0 {
+		return fmt.Errorf("cache.ttl must be >=0")
+	}
+	if c.Cache.MaxSize < 0 {
+		return fmt.Errorf("cache.max_size must be >=0")
+	}
+	if c.Cache.SemanticThreshold < 0 || c.Cache.SemanticThreshold > 1 {
+		return fmt.Errorf("cache.semantic_threshold must be between 0 and 1")
+	}
 	return nil
 }
 
@@ -264,5 +282,14 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Resilience.Hedge.Delay == 0 {
 		cfg.Resilience.Hedge.Delay = 300 * time.Millisecond
+	}
+	if cfg.Cache.TTL == 0 {
+		cfg.Cache.TTL = 5 * time.Minute
+	}
+	if cfg.Cache.MaxSize == 0 {
+		cfg.Cache.MaxSize = 1000
+	}
+	if cfg.Cache.SemanticThreshold == 0 {
+		cfg.Cache.SemanticThreshold = 0.97
 	}
 }

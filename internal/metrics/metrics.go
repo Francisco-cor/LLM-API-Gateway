@@ -31,6 +31,16 @@ var (
 		Name: "gateway_circuit_state",
 		Help: "Circuit breaker state (0=closed,1=open,2=half-open)",
 	}, []string{"provider"})
+
+	CacheHits = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gateway_cache_hits_total",
+		Help: "Cache hits vs misses",
+	}, []string{"result"}) // result=hit|miss
+
+	CacheSize = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "gateway_cache_size",
+		Help: "Current cache size (entries)",
+	})
 )
 
 func ObserveTokens(provider string, prompt, completion int) {

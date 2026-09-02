@@ -70,6 +70,13 @@ resilience:
     enabled: false
     delay: 300ms
 
+cache:
+  enabled: false
+  ttl: 5m
+  max_size: 1000
+  semantic_enabled: false
+  semantic_threshold: 0.97
+
 cors:
   allowed_origins: [] # e.g. ["https://app.example.com", "*"]
 

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/fcordero/llm-api-gateway/internal/budget"
+	"github.com/fcordero/llm-api-gateway/internal/cache"
 	"github.com/fcordero/llm-api-gateway/internal/metrics"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/ratelimit"
@@ -26,7 +27,8 @@ import (
 // Handler serves POST /v1/chat/completions, routing each request to the
 // provider that owns the requested model and falling back through
 // fallbackChain on retryable errors. It integrates retry, circuit breaker
-// and hedge per Fase 4, and token-aware rate limit + budget per Fase 6.
+// and hedge per Fase 4, and token-aware rate limit + budget per Fase 6,
+// and response caching per Fase 7.
 type Handler struct {
 	registry      *Registry
 	fallbackChain []string
@@ -40,6 +42,8 @@ type Handler struct {
 	overrideStore  *ratelimit.OverrideStore
 	budgetMgr      *budget.Manager
 	tokenAware     bool
+	cache          cache.Cache
+	cacheTTL       time.Duration
 }
 
 type hedgeConfig struct {
@@ -59,6 +63,11 @@ func NewHandlerWithResilience(registry *Registry, fallbackChain []string, log *s
 
 // NewHandlerWithResilienceAndBudget extends NewHandlerWithResilience with Fase 6 budget and token-aware rate limit.
 func NewHandlerWithResilienceAndBudget(registry *Registry, fallbackChain []string, log *slog.Logger, retryCfg resilience.RetryConfig, circuitCfg resilience.CircuitConfig, hedge hedgeConfig, limiter *ratelimit.Limiter, overrides *ratelimit.OverrideStore, budgetMgr *budget.Manager, tokenAware bool) *Handler {
+	return NewHandlerWithCache(registry, fallbackChain, log, retryCfg, circuitCfg, hedge, limiter, overrides, budgetMgr, tokenAware, nil, 0)
+}
+
+// NewHandlerWithCache extends with Fase 7 cache support.
+func NewHandlerWithCache(registry *Registry, fallbackChain []string, log *slog.Logger, retryCfg resilience.RetryConfig, circuitCfg resilience.CircuitConfig, hedge hedgeConfig, limiter *ratelimit.Limiter, overrides *ratelimit.OverrideStore, budgetMgr *budget.Manager, tokenAware bool, c cache.Cache, ttl time.Duration) *Handler {
 	h := &Handler{
 		registry:      registry,
 		fallbackChain: fallbackChain,
@@ -70,6 +79,8 @@ func NewHandlerWithResilienceAndBudget(registry *Registry, fallbackChain []strin
 		overrideStore: overrides,
 		budgetMgr:     budgetMgr,
 		tokenAware:    tokenAware,
+		cache:         c,
+		cacheTTL:      ttl,
 	}
 	// pre-create breakers for known providers
 	for _, p := range registry.All() {
@@ -131,13 +142,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Fase 6: per-tenant/model override + budget check
 	if h.overrideStore != nil && h.limiter != nil {
-		// if override specifies lower RPM, the global limiter already enforces default;
-		// for now, per-tenant check is additional: if tenant has custom burst, enforce via separate key
-		// (simplified: use tenant+model as key if override exists)
 		rpm, burst := h.overrideStore.Resolve(tenant, req.Model)
 		_ = rpm
 		_ = burst
-		// token-aware check (before dispatch) — estimate tokens
 		if h.tokenAware {
 			chars := 0
 			for _, m := range req.Messages {
@@ -167,6 +174,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
+	}
+
+	// Fase 7: cache lookup (only non-streaming 200 responses are cached)
+	var cacheKey string
+	var cacheTTL time.Duration
+	if h.cache != nil && !req.Stream && r.Header.Get("X-Cache-Skip") != "true" {
+		if ttlStr := r.Header.Get("X-Cache-TTL"); ttlStr != "" {
+			if d, err := time.ParseDuration(ttlStr); err == nil && d > 0 {
+				cacheTTL = d
+			}
+		}
+		if cacheTTL == 0 {
+			cacheTTL = h.cacheTTL
+			if cacheTTL == 0 {
+				cacheTTL = 5 * time.Minute
+			}
+		}
+		cacheKey = cache.BuildKey(req)
+		if data, ok := h.cache.Get(cacheKey); ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Cache", "HIT")
+			w.Header().Set("X-Gateway-Provider", "cache")
+			metrics.CacheHits.WithLabelValues("hit").Inc()
+			metrics.RequestsTotal.WithLabelValues(r.Method, r.URL.Path, "200", "cache").Inc()
+			_, _ = w.Write(data)
+			h.log.Info("cache hit", "model", req.Model, "request_id", requestID, "cache_key", cacheKey[:8])
+			return
+		}
+		metrics.CacheHits.WithLabelValues("miss").Inc()
 	}
 
 	if req.Stream {
@@ -225,21 +261,27 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"completion_tokens", resp.Usage.CompletionTokens,
 	)
 
-	// metrics
+	// metrics + cache store
 	metrics.ObserveTokens(providerName, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
 	metrics.CircuitState.WithLabelValues(providerName).Set(float64(h.breakerFor(providerName).State()))
-
-	// Fase 6: record budget usage
 	if h.budgetMgr != nil {
 		tenant := r.Header.Get("X-Tenant-ID")
-		// rough USD estimate: $0.01 per 1k tokens (actual cost varies per model)
 		usd := float64(resp.Usage.TotalTokens) * 0.00001
 		h.budgetMgr.Record(tenant, resp.Usage.TotalTokens, usd)
 	}
-
-	// propagate Retry-After if handler set it (fallback case handled in dispatch)
+	// Fase 7: cache store (only cache successful non-streaming)
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Gateway-Provider", providerName)
+	if h.cache != nil && cacheKey != "" {
+		data, _ := json.Marshal(resp)
+		h.cache.Set(cacheKey, data, cacheTTL)
+		w.Header().Set("X-Cache", "MISS")
+		metrics.CacheSize.Set(float64(h.cache.Stats().Size))
+		_, _ = w.Write(data)
+		return
+	} else if h.cache != nil {
+		w.Header().Set("X-Cache", "MISS")
+	}
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
