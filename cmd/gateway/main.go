@@ -55,7 +55,28 @@ func main() {
 		os.Exit(1)
 	}
 
-	registry := proxy.NewRegistryWithAliases(providers, cfg.ModelAliases)
+	// auto-discovery (Fase 8): if provider models empty, fetch upstream
+	providers = discoverModels(providers, log)
+
+	// build weighted routing map for Fase 8
+	weighted := make(map[string][]proxy.WeightedConfig)
+	for model, entries := range cfg.Routing.Weighted {
+		var we []proxy.WeightedConfig
+		for _, e := range entries {
+			we = append(we, proxy.WeightedConfig{
+				Provider: e.ProviderName(),
+				Weight:   e.Weight,
+			})
+		}
+		weighted[model] = we
+	}
+	var registry *proxy.Registry
+	if len(weighted) > 0 {
+		registry = proxy.NewRegistryWithWeighted(providers, cfg.ModelAliases, weighted)
+	} else {
+		registry = proxy.NewRegistryWithAliases(providers, cfg.ModelAliases)
+	}
+	registry.SetRandSeed(time.Now().UnixNano())
 	limiter := ratelimit.New(cfg.RateLimit.RequestsPerMinute, cfg.RateLimit.Burst)
 	// Redis distributed limiter (optional, Fase 6)
 	var redisClient *redis.Client
@@ -118,6 +139,7 @@ func main() {
 		Delay   time.Duration
 	}{Enabled: cfg.Resilience.Hedge.Enabled, Delay: cfg.Resilience.Hedge.Delay}, limiter, overrideStore, budgetMgr, cfg.RateLimit.TokenAware, cacheInst, cfg.Cache.TTL)
 	mux.Handle("POST /v1/chat/completions", handlerOpts)
+	mux.Handle("POST /v1/embeddings", proxy.NewEmbeddingsHandler(registry, cfg.FallbackChain, log))
 	mux.Handle("GET /v1/models", proxy.NewModelsHandler(registry))
 	mux.Handle("GET /health", health)
 	mux.Handle("GET /health/providers", proxy.NewHealthProvidersHandler(registry))
@@ -201,4 +223,36 @@ func buildProviders(cfg *config.Config, log *slog.Logger) ([]provider.Provider, 
 		return nil, fmt.Errorf("no providers configured: set at least one of OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY")
 	}
 	return providers, nil
+}
+
+type modelDiscoverer interface {
+	DiscoverModels(ctx context.Context) ([]string, error)
+	SetModels(models []string)
+}
+
+// discoverModels attempts to auto-discover models for providers with empty model list (Fase 8).
+func discoverModels(providers []provider.Provider, log *slog.Logger) []provider.Provider {
+	for i, p := range providers {
+		if len(p.Models()) > 0 {
+			continue
+		}
+		// try to discover
+		if d, ok := p.(modelDiscoverer); ok {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			models, err := d.DiscoverModels(ctx)
+			cancel()
+			if err != nil {
+				log.Warn("auto-discovery failed, provider has no models", "provider", p.Name(), "error", err)
+				continue
+			}
+			if len(models) == 0 {
+				log.Warn("auto-discovery returned no models", "provider", p.Name())
+				continue
+			}
+			log.Info("auto-discovered models", "provider", p.Name(), "models", models)
+			d.SetModels(models)
+			providers[i] = p
+		}
+	}
+	return providers
 }

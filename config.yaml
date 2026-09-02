@@ -11,6 +11,11 @@ providers:
     models:
       - gpt-4o
       - gpt-4o-mini
+      - text-embedding-3-small
+      - text-embedding-3-large
+      # Wildcard example: uncomment to use pattern matching
+      # - "gpt-4*"
+    # models: []  # leave empty to enable auto-discovery via GET /v1/models (Fase 8)
   anthropic:
     api_key: ${ANTHROPIC_API_KEY}
     base_url: https://api.anthropic.com
@@ -19,6 +24,7 @@ providers:
       - claude-opus-4-8
       - claude-sonnet-4-6
       - claude-haiku-4-5-20251001
+      # Wildcard: e.g. "claude-*"
   gemini:
     api_key: ${GEMINI_API_KEY}
     base_url: https://generativelanguage.googleapis.com/v1beta
@@ -26,6 +32,9 @@ providers:
     models:
       - gemini-2.5-flash
       - gemini-2.5-pro
+      - text-embedding-004
+      - embedding-001
+      # Wildcard: "gemini-*" matches gemini-2.5-flash, gemini-2.5-pro, etc.
 
 fallback_chain:
   - openai
@@ -36,6 +45,25 @@ model_aliases:
   # When primary model fails, remap to fallback's equivalent
   # gpt-4o: ["claude-sonnet-4-6", "gemini-2.5-pro"]
   # claude-sonnet-4-6: ["gpt-4o", "gemini-2.5-flash"]
+
+# Fase 8: intelligent routing — weighted/canary + wildcard/regex
+routing:
+  weighted:
+    # Example canary: 90% openai, 10% anthropic for gpt-4o
+    # gpt-4o:
+    #   - provider: openai
+    #     weight: 90
+    #   - provider: anthropic
+    #     weight: 10
+    # Wildcard routing: provider models may contain "gpt-4*", "claude-*", "gemini-*"
+    # Regex example: "gpt-4.*":  maps to same
+    gpt-4o:
+      - provider: openai
+        weight: 100
+    # Uncomment to enable explicit weighted split:
+    # text-embedding-3-small:
+    #   - provider: openai
+    #     weight: 100
 
 rate_limit:
   enabled: true
