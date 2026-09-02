@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"strings"
 	"sync"
 	"time"
@@ -76,6 +77,17 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
+	// Fase 10: pprof endpoints behind admin auth (on :8081 and :6060)
+	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+	mux.Handle("GET /debug/pprof/heap", pprof.Handler("heap"))
+	mux.Handle("GET /debug/pprof/goroutine", pprof.Handler("goroutine"))
+	mux.Handle("GET /debug/pprof/threadcreate", pprof.Handler("threadcreate"))
+	mux.Handle("GET /debug/pprof/block", pprof.Handler("block"))
+	mux.Handle("GET /debug/pprof/mutex", pprof.Handler("mutex"))
 	var h http.Handler = mux
 	if s.apiKey != "" && s.apiKey != "${ADMIN_API_KEY}" {
 		h = s.authMiddleware(h)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -18,13 +19,24 @@ const healthCheckTimeout = 10 * time.Second
 const perProviderTimeout = 3 * time.Second
 
 // HealthHandler serves GET /health, a liveness probe for the gateway itself.
+// It also tracks readiness for graceful drain (Fase 10): SetReady(false) makes
+// /readyz return 503 so K8s stops routing before Shutdown completes.
 type HealthHandler struct {
 	startTime time.Time
+	ready     atomic.Bool
 }
 
 func NewHealthHandler() *HealthHandler {
-	return &HealthHandler{startTime: time.Now()}
+	h := &HealthHandler{startTime: time.Now()}
+	h.ready.Store(true)
+	return h
 }
+
+// SetReady marks the gateway as ready (true) or draining (false).
+func (h *HealthHandler) SetReady(v bool) { h.ready.Store(v) }
+
+// IsReady reports whether gateway is ready to serve traffic.
+func (h *HealthHandler) IsReady() bool { return h.ready.Load() }
 
 func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -32,6 +44,7 @@ func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"status":         "ok",
 		"uptime_seconds": time.Since(time.Now().Add(-time.Since(h.startTime))).Seconds(),
 		"start_time":     h.startTime.Format(time.RFC3339),
+		"ready":          h.ready.Load(),
 	})
 }
 
@@ -51,13 +64,29 @@ func (h *LivenessHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // ReadinessHandler is GET /readyz (k8s readiness) - checks providers are at least one healthy.
 type ReadinessHandler struct {
 	registry *Registry
+	health   *HealthHandler
 }
 
 func NewReadinessHandler(registry *Registry) *ReadinessHandler {
 	return &ReadinessHandler{registry: registry}
 }
 
+// NewReadinessHandlerWithHealth links readiness to HealthHandler ready flag (for graceful drain).
+func NewReadinessHandlerWithHealth(registry *Registry, health *HealthHandler) *ReadinessHandler {
+	return &ReadinessHandler{registry: registry, health: health}
+}
+
 func (h *ReadinessHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Fase 10: if gateway is draining, return 503 immediately so K8s removes endpoint
+	if h.health != nil && !h.health.IsReady() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": "draining",
+			"ready":  false,
+		})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), healthCheckTimeout)
 	defer cancel()
 

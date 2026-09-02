@@ -13,5 +13,6 @@ COPY --from=builder /app/gateway ./gateway
 COPY config.yaml ./config.yaml
 RUN chown appuser:appgroup ./gateway ./config.yaml
 USER appuser
-EXPOSE 8080
+EXPOSE 8080 8081 6060
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD wget -qO- http://localhost:8080/health || exit 1
 ENTRYPOINT ["./gateway", "-config", "config.yaml"]

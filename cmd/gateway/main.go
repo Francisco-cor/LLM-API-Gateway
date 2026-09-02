@@ -135,7 +135,7 @@ func main() {
 	mux.Handle("GET /health", health)
 	mux.Handle("GET /health/providers", proxy.NewHealthProvidersHandler(registry))
 	mux.Handle("GET /livez", proxy.NewLivenessHandler(health))
-	mux.Handle("GET /readyz", proxy.NewReadinessHandler(registry))
+	mux.Handle("GET /readyz", proxy.NewReadinessHandlerWithHealth(registry, health))
 	mux.Handle("GET /metrics", proxy.NewMetricsHandler())
 
 	var handler http.Handler = mux
@@ -263,13 +263,29 @@ func main() {
 	}
 	adminSrv = admin.New(log, adminAPIKey, *configPath, currentCfg, registry, applyConfig, nil)
 	adminHTTP = &http.Server{
-		Addr:    adminAddr,
-		Handler: adminSrv.Handler(),
+		Addr:              adminAddr,
+		Handler:           adminSrv.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	go func() {
 		log.Info("admin listening", "addr", adminHTTP.Addr)
 		if err := adminHTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("admin server error", "error", err)
+		}
+	}()
+
+	// Fase 10: pprof server on :6060 behind same admin auth (exposed via admin Handler pprof routes)
+	pprofHTTP := &http.Server{
+		Addr:              ":6060",
+		Handler:           adminSrv.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	go func() {
+		log.Info("pprof listening", "addr", pprofHTTP.Addr)
+		if err := pprofHTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("pprof server error", "error", err)
 		}
 	}()
 
@@ -324,10 +340,15 @@ func main() {
 			os.Exit(1)
 		}
 	case <-quit:
-		log.Info("shutting down")
-		// shutdown admin first
+		log.Info("shutting down, draining")
+		// Fase 10: mark as not ready so /readyz fails and K8s stops routing before drain
+		health.SetReady(false)
+		// give kube-proxy / load balancer time to remove endpoint (5s)
+		time.Sleep(5 * time.Second)
+		// shutdown admin and pprof first
 		ctxA, cancelA := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = adminHTTP.Shutdown(ctxA)
+		_ = pprofHTTP.Shutdown(ctxA)
 		cancelA()
 		watchCancel()
 		signal.Stop(hupCh)

@@ -3,7 +3,8 @@ services:
     build: .
     ports:
       - "8080:8080"
-      - "6060:6060" # pprof (admin)
+      - "8081:8081" # admin
+      - "6060:6060" # pprof (admin auth)
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
