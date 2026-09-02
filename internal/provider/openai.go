@@ -69,6 +69,7 @@ func (o *OpenAI) Send(ctx context.Context, req ChatRequest) (ChatResponse, error
 			StatusCode:   resp.StatusCode,
 			Message:      string(data),
 			Retryable:    resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500,
+			RetryAfter:   parseRetryAfter(resp.Header.Get("Retry-After")),
 		}
 	}
 
@@ -116,6 +117,7 @@ func (o *OpenAI) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 				StatusCode:   resp.StatusCode,
 				Message:      string(data),
 				Retryable:    resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500,
+				RetryAfter:   parseRetryAfter(resp.Header.Get("Retry-After")),
 			}
 			return
 		}

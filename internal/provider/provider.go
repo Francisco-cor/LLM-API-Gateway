@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // StreamChunk is an OpenAI-compatible SSE chunk.
@@ -121,6 +122,7 @@ type ProviderError struct {
 	StatusCode   int
 	Message      string
 	Retryable    bool
+	RetryAfter   time.Duration
 }
 
 func (e *ProviderError) Error() string {
@@ -138,4 +140,18 @@ func IsRetryable(err error) bool {
 // IsNoProvider reports whether err indicates an unknown model.
 func IsNoProvider(err error) bool {
 	return errors.Is(err, ErrNoProvider)
+}
+
+func parseRetryAfter(v string) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if secs, err := time.ParseDuration(v + "s"); err == nil {
+		return secs
+	}
+	var s int
+	if _, err := fmt.Sscanf(v, "%d", &s); err == nil {
+		return time.Duration(s) * time.Second
+	}
+	return 0
 }

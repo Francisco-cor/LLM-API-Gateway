@@ -112,6 +112,7 @@ func (a *Anthropic) Send(ctx context.Context, req ChatRequest) (ChatResponse, er
 			StatusCode:   resp.StatusCode,
 			Message:      anthropicErrorMessage(data),
 			Retryable:    resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500,
+			RetryAfter:   parseRetryAfter(resp.Header.Get("Retry-After")),
 		}
 	}
 
@@ -166,6 +167,7 @@ func (a *Anthropic) SendStream(ctx context.Context, req ChatRequest) (<-chan Str
 				StatusCode:   resp.StatusCode,
 				Message:      anthropicErrorMessage(data),
 				Retryable:    resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500,
+				RetryAfter:   parseRetryAfter(resp.Header.Get("Retry-After")),
 			}
 			return
 		}
