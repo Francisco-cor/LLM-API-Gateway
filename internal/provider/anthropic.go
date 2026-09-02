@@ -40,7 +40,7 @@ func NewAnthropic(apiKey, baseURL string, timeout time.Duration, models []string
 		apiKey:  apiKey,
 		baseURL: baseURL,
 		models:  models,
-		client:  &http.Client{Timeout: timeout},
+		client:  newHTTPClient(timeout),
 	}
 }
 
@@ -59,7 +59,7 @@ type anthropicErrorResponse struct {
 }
 
 func (a *Anthropic) Send(ctx context.Context, req ChatRequest) (ChatResponse, error) {
-	body, err := json.Marshal(translate.ToAnthropic(req))
+	body, err := marshalJSON(translate.ToAnthropic(req))
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("marshal request: %w", err)
 	}
@@ -119,7 +119,7 @@ func (a *Anthropic) SendStream(ctx context.Context, req ChatRequest) (<-chan Str
 			Stream bool `json:"stream"`
 		}
 		sr := streamReq{anthropicRequest: native, Stream: true}
-		body, err := json.Marshal(sr)
+		body, err := marshalJSON(sr)
 		if err != nil {
 			errCh <- fmt.Errorf("marshal request: %w", err)
 			return
@@ -216,7 +216,7 @@ func (a *Anthropic) SendStream(ctx context.Context, req ChatRequest) (<-chan Str
 func (a *Anthropic) HealthCheck(ctx context.Context) error {
 	// Anthropic has no models-list endpoint; send the smallest possible
 	// request and treat anything other than 401/403 as healthy.
-	body, _ := json.Marshal(anthropicRequest{
+	body, _ := marshalJSON(anthropicRequest{
 		Model:     firstOrDefault(a.models, "claude-haiku-4-5-20251001"),
 		MaxTokens: 1,
 		Messages:  []anthropicMessage{{Role: "user", Content: "ping"}},

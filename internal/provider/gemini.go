@@ -36,7 +36,7 @@ func NewGemini(apiKey, baseURL string, timeout time.Duration, models []string) *
 		apiKey:  apiKey,
 		baseURL: baseURL,
 		models:  models,
-		client:  &http.Client{Timeout: timeout},
+		client:  newHTTPClient(timeout),
 	}
 }
 
@@ -54,7 +54,7 @@ type geminiErrorResponse struct {
 }
 
 func (g *Gemini) Send(ctx context.Context, req ChatRequest) (ChatResponse, error) {
-	body, err := json.Marshal(translate.ToGemini(req))
+	body, err := marshalJSON(translate.ToGemini(req))
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("marshal request: %w", err)
 	}
@@ -107,7 +107,7 @@ func (g *Gemini) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 		defer close(ch)
 		defer close(errCh)
 
-		body, err := json.Marshal(translate.ToGemini(req))
+		body, err := marshalJSON(translate.ToGemini(req))
 		if err != nil {
 			errCh <- fmt.Errorf("marshal request: %w", err)
 			return
@@ -227,7 +227,7 @@ func (g *Gemini) Embed(ctx context.Context, req EmbeddingRequest) (EmbeddingResp
 	var data []EmbeddingData
 	for i, input := range inputs {
 		gemReq := translate.ToGeminiEmbedding(input)
-		body, err := json.Marshal(gemReq)
+		body, err := marshalJSON(gemReq)
 		if err != nil {
 			return EmbeddingResponse{}, fmt.Errorf("marshal request: %w", err)
 		}

@@ -27,7 +27,7 @@ func NewOpenAI(apiKey, baseURL string, timeout time.Duration, models []string) *
 		apiKey:  apiKey,
 		baseURL: baseURL,
 		models:  models,
-		client:  &http.Client{Timeout: timeout},
+		client:  newHTTPClient(timeout),
 	}
 }
 
@@ -38,7 +38,7 @@ func (o *OpenAI) Models() []string { return o.models }
 func (o *OpenAI) SetModels(models []string) { o.models = models }
 
 func (o *OpenAI) Send(ctx context.Context, req ChatRequest) (ChatResponse, error) {
-	body, err := json.Marshal(req)
+	body, err := marshalJSON(req)
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("marshal request: %w", err)
 	}
@@ -91,7 +91,7 @@ func (o *OpenAI) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 		defer close(errCh)
 
 		req.Stream = true
-		body, err := json.Marshal(req)
+		body, err := marshalJSON(req)
 		if err != nil {
 			errCh <- fmt.Errorf("marshal request: %w", err)
 			return
@@ -180,7 +180,7 @@ func (o *OpenAI) HealthCheck(ctx context.Context) error {
 }
 
 func (o *OpenAI) Embed(ctx context.Context, req EmbeddingRequest) (EmbeddingResponse, error) {
-	body, err := json.Marshal(req)
+	body, err := marshalJSON(req)
 	if err != nil {
 		return EmbeddingResponse{}, fmt.Errorf("marshal request: %w", err)
 	}
