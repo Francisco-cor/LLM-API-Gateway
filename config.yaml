@@ -41,6 +41,22 @@ rate_limit:
   enabled: true
   requests_per_minute: 60
   burst: 10
+  redis_url: ${REDIS_URL}
+  token_aware: true
+  overrides:
+    # Example tier overrides
+    # - tenant: pro-tenant
+    #   model_pattern: "gpt-4*"
+    #   rpm: 600
+    #   burst: 60
+    # - tenant: "*"
+    #   model_pattern: "*"
+    #   rpm: 60
+    #   burst: 10
+  budget:
+    enabled: false
+    monthly_tokens: 1000000
+    monthly_usd: 100.0
 
 resilience:
   retry:

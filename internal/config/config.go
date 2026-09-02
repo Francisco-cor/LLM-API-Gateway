@@ -34,9 +34,26 @@ type ProviderConfig struct {
 }
 
 type RateLimitConfig struct {
+	Enabled           bool              `yaml:"enabled"`
+	RequestsPerMinute int               `yaml:"requests_per_minute"`
+	Burst             int               `yaml:"burst"`
+	RedisURL          string            `yaml:"redis_url"`
+	TokenAware        bool              `yaml:"token_aware"`
+	Overrides         []RateLimitOverride `yaml:"overrides"`
+	Budget            *BudgetConfig     `yaml:"budget"`
+}
+
+type RateLimitOverride struct {
+	Tenant       string `yaml:"tenant"`
+	ModelPattern string `yaml:"model_pattern"`
+	RPM          int    `yaml:"rpm"`
+	Burst        int    `yaml:"burst"`
+}
+
+type BudgetConfig struct {
 	Enabled           bool `yaml:"enabled"`
-	RequestsPerMinute int  `yaml:"requests_per_minute"`
-	Burst             int  `yaml:"burst"`
+	MonthlyTokens     int  `yaml:"monthly_tokens"`
+	MonthlyUSD        float64 `yaml:"monthly_usd"`
 }
 
 type LoggingConfig struct {
@@ -132,6 +149,19 @@ func (c *Config) Validate() error {
 	}
 	if c.RateLimit.Enabled && c.RateLimit.Burst == 0 {
 		return fmt.Errorf("rate_limit.burst must be > 0 when enabled")
+	}
+	for i, ov := range c.RateLimit.Overrides {
+		if ov.RPM < 0 || ov.Burst < 0 {
+			return fmt.Errorf("rate_limit.overrides[%d] rpm/burst must be >=0", i)
+		}
+	}
+	if c.RateLimit.Budget != nil && c.RateLimit.Budget.Enabled {
+		if c.RateLimit.Budget.MonthlyTokens < 0 {
+			return fmt.Errorf("rate_limit.budget.monthly_tokens must be >=0")
+		}
+		if c.RateLimit.Budget.MonthlyUSD < 0 {
+			return fmt.Errorf("rate_limit.budget.monthly_usd must be >=0")
+		}
 	}
 	// Providers validation — APIKey may be empty or unexpanded "${...}" (treated as disabled, not an error)
 	if len(c.Providers) == 0 {
