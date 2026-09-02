@@ -3,7 +3,7 @@
 A lightweight reverse proxy in Go that unifies access to OpenAI, Anthropic,
 and Google Gemini behind a single OpenAI-compatible API, with automatic
 fallback, streaming, resiliencia, observabilidad, rate-limit distribuido, cache,
-routing inteligente y embeddings (Fases 1-8).
+routing inteligente, embeddings y control plane dinámico (Fases 1-9).
 
 ```mermaid
 flowchart LR
@@ -47,7 +47,12 @@ flowchart LR
   (array o string), con fallback y `X-Gateway-Provider`.
 - **Health** — `GET /health`, `/health/providers` (fan-out paralelo),
   `/livez`, `/readyz`, y `/metrics`.
-- **Graceful shutdown** — `SIGINT`/`SIGTERM` drain 30s.
+- **Control Plane (Fase 9)** — Admin API `:8081` (`GET /admin/config` redacted,
+  `POST /admin/reload`, `GET /admin/providers`, `PATCH /admin/config` para
+  `rate_limit`/`cache`/`circuit`/`hedge` en caliente), hot-reload vía
+  `SIGHUP` y file watcher (poll 1s) con validación y rollback atómico,
+  `ADMIN_API_KEY` Bearer auth, sin downtime.
+- **Graceful shutdown** — `SIGINT`/`SIGTERM` drain 30s + admin shutdown.
 
 ## Quick start
 
@@ -112,6 +117,7 @@ go run ./cmd/gateway -config config.yaml
 | `cache.enabled/ttl/max_size` | Cache exact + `semantic_enabled`/`threshold` 0.97 |
 | `rate_limit.enabled/requests_per_minute/burst/redis_url/token_aware` | Limiter + `overrides` por tenant/model |
 | `auth.enabled/keys` | `key`, `tenant`, `scopes`, `expires_at` |
+| `admin.port/api_key` | Admin `:8081` con `ADMIN_API_KEY` (`Bearer` o `X-Admin-API-Key`) |
 | `cors.allowed_origins` | CORS |
 | `logging.level` / `format` | `debug`/`info`/`warn`/`error`, `json`/`text` |
 
@@ -129,20 +135,23 @@ runs fine with only a subset of providers configured.
 | `GET` | `/health/providers` | Per-provider connectivity (parallel fan-out 3s) |
 | `GET` | `/livez` / `/readyz` | K8s probes |
 | `GET` | `/metrics` | Prometheus metrics |
+| `GET` | `/admin/config` | Admin current config (redacted, auth `ADMIN_API_KEY`) |
+| `POST` | `/admin/reload` | Reload from file (validate + rollback) |
+| `GET` | `/admin/providers` | List providers + models |
+| `PATCH` | `/admin/config` | Runtime knobs `rate_limit`/`cache`/`circuit`/`hedge`/`routing` |
 
 ## Tests
 
 ```bash
 go test ./... -v -cover
-# 2026-09-01 Fase 8: go test 38 PASS (router weighted 90/10, wildcard, embeddings, translate)
+# 2026-09-01 Fase 9: go test 46 PASS (router 90/10, embeddings, translate, admin auth/reload/PATCH, watch)
 ```
 
 Tests cubren routing (weighted/canary, wildcards `gpt-4*`, regex), embeddings
-(`POST /v1/embeddings` → OpenAI/Gemini, fallback retryable, validación),
-`internal/translate` (Anthropic/Gemini ↔ OpenAI + embeddings), auto-discovery
-`GET /v1/models`, resiliencia (retry jitter, circuit, hedge), rate-limit v2
-(sharded, TTL, `AllowN`), observabilidad (metrics, tracing), y handler
-(HIT/MISS cache, auth, stream).
+(`POST /v1/embeddings` → OpenAI/Gemini), `internal/translate` (Anthropic/Gemini),
+auto-discovery, resiliencia, rate-limit v2, observabilidad, handler cache, y
+**admin** (auth `Bearer`, `POST /reload` rollback, `PATCH` runtime knobs,
+concurrent reload safety con `sync.Mutex`, file watcher `Watch` polling).
 
 ## Design decisions
 
