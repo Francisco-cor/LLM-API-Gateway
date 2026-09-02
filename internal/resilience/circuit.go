@@ -79,7 +79,7 @@ func (b *Breaker) Allow() bool {
 	case StateOpen:
 		if time.Since(b.lastOpenedAt) >= b.cfg.OpenTimeout {
 			b.state = StateHalfOpen
-			b.halfOpenPend = 0
+			b.halfOpenPend = 1
 			b.successes = 0
 			return true
 		}

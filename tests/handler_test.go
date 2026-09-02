@@ -148,8 +148,9 @@ func TestHandler_FallbackOnRetryableError(t *testing.T) {
 	if resp.ID != "fallback-id" {
 		t.Errorf("got response from %q, want fallback response", resp.ID)
 	}
-	if primary.callCount != 1 {
-		t.Errorf("primary called %d times, want 1", primary.callCount)
+	// with retry (3 attempts) primary is retried before fallback
+	if primary.callCount != 3 {
+		t.Errorf("primary called %d times, want 3 (retry: 3 attempts)", primary.callCount)
 	}
 	if fallback.callCount != 1 {
 		t.Errorf("fallback called %d times, want 1", fallback.callCount)
