@@ -42,7 +42,7 @@ func (h *HealthHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":         "ok",
-		"uptime_seconds": time.Since(time.Now().Add(-time.Since(h.startTime))).Seconds(),
+		"uptime_seconds": time.Since(h.startTime).Seconds(),
 		"start_time":     h.startTime.Format(time.RFC3339),
 		"ready":          h.ready.Load(),
 	})
@@ -65,6 +65,18 @@ func (h *LivenessHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 type ReadinessHandler struct {
 	registry *Registry
 	health   *HealthHandler
+	cacheMu  sync.Mutex
+	refresh  sync.Mutex
+	last     readinessSnapshot
+}
+
+const readinessCacheTTL = 15 * time.Second
+
+type readinessSnapshot struct {
+	at        time.Time
+	healthy   int
+	total     int
+	providers map[string]providerStatus
 }
 
 func NewReadinessHandler(registry *Registry) *ReadinessHandler {
@@ -87,7 +99,31 @@ func (h *ReadinessHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), healthCheckTimeout)
+	snapshot, ok := h.cachedSnapshot()
+	if !ok {
+		snapshot = h.refreshSnapshot(r.Context())
+	}
+
+	h.writeReadiness(w, snapshot)
+}
+
+func (h *ReadinessHandler) cachedSnapshot() (readinessSnapshot, bool) {
+	h.cacheMu.Lock()
+	defer h.cacheMu.Unlock()
+	if h.last.at.IsZero() || time.Since(h.last.at) >= readinessCacheTTL {
+		return readinessSnapshot{}, false
+	}
+	return cloneReadinessSnapshot(h.last), true
+}
+
+func (h *ReadinessHandler) refreshSnapshot(parent context.Context) readinessSnapshot {
+	// Collapse concurrent Kubernetes probes into one upstream health fan-out.
+	h.refresh.Lock()
+	defer h.refresh.Unlock()
+	if snapshot, ok := h.cachedSnapshot(); ok {
+		return snapshot
+	}
+	ctx, cancel := context.WithTimeout(parent, healthCheckTimeout)
 	defer cancel()
 
 	var mu sync.Mutex
@@ -113,24 +149,40 @@ func (h *ReadinessHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	_ = g.Wait()
+	snapshot := readinessSnapshot{at: time.Now(), healthy: healthy, total: len(h.registry.All()), providers: results}
+	h.cacheMu.Lock()
+	h.last = cloneReadinessSnapshot(snapshot)
+	h.cacheMu.Unlock()
+	return snapshot
+}
 
+func (h *ReadinessHandler) writeReadiness(w http.ResponseWriter, snapshot readinessSnapshot) {
 	w.Header().Set("Content-Type", "application/json")
-	if healthy == 0 && len(h.registry.All()) > 0 {
+	if snapshot.healthy == 0 && snapshot.total > 0 {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status":    "not_ready",
 			"healthy":   0,
-			"total":     len(h.registry.All()),
-			"providers": results,
+			"total":     snapshot.total,
+			"providers": snapshot.providers,
 		})
 		return
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":    "ready",
-		"healthy":   healthy,
-		"total":     len(h.registry.All()),
-		"providers": results,
+		"healthy":   snapshot.healthy,
+		"total":     snapshot.total,
+		"providers": snapshot.providers,
 	})
+}
+
+func cloneReadinessSnapshot(in readinessSnapshot) readinessSnapshot {
+	out := in
+	out.providers = make(map[string]providerStatus, len(in.providers))
+	for name, status := range in.providers {
+		out.providers[name] = status
+	}
+	return out
 }
 
 // providerStatus describes the outcome of a single provider's health check.

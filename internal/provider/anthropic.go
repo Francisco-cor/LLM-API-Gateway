@@ -82,7 +82,7 @@ func (a *Anthropic) Send(ctx context.Context, req ChatRequest) (ChatResponse, er
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := readProviderResponse(resp.Body)
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("read response: %w", err)
 	}
@@ -142,7 +142,7 @@ func (a *Anthropic) SendStream(ctx context.Context, req ChatRequest) (<-chan Str
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			data, _ := io.ReadAll(resp.Body)
+			data, _ := readProviderResponse(resp.Body)
 			errCh <- &ProviderError{
 				ProviderName: a.Name(),
 				StatusCode:   resp.StatusCode,
@@ -256,14 +256,16 @@ func (a *Anthropic) Embed(_ context.Context, _ EmbeddingRequest) (EmbeddingRespo
 func translateToAnthropic(req ChatRequest) anthropicRequest { return translate.ToAnthropic(req) }
 
 // translateFromAnthropic retained for backward compat (delegates to translate package).
-func translateFromAnthropic(resp anthropicResponse) ChatResponse { return translate.FromAnthropic(resp) }
+func translateFromAnthropic(resp anthropicResponse) ChatResponse {
+	return translate.FromAnthropic(resp)
+}
 
 func anthropicErrorMessage(body []byte) string {
 	var errResp anthropicErrorResponse
 	if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error.Message != "" {
-		return errResp.Error.Message
+		return truncateProviderError(errResp.Error.Message)
 	}
-	return string(body)
+	return providerErrorMessage(body)
 }
 
 func firstOrDefault(values []string, def string) string {

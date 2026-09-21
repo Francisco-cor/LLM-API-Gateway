@@ -67,6 +67,19 @@ func TestCache_BuildKeyDeterministic(t *testing.T) {
 	if cache.BuildKey(req1) == cache.BuildKey(req2) {
 		t.Error("different temperature should have different key")
 	}
+	req2 = req1
+	req2.ToolChoice = "required"
+	if cache.BuildKey(req1) == cache.BuildKey(req2) {
+		t.Error("different tool choice should have different key")
+	}
+	req2 = req1
+	req2.ResponseFormat = &provider.ResponseFormat{Type: "json_object"}
+	if cache.BuildKey(req1) == cache.BuildKey(req2) {
+		t.Error("different response format should have different key")
+	}
+	if cache.BuildKeyForIdentity(req1, "tenant-a") == cache.BuildKeyForIdentity(req1, "tenant-b") {
+		t.Error("different identities should not share cache keys")
+	}
 }
 
 func TestHandler_CacheHITMISS(t *testing.T) {

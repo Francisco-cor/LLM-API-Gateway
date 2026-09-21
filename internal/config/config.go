@@ -1,8 +1,10 @@
 package config
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -62,13 +64,13 @@ type ProviderConfig struct {
 }
 
 type RateLimitConfig struct {
-	Enabled           bool              `yaml:"enabled"`
-	RequestsPerMinute int               `yaml:"requests_per_minute"`
-	Burst             int               `yaml:"burst"`
-	RedisURL          string            `yaml:"redis_url"`
-	TokenAware        bool              `yaml:"token_aware"`
+	Enabled           bool                `yaml:"enabled"`
+	RequestsPerMinute int                 `yaml:"requests_per_minute"`
+	Burst             int                 `yaml:"burst"`
+	RedisURL          string              `yaml:"redis_url"`
+	TokenAware        bool                `yaml:"token_aware"`
 	Overrides         []RateLimitOverride `yaml:"overrides"`
-	Budget            *BudgetConfig     `yaml:"budget"`
+	Budget            *BudgetConfig       `yaml:"budget"`
 }
 
 type RateLimitOverride struct {
@@ -79,9 +81,10 @@ type RateLimitOverride struct {
 }
 
 type BudgetConfig struct {
-	Enabled           bool `yaml:"enabled"`
-	MonthlyTokens     int  `yaml:"monthly_tokens"`
-	MonthlyUSD        float64 `yaml:"monthly_usd"`
+	Enabled         bool    `yaml:"enabled"`
+	MonthlyTokens   int     `yaml:"monthly_tokens"`
+	MonthlyUSD      float64 `yaml:"monthly_usd"`
+	CostPerTokenUSD float64 `yaml:"cost_per_token_usd"`
 }
 
 type LoggingConfig struct {
@@ -106,9 +109,9 @@ type APIKeyConfig struct {
 }
 
 type ResilienceConfig struct {
-	Retry       RetryConfig    `yaml:"retry"`
-	Circuit     CircuitConfig  `yaml:"circuit"`
-	Hedge       HedgeConfig    `yaml:"hedge"`
+	Retry   RetryConfig   `yaml:"retry"`
+	Circuit CircuitConfig `yaml:"circuit"`
+	Hedge   HedgeConfig   `yaml:"hedge"`
 }
 
 type RetryConfig struct {
@@ -147,7 +150,16 @@ func Load(path string) (*Config, error) {
 		return "${" + key + "}"
 	})
 	var cfg Config
-	if err := yaml.Unmarshal([]byte(expanded), &cfg); err != nil {
+	decoder := yaml.NewDecoder(bytes.NewReader([]byte(expanded)))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
+		return nil, fmt.Errorf("parsing config: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("parsing config: multiple YAML documents are not supported")
+		}
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
 	setDefaults(&cfg)
@@ -198,6 +210,9 @@ func (c *Config) Validate() error {
 		if c.RateLimit.Budget.MonthlyUSD < 0 {
 			return fmt.Errorf("rate_limit.budget.monthly_usd must be >=0")
 		}
+		if c.RateLimit.Budget.CostPerTokenUSD < 0 {
+			return fmt.Errorf("rate_limit.budget.cost_per_token_usd must be >=0")
+		}
 	}
 	// Providers validation — APIKey may be empty or unexpanded "${...}" (treated as disabled, not an error)
 	if len(c.Providers) == 0 {
@@ -241,8 +256,17 @@ func (c *Config) Validate() error {
 	if c.Resilience.Retry.MaxAttempts < 0 {
 		return fmt.Errorf("resilience.retry.max_attempts must be >= 0")
 	}
+	if c.Resilience.Retry.BaseDelay < 0 || c.Resilience.Retry.MaxDelay < 0 {
+		return fmt.Errorf("resilience.retry delays must be >= 0")
+	}
 	if c.Resilience.Circuit.FailureThreshold < 0 {
 		return fmt.Errorf("resilience.circuit.failure_threshold must be >= 0")
+	}
+	if c.Resilience.Circuit.OpenTimeout < 0 {
+		return fmt.Errorf("resilience.circuit.open_timeout must be >= 0")
+	}
+	if c.Resilience.Hedge.Delay < 0 {
+		return fmt.Errorf("resilience.hedge.delay must be >= 0")
 	}
 	// model_aliases validation: aliases must point to existing providers via models map
 	for alias, targets := range c.ModelAliases {
@@ -314,6 +338,9 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.RateLimit.Burst == 0 {
 		cfg.RateLimit.Burst = 10
+	}
+	if cfg.RateLimit.Budget != nil && cfg.RateLimit.Budget.CostPerTokenUSD == 0 {
+		cfg.RateLimit.Budget.CostPerTokenUSD = 0.00001
 	}
 	if cfg.Logging.Level == "" {
 		cfg.Logging.Level = "info"

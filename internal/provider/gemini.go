@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -59,13 +58,14 @@ func (g *Gemini) Send(ctx context.Context, req ChatRequest) (ChatResponse, error
 		return ChatResponse{}, fmt.Errorf("marshal request: %w", err)
 	}
 
-	endpoint := fmt.Sprintf("%s/models/%s:generateContent?key=%s", g.baseURL, req.Model, url.QueryEscape(g.apiKey))
+	endpoint := fmt.Sprintf("%s/models/%s:generateContent", g.baseURL, req.Model)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("x-goog-api-key", g.apiKey)
 
 	resp, err := g.client.Do(httpReq)
 	if err != nil {
@@ -77,7 +77,7 @@ func (g *Gemini) Send(ctx context.Context, req ChatRequest) (ChatResponse, error
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := readProviderResponse(resp.Body)
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("read response: %w", err)
 	}
@@ -112,7 +112,7 @@ func (g *Gemini) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 			errCh <- fmt.Errorf("marshal request: %w", err)
 			return
 		}
-		endpoint := fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse&key=%s", g.baseURL, req.Model, url.QueryEscape(g.apiKey))
+		endpoint := fmt.Sprintf("%s/models/%s:streamGenerateContent?alt=sse", g.baseURL, req.Model)
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
 			errCh <- fmt.Errorf("build request: %w", err)
@@ -120,6 +120,7 @@ func (g *Gemini) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq.Header.Set("x-goog-api-key", g.apiKey)
 
 		resp, err := g.client.Do(httpReq)
 		if err != nil {
@@ -129,7 +130,7 @@ func (g *Gemini) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			data, _ := io.ReadAll(resp.Body)
+			data, _ := readProviderResponse(resp.Body)
 			errCh <- &ProviderError{
 				ProviderName: g.Name(),
 				StatusCode:   resp.StatusCode,
@@ -200,12 +201,13 @@ func (g *Gemini) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 }
 
 func (g *Gemini) HealthCheck(ctx context.Context) error {
-	endpoint := fmt.Sprintf("%s/models?key=%s", g.baseURL, url.QueryEscape(g.apiKey))
+	endpoint := fmt.Sprintf("%s/models", g.baseURL)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return err
 	}
+	httpReq.Header.Set("x-goog-api-key", g.apiKey)
 
 	resp, err := g.client.Do(httpReq)
 	if err != nil {
@@ -231,17 +233,18 @@ func (g *Gemini) Embed(ctx context.Context, req EmbeddingRequest) (EmbeddingResp
 		if err != nil {
 			return EmbeddingResponse{}, fmt.Errorf("marshal request: %w", err)
 		}
-		endpoint := fmt.Sprintf("%s/models/%s:embedContent?key=%s", g.baseURL, req.Model, url.QueryEscape(g.apiKey))
+		endpoint := fmt.Sprintf("%s/models/%s:embedContent", g.baseURL, req.Model)
 		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
 			return EmbeddingResponse{}, fmt.Errorf("build request: %w", err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("x-goog-api-key", g.apiKey)
 		resp, err := g.client.Do(httpReq)
 		if err != nil {
 			return EmbeddingResponse{}, &ProviderError{ProviderName: g.Name(), Message: err.Error(), Retryable: true}
 		}
-		dataBytes, err := io.ReadAll(resp.Body)
+		dataBytes, err := readProviderResponse(resp.Body)
 		resp.Body.Close()
 		if err != nil {
 			return EmbeddingResponse{}, fmt.Errorf("read response: %w", err)
@@ -279,11 +282,12 @@ func (g *Gemini) Embed(ctx context.Context, req EmbeddingRequest) (EmbeddingResp
 
 // DiscoverModels fetches available models from Gemini /v1beta/models
 func (g *Gemini) DiscoverModels(ctx context.Context) ([]string, error) {
-	endpoint := fmt.Sprintf("%s/models?key=%s", g.baseURL, url.QueryEscape(g.apiKey))
+	endpoint := fmt.Sprintf("%s/models", g.baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}
+	httpReq.Header.Set("x-goog-api-key", g.apiKey)
 	resp, err := g.client.Do(httpReq)
 	if err != nil {
 		return nil, err
@@ -342,7 +346,7 @@ func translateFromGemini(resp geminiResponse, model string) ChatResponse {
 func geminiErrorMessage(body []byte) string {
 	var errResp geminiErrorResponse
 	if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error.Message != "" {
-		return errResp.Error.Message
+		return truncateProviderError(errResp.Error.Message)
 	}
-	return string(body)
+	return providerErrorMessage(body)
 }

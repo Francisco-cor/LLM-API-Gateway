@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -40,10 +41,11 @@ func main() {
 	log := logger.New(cfg.Logging.Level, cfg.Logging.Format)
 
 	// tracing init (Fase 5) — noop if OTEL env not set
-	shutdownTracing, err := tracing.Init("llm-api-gateway")
-	if err != nil {
-		log.Warn("tracing init failed", "error", err)
-	} else {
+	shutdownTracing, tracingErr := tracing.Init("llm-api-gateway")
+	if tracingErr != nil {
+		log.Warn("tracing init failed; continuing with local tracing", "error", tracingErr)
+	}
+	if shutdownTracing != nil {
 		defer func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -69,25 +71,28 @@ func main() {
 		registry = proxy.NewRegistryWithAliases(providers, cfg.ModelAliases)
 	}
 	registry.SetRandSeed(time.Now().UnixNano())
-	limiter := ratelimit.New(cfg.RateLimit.RequestsPerMinute, cfg.RateLimit.Burst)
+	var limiter ratelimit.Backend = ratelimit.New(cfg.RateLimit.RequestsPerMinute, cfg.RateLimit.Burst)
 	// Redis distributed limiter (optional, Fase 6)
 	var redisClient *redis.Client
 	if cfg.RateLimit.RedisURL != "" && cfg.RateLimit.RedisURL != "${REDIS_URL}" {
 		if rl, err := ratelimit.NewRedis(cfg.RateLimit.RedisURL, cfg.RateLimit.RequestsPerMinute, cfg.RateLimit.Burst); err == nil {
-			log.Info("redis limiter enabled", "url", cfg.RateLimit.RedisURL)
-			_ = rl
+			log.Info("redis limiter enabled")
+			limiter = rl
 			opts, _ := redis.ParseURL(cfg.RateLimit.RedisURL)
 			redisClient = redis.NewClient(opts)
 		} else {
 			log.Warn("redis limiter failed, using memory", "error", err)
 		}
 	}
+	if closer, ok := limiter.(interface{ Close() error }); ok {
+		defer func() { _ = closer.Close() }()
+	}
 	authStore := auth.New(cfg.Auth.Keys)
 
 	// Budget manager (Fase 6)
 	var budgetMgr *budget.Manager
 	if cfg.RateLimit.Budget != nil && cfg.RateLimit.Budget.Enabled {
-		budgetMgr = budget.New(cfg.RateLimit.Budget.MonthlyTokens, cfg.RateLimit.Budget.MonthlyUSD, redisClient)
+		budgetMgr = budget.NewWithCost(cfg.RateLimit.Budget.MonthlyTokens, cfg.RateLimit.Budget.MonthlyUSD, cfg.RateLimit.Budget.CostPerTokenUSD, redisClient)
 		log.Info("budget enabled", "tokens", cfg.RateLimit.Budget.MonthlyTokens, "usd", cfg.RateLimit.Budget.MonthlyUSD)
 	}
 	overrideStore := ratelimit.NewOverrideStore(cfg.RateLimit)
@@ -127,8 +132,10 @@ func main() {
 
 	health := proxy.NewHealthHandler()
 	mux := http.NewServeMux()
-	handlerOpts := proxy.NewHandlerWithCache(registry, cfg.FallbackChain, log, retryCfg, circuitCfg, hedgeCfg, limiter, overrideStore, budgetMgr, cfg.RateLimit.TokenAware, cacheInst, cfg.Cache.TTL)
-	embedHandler := proxy.NewEmbeddingsHandler(registry, cfg.FallbackChain, log)
+	rateLimitEnabled := &atomic.Bool{}
+	rateLimitEnabled.Store(cfg.RateLimit.Enabled)
+	handlerOpts := proxy.NewHandlerWithCache(registry, cfg.FallbackChain, log, retryCfg, circuitCfg, hedgeCfg, limiter, overrideStore, budgetMgr, cfg.RateLimit.Enabled && cfg.RateLimit.TokenAware, cacheInst, cfg.Cache.TTL)
+	embedHandler := proxy.NewEmbeddingsHandlerWithResilienceAndBudget(registry, cfg.FallbackChain, log, limiter, overrideStore, cfg.RateLimit.Enabled && cfg.RateLimit.TokenAware, retryCfg, circuitCfg, budgetMgr)
 	mux.Handle("POST /v1/chat/completions", handlerOpts)
 	mux.Handle("POST /v1/embeddings", embedHandler)
 	mux.Handle("GET /v1/models", proxy.NewModelsHandler(registry))
@@ -139,12 +146,12 @@ func main() {
 	mux.Handle("GET /metrics", proxy.NewMetricsHandler())
 
 	var handler http.Handler = mux
+	// Keep this wrapper installed so admin/SIGHUP hot-reload can toggle the
+	// feature without rebuilding the HTTP server.
+	handler = proxy.RateLimitWithEnabled(limiter, overrideStore, rateLimitEnabled, handler)
 	if cfg.Auth.Enabled {
 		handler = auth.Middleware(authStore, handler)
 		log.Info("auth enabled", "keys", len(cfg.Auth.Keys))
-	}
-	if cfg.RateLimit.Enabled {
-		handler = proxy.RateLimit(limiter, handler)
 	}
 	if len(cfg.CORS.AllowedOrigins) > 0 {
 		handler = proxy.CORS(cfg.CORS.AllowedOrigins)(handler)
@@ -197,6 +204,7 @@ func main() {
 		// update limiter and overrides
 		limiter.UpdateLimits(newCfg.RateLimit.RequestsPerMinute, newCfg.RateLimit.Burst)
 		overrideStore.Reload(newCfg.RateLimit)
+		rateLimitEnabled.Store(newCfg.RateLimit.Enabled)
 
 		// auth
 		authStore.Reload(newCfg.Auth.Keys)
@@ -238,6 +246,9 @@ func main() {
 		handlerOpts.SetRetryConfig(newRetryCfg)
 		handlerOpts.SetCircuitConfig(newCircuitCfg)
 		handlerOpts.SetHedgeConfig(newHedgeCfg)
+		handlerOpts.SetTokenAware(newCfg.RateLimit.Enabled && newCfg.RateLimit.TokenAware)
+		embedHandler.SetTokenAware(newCfg.RateLimit.Enabled && newCfg.RateLimit.TokenAware)
+		embedHandler.SetResilience(newRetryCfg, newCircuitCfg)
 		handlerOpts.SetFallbackChain(newCfg.FallbackChain)
 		embedHandler.SetFallbackChain(newCfg.FallbackChain)
 

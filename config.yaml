@@ -85,6 +85,7 @@ rate_limit:
     enabled: false
     monthly_tokens: 1000000
     monthly_usd: 100.0
+    cost_per_token_usd: 0.00001
 
 resilience:
   retry:

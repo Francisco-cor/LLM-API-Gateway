@@ -148,3 +148,19 @@ func TestHedge_PrimarySlowFallbackWins(t *testing.T) {
 		t.Errorf("val=%v, want primary or fallback", val)
 	}
 }
+
+func TestHedge_FallbackErrorDoesNotMaskPrimary(t *testing.T) {
+	ctx := context.Background()
+	val, err := resilience.DoHedge(ctx, 5*time.Millisecond,
+		func() (any, error) {
+			time.Sleep(20 * time.Millisecond)
+			return "primary", nil
+		},
+		func() (any, error) {
+			return nil, errors.New("fallback unavailable")
+		},
+	)
+	if err != nil || val != "primary" {
+		t.Fatalf("got value=%v err=%v, want primary success", val, err)
+	}
+}

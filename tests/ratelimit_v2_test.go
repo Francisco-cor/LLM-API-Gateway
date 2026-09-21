@@ -23,6 +23,26 @@ func TestLimiter_AllowN_TokenAware(t *testing.T) {
 	}
 }
 
+func TestLimiter_CloseIsIdempotent(t *testing.T) {
+	limiter := ratelimit.New(60, 1)
+	if err := limiter.Close(); err != nil {
+		t.Fatalf("first Close returned error: %v", err)
+	}
+	if err := limiter.Close(); err != nil {
+		t.Fatalf("second Close returned error: %v", err)
+	}
+}
+
+func TestLimiter_PerKeyOverride(t *testing.T) {
+	limiter := ratelimit.New(60, 1)
+	if !limiter.AllowWithLimits("override-key", 5, 600, 5) {
+		t.Fatal("override should allow its configured burst")
+	}
+	if limiter.AllowWithLimits("override-key", 1, 600, 5) {
+		t.Fatal("override burst should be exhausted")
+	}
+}
+
 func TestLimiter_TTLExpiration(t *testing.T) {
 	limiter := ratelimit.New(600, 1) // high rate so refill fast, but test TTL path via Tokens
 	key := "ttl-key"

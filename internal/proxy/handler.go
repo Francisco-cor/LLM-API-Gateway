@@ -31,22 +31,22 @@ import (
 // and response caching per Fase 7.
 // It supports hot-reload via Update* methods protected by mu.
 type Handler struct {
-	registry      *Registry
-	log           *slog.Logger
+	registry *Registry
+	log      *slog.Logger
 
 	mu            sync.RWMutex
 	fallbackChain []string
-	retryCfg       resilience.RetryConfig
-	circuitCfg     resilience.CircuitConfig
-	circuits       map[string]*resilience.Breaker
-	circuitsMu     sync.RWMutex
-	hedgeCfg       hedgeConfig
-	limiter        *ratelimit.Limiter
-	overrideStore  *ratelimit.OverrideStore
-	budgetMgr      *budget.Manager
-	tokenAware     bool
-	cache          cache.Cache
-	cacheTTL       time.Duration
+	retryCfg      resilience.RetryConfig
+	circuitCfg    resilience.CircuitConfig
+	circuits      map[string]*resilience.Breaker
+	circuitsMu    sync.RWMutex
+	hedgeCfg      hedgeConfig
+	limiter       ratelimit.Backend
+	overrideStore *ratelimit.OverrideStore
+	budgetMgr     *budget.Manager
+	tokenAware    bool
+	cache         cache.Cache
+	cacheTTL      time.Duration
 }
 
 type hedgeConfig struct {
@@ -64,13 +64,20 @@ func NewHandlerWithResilience(registry *Registry, fallbackChain []string, log *s
 	return NewHandlerWithResilienceAndBudget(registry, fallbackChain, log, retryCfg, circuitCfg, hedge, nil, nil, nil, false)
 }
 
+// NewHandlerWithBudget creates a handler with default resilience and a budget
+// manager. It keeps budget integration usable without exposing the internal
+// hedge configuration type to external packages.
+func NewHandlerWithBudget(registry *Registry, fallbackChain []string, log *slog.Logger, budgetMgr *budget.Manager) *Handler {
+	return NewHandlerWithResilienceAndBudget(registry, fallbackChain, log, resilience.DefaultRetryConfig(), resilience.DefaultCircuitConfig(), hedgeConfig{}, nil, nil, budgetMgr, false)
+}
+
 // NewHandlerWithResilienceAndBudget extends NewHandlerWithResilience with Fase 6 budget and token-aware rate limit.
-func NewHandlerWithResilienceAndBudget(registry *Registry, fallbackChain []string, log *slog.Logger, retryCfg resilience.RetryConfig, circuitCfg resilience.CircuitConfig, hedge hedgeConfig, limiter *ratelimit.Limiter, overrides *ratelimit.OverrideStore, budgetMgr *budget.Manager, tokenAware bool) *Handler {
+func NewHandlerWithResilienceAndBudget(registry *Registry, fallbackChain []string, log *slog.Logger, retryCfg resilience.RetryConfig, circuitCfg resilience.CircuitConfig, hedge hedgeConfig, limiter ratelimit.Backend, overrides *ratelimit.OverrideStore, budgetMgr *budget.Manager, tokenAware bool) *Handler {
 	return NewHandlerWithCache(registry, fallbackChain, log, retryCfg, circuitCfg, hedge, limiter, overrides, budgetMgr, tokenAware, nil, 0)
 }
 
 // NewHandlerWithCache extends with Fase 7 cache support.
-func NewHandlerWithCache(registry *Registry, fallbackChain []string, log *slog.Logger, retryCfg resilience.RetryConfig, circuitCfg resilience.CircuitConfig, hedge hedgeConfig, limiter *ratelimit.Limiter, overrides *ratelimit.OverrideStore, budgetMgr *budget.Manager, tokenAware bool, c cache.Cache, ttl time.Duration) *Handler {
+func NewHandlerWithCache(registry *Registry, fallbackChain []string, log *slog.Logger, retryCfg resilience.RetryConfig, circuitCfg resilience.CircuitConfig, hedge hedgeConfig, limiter ratelimit.Backend, overrides *ratelimit.OverrideStore, budgetMgr *budget.Manager, tokenAware bool, c cache.Cache, ttl time.Duration) *Handler {
 	h := &Handler{
 		registry:      registry,
 		fallbackChain: fallbackChain,
@@ -126,6 +133,20 @@ func (h *Handler) SetHedgeConfig(cfg hedgeConfig) {
 	h.mu.Lock()
 	h.hedgeCfg = cfg
 	h.mu.Unlock()
+}
+
+// SetTokenAware enables or disables the per-request token bucket during a
+// configuration reload without rebuilding the HTTP handler chain.
+func (h *Handler) SetTokenAware(enabled bool) {
+	h.mu.Lock()
+	h.tokenAware = enabled
+	h.mu.Unlock()
+}
+
+func (h *Handler) tokenAwareEnabled() bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.tokenAware
 }
 
 // SetCache updates cache instance and TTL atomically.
@@ -210,9 +231,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req provider.ChatRequest
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
+	if err := decodeSingleJSON(body, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON body: "+err.Error())
 		return
 	}
@@ -229,42 +248,28 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-ID")
 	ctx := r.Context()
 
-	// Fase 6: per-tenant/model override + budget check
+	// Fase 6: per-tenant/model token override.
 	if h.overrideStore != nil && h.limiter != nil {
 		rpm, burst := h.overrideStore.Resolve(tenant, req.Model)
-		_ = rpm
-		_ = burst
-		if h.tokenAware {
+		if h.tokenAwareEnabled() {
 			chars := 0
 			for _, m := range req.Messages {
 				chars += len(m.Content)
 			}
 			estTokens := ratelimit.EstimateTokens(chars)
-			key := r.Header.Get("Authorization")
-			if key == "" {
-				key = r.RemoteAddr
-			}
-			if tenant != "" {
-				key = tenant
-			}
-			if !h.limiter.AllowN(key+"_tokens", estTokens) {
-				w.Header().Set("Retry-After", "1")
+			key := clientRateLimitKey(r)
+			if !h.limiter.AllowWithLimits(key+":tokens", estTokens, rpm, burst) {
+				retryAfter := h.limiter.RetryAfterWithLimits(key+":tokens", rpm, burst)
+				seconds := int64(retryAfter / time.Second)
+				if seconds < 1 {
+					seconds = 1
+				}
+				w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
 				writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "token budget exceeded, retry later")
 				return
 			}
 		}
 	}
-	if h.budgetMgr != nil {
-		if err := h.budgetMgr.Check(tenant); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusTooManyRequests)
-			_ = json.NewEncoder(w).Encode(provider.ErrorResponse{
-				Error: provider.Error{Message: err.Error(), Type: "insufficient_quota", Code: "429"},
-			})
-			return
-		}
-	}
-
 	// Fase 7: cache lookup (only non-streaming 200 responses are cached)
 	var cacheKey string
 	var cacheTTL time.Duration
@@ -281,7 +286,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				cacheTTL = 5 * time.Minute
 			}
 		}
-		cacheKey = cache.BuildKey(req)
+		cacheKey = cache.BuildKeyForIdentity(req, r.Header.Get("Authorization"))
 		if data, ok := cached.Get(cacheKey); ok {
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("X-Cache", "HIT")
@@ -295,15 +300,35 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		metrics.CacheHits.WithLabelValues("miss").Inc()
 	}
 
-	if req.Stream {
-		h.handleStream(w, r, req, requestID, ctx)
+	budgetReservation, estimatedTokens, estimatedUSD, err := h.reserveChatBudget(tenant, req)
+	if err != nil {
+		writeBudgetError(w, err)
 		return
 	}
 
+	if req.Stream {
+		started := h.handleStream(w, r, req, requestID, ctx)
+		if budgetReservation != nil {
+			if started {
+				if err := budgetReservation.Commit(estimatedTokens, estimatedUSD); err != nil {
+					h.log.Warn("stream budget adjustment exceeded estimate", "tenant", tenant, "error", err)
+				}
+			} else {
+				budgetReservation.Cancel()
+			}
+		}
+		return
+	}
+	budgetCommitted := false
+	defer func() {
+		if budgetReservation != nil && !budgetCommitted {
+			budgetReservation.Cancel()
+		}
+	}()
+
 	// OTEL span per chat completion
 	tracer := otel.Tracer("gateway.handler")
-	ctx, span := tracer.Start(ctx, "chat.completions",
-	)
+	ctx, span := tracer.Start(ctx, "chat.completions")
 	span.SetAttributes(
 		attribute.String("model", req.Model),
 		attribute.String("request_id", requestID),
@@ -354,10 +379,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// metrics + cache store
 	metrics.ObserveTokens(providerName, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
 	metrics.CircuitState.WithLabelValues(providerName).Set(float64(h.breakerFor(providerName).State()))
-	if h.budgetMgr != nil {
-		tenant := r.Header.Get("X-Tenant-ID")
-		usd := float64(resp.Usage.TotalTokens) * 0.00001
-		h.budgetMgr.Record(tenant, resp.Usage.TotalTokens, usd)
+	if budgetReservation != nil {
+		actualUSD := h.budgetMgr.CostForTokens(resp.Usage.TotalTokens)
+		if err := budgetReservation.Commit(resp.Usage.TotalTokens, actualUSD); err != nil {
+			h.log.Warn("budget adjustment exceeded estimate", "tenant", tenant, "error", err)
+		}
+		budgetCommitted = true
 	}
 	// Fase 7: cache store (only cache successful non-streaming)
 	w.Header().Set("Content-Type", "application/json")
@@ -376,6 +403,50 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+func (h *Handler) reserveChatBudget(tenant string, req provider.ChatRequest) (*budget.Reservation, int, float64, error) {
+	if h.budgetMgr == nil {
+		return nil, 0, 0, nil
+	}
+	chars := 0
+	for _, message := range req.Messages {
+		chars += len(message.Content)
+	}
+	tokens := ratelimit.EstimateTokens(chars)
+	if req.MaxTokens != nil && *req.MaxTokens > 0 {
+		tokens += *req.MaxTokens
+	}
+	usd := h.budgetMgr.CostForTokens(tokens)
+	reservation, err := h.budgetMgr.Reserve(tenant, tokens, usd)
+	return reservation, tokens, usd, err
+}
+
+func writeBudgetError(w http.ResponseWriter, err error) {
+	if errors.Is(err, budget.ErrUnavailable) {
+		writeError(w, http.StatusServiceUnavailable, "budget_unavailable", "budget service temporarily unavailable")
+		return
+	}
+	writeError(w, http.StatusTooManyRequests, "insufficient_quota", err.Error())
+}
+
+// decodeSingleJSON accepts exactly one JSON value and rejects trailing data.
+// Without the second Decode, bodies such as {"...":...}{"...":...} were
+// silently accepted, which is surprising for clients and proxies.
+func decodeSingleJSON(body []byte, dst any) error {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple JSON values are not allowed")
+		}
+		return err
+	}
+	return nil
+}
+
 // propagateRetryAfter writes Retry-After header if err is retryable ProviderError with RetryAfter set.
 func propagateRetryAfter(w http.ResponseWriter, err error) {
 	var pe *provider.ProviderError
@@ -387,75 +458,168 @@ func propagateRetryAfter(w http.ResponseWriter, err error) {
 	}
 }
 
-func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req provider.ChatRequest, requestID string, ctx context.Context) {
+func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req provider.ChatRequest, requestID string, ctx context.Context) bool {
 	primary, err := h.registry.Resolve(req.Model)
 	if err != nil {
 		writeError(w, http.StatusNotFound, "model_not_found", err.Error())
-		return
+		return false
 	}
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "server_error", "streaming not supported")
-		return
+		return false
 	}
+
+	session, err := h.openStream(ctx, req, primary, requestID)
+	if err != nil {
+		propagateRetryAfter(w, err)
+		writeError(w, http.StatusBadGateway, "provider_error", err.Error())
+		return false
+	}
+	defer session.cancel()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Gateway-Provider", primary.Name())
+	w.Header().Set("X-Gateway-Provider", session.provider.Name())
+	// http.Server.WriteTimeout is useful for ordinary responses but otherwise
+	// caps valid long-lived SSE sessions. Clear the per-response deadline after
+	// the first upstream chunk proves that this is an active stream.
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
 	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
 
-	ch, errCh := primary.SendStream(ctx, req)
-
-	enc := json.NewEncoder(w)
-	_ = enc
+	writeChunk := func(chunk provider.StreamChunk) {
+		data, _ := json.Marshal(chunk)
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(data)
+		_, _ = w.Write([]byte("\n\n"))
+		flusher.Flush()
+	}
+	if session.first != nil {
+		writeChunk(*session.first)
+	}
 
 	for {
+		select {
+		case chunk, ok := <-session.ch:
+			if !ok {
+				session.ch = nil
+				_, _ = w.Write([]byte("data: [DONE]\n\n"))
+				flusher.Flush()
+				h.log.Info("stream completed", "model", req.Model, "provider", session.provider.Name(), "request_id", requestID)
+				return true
+			}
+			writeChunk(chunk)
+		case streamErr, ok := <-session.errCh:
+			session.errCh = nil
+			if ok && streamErr != nil {
+				h.log.Error("stream provider error", "provider", session.provider.Name(), "request_id", requestID, "error", streamErr)
+				_, _ = w.Write([]byte("event: error\ndata: "))
+				data, _ := json.Marshal(provider.ErrorResponse{Error: provider.Error{
+					Message: streamErr.Error(), Type: "provider_error", Code: "provider_error",
+				}})
+				_, _ = w.Write(data)
+				_, _ = w.Write([]byte("\n\ndata: [DONE]\n\n"))
+				flusher.Flush()
+				return true
+			}
+		case <-r.Context().Done():
+			return true
+		}
+		if session.ch == nil && session.errCh == nil {
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			flusher.Flush()
+			return true
+		}
+	}
+}
+
+type streamSession struct {
+	provider provider.Provider
+	ch       <-chan provider.StreamChunk
+	errCh    <-chan error
+	first    *provider.StreamChunk
+	cancel   context.CancelFunc
+}
+
+// openStream waits for the first upstream event before committing the HTTP
+// response. That makes retryable early stream failures eligible for the same
+// fallback chain as non-streaming requests; once bytes are sent, a stream
+// cannot be transparently moved to another provider.
+func (h *Handler) openStream(ctx context.Context, req provider.ChatRequest, primary provider.Provider, requestID string) (*streamSession, error) {
+	providers := []provider.Provider{primary}
+	for _, name := range h.getFallbackChain() {
+		if name == primary.Name() {
+			continue
+		}
+		if p, ok := h.registry.Get(name); ok {
+			providers = append(providers, p)
+		}
+	}
+
+	var lastErr error
+	for i, p := range providers {
+		b := h.breakerFor(p.Name())
+		if !b.Allow() {
+			h.log.Warn("stream circuit open, skipping provider", "provider", p.Name(), "request_id", requestID)
+			continue
+		}
+		mapped := req
+		if i > 0 {
+			mapped = h.registry.RemapForFallback(req, p)
+		}
+		streamCtx, cancel := context.WithCancel(ctx)
+		ch, errCh := p.SendStream(streamCtx, mapped)
+		first, err := firstStreamChunk(streamCtx, ch, errCh)
+		if err != nil {
+			cancel()
+			lastErr = err
+			b.RecordFailure()
+			if !provider.IsRetryable(err) {
+				return nil, err
+			}
+			h.log.Warn("stream provider failed before first chunk, trying fallback", "provider", p.Name(), "request_id", requestID, "error", err)
+			continue
+		}
+		b.RecordSuccess()
+		return &streamSession{provider: p, ch: ch, errCh: errCh, first: first, cancel: cancel}, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("all providers failed for streaming model %q", req.Model)
+}
+
+func firstStreamChunk(ctx context.Context, ch <-chan provider.StreamChunk, errCh <-chan error) (*provider.StreamChunk, error) {
+	for ch != nil || errCh != nil {
 		select {
 		case chunk, ok := <-ch:
 			if !ok {
 				ch = nil
-				// check errCh before closing
-				select {
-				case err := <-errCh:
-					if err != nil {
-						h.log.Error("stream error", "provider", primary.Name(), "request_id", requestID, "error", err)
-					}
-				default:
-				}
-				_, _ = w.Write([]byte("data: [DONE]\n\n"))
-				flusher.Flush()
-				h.log.Info("stream completed", "model", req.Model, "provider", primary.Name(), "request_id", requestID)
-				return
+				continue
 			}
-			data, _ := json.Marshal(chunk)
-			_, _ = w.Write([]byte("data: "))
-			_, _ = w.Write(data)
-			_, _ = w.Write([]byte("\n\n"))
-			flusher.Flush()
-		case err := <-errCh:
+			return &chunk, nil
+		case err, ok := <-errCh:
+			if !ok {
+				errCh = nil
+				continue
+			}
 			if err != nil {
-				if provider.IsRetryable(err) {
-					h.log.Warn("stream primary failed, fallback not yet implemented for streams", "provider", primary.Name(), "request_id", requestID, "error", err)
-				}
-				h.log.Error("stream provider error", "provider", primary.Name(), "request_id", requestID, "error", err)
+				return nil, err
 			}
-			errCh = nil
 		case <-ctx.Done():
-			return
-		}
-		if ch == nil && errCh == nil {
-			_, _ = w.Write([]byte("data: [DONE]\n\n"))
-			flusher.Flush()
-			return
+			return nil, ctx.Err()
 		}
 	}
+	return nil, nil
 }
 
 // dispatch sends req to the provider that owns req.Model with retry, circuit breaker and hedge.
 // If primary returns retryable error, it tries each fallback in chain, remapping model via aliases.
 func (h *Handler) dispatch(ctx context.Context, req provider.ChatRequest, requestID string) (provider.ChatResponse, string, error) {
+	var lastErr error
 	primary, err := h.registry.Resolve(req.Model)
 	if err != nil {
 		return provider.ChatResponse{}, "", err
@@ -470,6 +634,7 @@ func (h *Handler) dispatch(ctx context.Context, req provider.ChatRequest, reques
 			h.breakerFor(primary.Name()).RecordSuccess()
 			return resp, primary.Name(), nil
 		}
+		lastErr = err
 		h.breakerFor(primary.Name()).RecordFailure()
 		if !provider.IsRetryable(err) {
 			return provider.ChatResponse{}, "", err
@@ -514,6 +679,7 @@ func (h *Handler) dispatch(ctx context.Context, req provider.ChatRequest, reques
 			)
 			return resp, fallback.Name(), nil
 		}
+		lastErr = err
 		h.breakerFor(fallback.Name()).RecordFailure()
 		h.log.Warn("fallback provider failed",
 			"provider", fallback.Name(),
@@ -526,6 +692,9 @@ func (h *Handler) dispatch(ctx context.Context, req provider.ChatRequest, reques
 		}
 	}
 
+	if lastErr != nil {
+		return provider.ChatResponse{}, "", lastErr
+	}
 	return provider.ChatResponse{}, "", fmt.Errorf("all providers failed for model %q", req.Model)
 }
 
@@ -540,7 +709,13 @@ func (h *Handler) sendWithRetry(ctx context.Context, p provider.Provider, req pr
 		return err
 	})
 	if err != nil {
-		return provider.ChatResponse{}, lastErr
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return provider.ChatResponse{}, ctxErr
+		}
+		if lastErr != nil {
+			return provider.ChatResponse{}, lastErr
+		}
+		return provider.ChatResponse{}, err
 	}
 	return resp, nil
 }
@@ -568,13 +743,17 @@ func (h *Handler) dispatchHedge(ctx context.Context, req provider.ChatRequest, r
 	h.log.Info("hedge enabled, racing fallbacks", "request_id", requestID, "p1", candidates[0].Name(), "p2", candidates[1].Name())
 	ctx, cancel := context.WithTimeout(ctx, retryCfg.MaxDelay*2+5*time.Second)
 	defer cancel()
+	type hedgeResult struct {
+		response provider.ChatResponse
+		provider string
+	}
 	val, err := resilience.DoHedge(ctx, hedgeCfg.Delay,
 		func() (any, error) {
 			mapped := h.registry.RemapForFallback(req, candidates[0])
 			resp, e := h.sendWithRetry(ctx, candidates[0], mapped)
 			if e == nil {
 				h.breakerFor(candidates[0].Name()).RecordSuccess()
-				return resp, nil
+				return hedgeResult{response: resp, provider: candidates[0].Name()}, nil
 			}
 			h.breakerFor(candidates[0].Name()).RecordFailure()
 			return nil, e
@@ -584,7 +763,7 @@ func (h *Handler) dispatchHedge(ctx context.Context, req provider.ChatRequest, r
 			resp, e := h.sendWithRetry(ctx, candidates[1], mapped)
 			if e == nil {
 				h.breakerFor(candidates[1].Name()).RecordSuccess()
-				return resp, nil
+				return hedgeResult{response: resp, provider: candidates[1].Name()}, nil
 			}
 			h.breakerFor(candidates[1].Name()).RecordFailure()
 			return nil, e
@@ -593,10 +772,8 @@ func (h *Handler) dispatchHedge(ctx context.Context, req provider.ChatRequest, r
 	if err != nil {
 		return provider.ChatResponse{}, "", false
 	}
-	if resp, ok := val.(provider.ChatResponse); ok {
-		// determine which provider won: best-effort by checking which one returned without error first
-		// we return first candidate as name if both could have won; ideally DoHedge returns name too
-		return resp, candidates[0].Name(), true
+	if result, ok := val.(hedgeResult); ok {
+		return result.response, result.provider, true
 	}
 	return provider.ChatResponse{}, "", false
 }

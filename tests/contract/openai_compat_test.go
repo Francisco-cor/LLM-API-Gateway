@@ -29,9 +29,9 @@ type mockProvider struct {
 	streamErr chan error
 }
 
-func (m *mockProvider) Name() string               { return m.name }
-func (m *mockProvider) Models() []string           { return m.models }
-func (m *mockProvider) SetModels(models []string)  { m.models = models }
+func (m *mockProvider) Name() string                        { return m.name }
+func (m *mockProvider) Models() []string                    { return m.models }
+func (m *mockProvider) SetModels(models []string)           { m.models = models }
 func (m *mockProvider) HealthCheck(_ context.Context) error { return nil }
 func (m *mockProvider) Send(_ context.Context, _ provider.ChatRequest) (provider.ChatResponse, error) {
 	m.callCount++
@@ -184,8 +184,8 @@ func TestContract_DisallowUnknownFields(t *testing.T) {
 	openai := &mockProvider{name: "openai", models: []string{"gpt-4o"}, resp: sampleChatResponse("gpt-4o")}
 	gw := buildGateway([]provider.Provider{openai}, []string{"openai"})
 	body, _ := json.Marshal(map[string]any{
-		"model":    "gpt-4o",
-		"messages": []map[string]string{{"role": "user", "content": "hi"}},
+		"model":         "gpt-4o",
+		"messages":      []map[string]string{{"role": "user", "content": "hi"}},
 		"unknown_field": "oops",
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
@@ -270,6 +270,55 @@ func TestContract_Stream_DONE(t *testing.T) {
 			t.Errorf("chunk not valid JSON: %v payload %q", err, payload)
 		}
 	}
+}
+
+func TestContract_StreamFallbackBeforeHeaders(t *testing.T) {
+	primary := &mockProvider{
+		name:      "openai",
+		models:    []string{"gpt-4o"},
+		streamErr: errorChannel(&provider.ProviderError{ProviderName: "openai", StatusCode: http.StatusBadGateway, Message: "upstream", Retryable: true}),
+	}
+	fallbackCh := make(chan provider.StreamChunk, 1)
+	fallbackCh <- provider.StreamChunk{
+		ID: "chatcmpl-fallback", Object: "chat.completion.chunk", Model: "gpt-4o",
+		Choices: []provider.StreamChoice{{Index: 0, Delta: provider.ChatMessage{Role: "assistant", Content: "fallback"}}},
+	}
+	close(fallbackCh)
+	fallback := &mockProvider{name: "anthropic", models: []string{"claude-sonnet-4-6"}, streamCh: fallbackCh}
+	gw := buildGateway([]provider.Provider{primary, fallback}, []string{"openai", "anthropic"})
+	body := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	gw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("stream fallback expected 200 got %d body %s", w.Code, w.Body.String())
+	}
+	if w.Header().Get("X-Gateway-Provider") != "anthropic" {
+		t.Fatalf("provider header %q want anthropic", w.Header().Get("X-Gateway-Provider"))
+	}
+	if !strings.Contains(w.Body.String(), "fallback") || !strings.Contains(w.Body.String(), "data: [DONE]") {
+		t.Fatalf("fallback stream body incomplete: %s", w.Body.String())
+	}
+}
+
+func TestContract_StreamThroughResponseMiddleware(t *testing.T) {
+	openai := &mockProvider{name: "openai", models: []string{"gpt-4o"}}
+	base := buildGateway([]provider.Provider{openai}, []string{"openai"})
+	gw := proxy.Metrics(proxy.Logging(discardLogger(), base))
+	body := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	gw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "data: [DONE]") {
+		t.Fatalf("stream through middleware got status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func errorChannel(err error) chan error {
+	ch := make(chan error, 1)
+	ch <- err
+	close(ch)
+	return ch
 }
 
 // TestContract_ModelsEndpoint validates GET /v1/models aggregation.

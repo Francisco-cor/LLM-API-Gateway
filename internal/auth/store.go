@@ -41,7 +41,7 @@ func (s *Store) Reload(keys []config.APIKeyConfig) {
 		h := hashKey(k.Key)
 		m[h] = &Key{
 			Tenant:    k.Tenant,
-			Scopes:    k.Scopes,
+			Scopes:    append([]string(nil), k.Scopes...),
 			ExpiresAt: k.ExpiresAt,
 			hash:      h,
 		}

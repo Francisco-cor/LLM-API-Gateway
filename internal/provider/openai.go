@@ -60,7 +60,7 @@ func (o *OpenAI) Send(ctx context.Context, req ChatRequest) (ChatResponse, error
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := readProviderResponse(resp.Body)
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("read response: %w", err)
 	}
@@ -69,7 +69,7 @@ func (o *OpenAI) Send(ctx context.Context, req ChatRequest) (ChatResponse, error
 		return ChatResponse{}, &ProviderError{
 			ProviderName: o.Name(),
 			StatusCode:   resp.StatusCode,
-			Message:      string(data),
+			Message:      providerErrorMessage(data),
 			Retryable:    resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500,
 			RetryAfter:   parseRetryAfter(resp.Header.Get("Retry-After")),
 		}
@@ -113,11 +113,11 @@ func (o *OpenAI) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			data, _ := io.ReadAll(resp.Body)
+			data, _ := readProviderResponse(resp.Body)
 			errCh <- &ProviderError{
 				ProviderName: o.Name(),
 				StatusCode:   resp.StatusCode,
-				Message:      string(data),
+				Message:      providerErrorMessage(data),
 				Retryable:    resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500,
 				RetryAfter:   parseRetryAfter(resp.Header.Get("Retry-After")),
 			}
@@ -195,7 +195,7 @@ func (o *OpenAI) Embed(ctx context.Context, req EmbeddingRequest) (EmbeddingResp
 		return EmbeddingResponse{}, &ProviderError{ProviderName: o.Name(), Message: err.Error(), Retryable: true}
 	}
 	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
+	data, err := readProviderResponse(resp.Body)
 	if err != nil {
 		return EmbeddingResponse{}, fmt.Errorf("read response: %w", err)
 	}
@@ -203,7 +203,7 @@ func (o *OpenAI) Embed(ctx context.Context, req EmbeddingRequest) (EmbeddingResp
 		return EmbeddingResponse{}, &ProviderError{
 			ProviderName: o.Name(),
 			StatusCode:   resp.StatusCode,
-			Message:      string(data),
+			Message:      providerErrorMessage(data),
 			Retryable:    resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500,
 			RetryAfter:   parseRetryAfter(resp.Header.Get("Retry-After")),
 		}

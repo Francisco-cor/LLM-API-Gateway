@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 
@@ -61,7 +62,7 @@ func NewRegistryWithWeighted(providers []provider.Provider, aliases map[string][
 	r := &Registry{
 		byName:   make(map[string]provider.Provider),
 		byModel:  make(map[string]provider.Provider),
-		aliases:  aliases,
+		aliases:  cloneAliases(aliases),
 		weighted: make(map[string][]weightedEntry),
 		rnd:      rand.New(rand.NewSource(42)), // deterministic seed for tests; overwritten with time-based in production via SetRandSeed
 	}
@@ -179,15 +180,28 @@ func (r *Registry) Resolve(model string) (provider.Provider, error) {
 		return p, nil
 	}
 	// 3. weighted pattern keys: check if any weighted key is a pattern matching model
-	for key, we := range r.weighted {
+	weightedKeys := make([]string, 0, len(r.weighted))
+	for key := range r.weighted {
 		if isPattern(key) {
-			re, _ := compilePattern(key)
-			if re != nil && re.MatchString(model) {
-				return r.pickWeighted(we), nil
-			}
-			if matched, _ := path.Match(key, model); matched {
-				return r.pickWeighted(we), nil
-			}
+			weightedKeys = append(weightedKeys, key)
+		}
+	}
+	sort.Slice(weightedKeys, func(i, j int) bool {
+		// More specific patterns win before broad catch-alls; lexical order
+		// makes ties deterministic across map iterations.
+		if len(weightedKeys[i]) != len(weightedKeys[j]) {
+			return len(weightedKeys[i]) > len(weightedKeys[j])
+		}
+		return weightedKeys[i] < weightedKeys[j]
+	})
+	for _, key := range weightedKeys {
+		we := r.weighted[key]
+		re, _ := compilePattern(key)
+		if re != nil && re.MatchString(model) {
+			return r.pickWeighted(we), nil
+		}
+		if matched, _ := path.Match(key, model); matched {
+			return r.pickWeighted(we), nil
 		}
 	}
 	// 4. pattern match
@@ -252,7 +266,7 @@ func (r *Registry) All() []provider.Provider {
 func (r *Registry) Aliases(model string) []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.aliases[model]
+	return append([]string(nil), r.aliases[model]...)
 }
 
 // Reload atomically replaces registry contents with new providers/aliases/weighted.
@@ -260,7 +274,9 @@ func (r *Registry) Aliases(model string) []string {
 func (r *Registry) Reload(providers []provider.Provider, aliases map[string][]string, weighted map[string][]WeightedConfig) {
 	newR := NewRegistryWithWeighted(providers, aliases, weighted)
 	// preserve RNG seed
+	r.randMu.Lock()
 	newR.rnd = r.rnd
+	r.randMu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.byName = newR.byName
@@ -275,13 +291,15 @@ func (r *Registry) Reload(providers []provider.Provider, aliases map[string][]st
 func (r *Registry) UpdateAliases(aliases map[string][]string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.aliases = aliases
+	r.aliases = cloneAliases(aliases)
 }
 
 // RemapForFallback returns a ChatRequest with Model remapped to fallback's model
 // if an alias exists. Otherwise returns req unchanged.
 func (r *Registry) RemapForFallback(req provider.ChatRequest, fallback provider.Provider) provider.ChatRequest {
-	targets := r.aliases[req.Model]
+	r.mu.RLock()
+	targets := append([]string(nil), r.aliases[req.Model]...)
+	r.mu.RUnlock()
 	if len(targets) == 0 {
 		return req
 	}
@@ -299,6 +317,17 @@ func (r *Registry) RemapForFallback(req provider.ChatRequest, fallback provider.
 		req.Model = fallback.Models()[0]
 	}
 	return req
+}
+
+func cloneAliases(aliases map[string][]string) map[string][]string {
+	if len(aliases) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(aliases))
+	for model, targets := range aliases {
+		out[model] = append([]string(nil), targets...)
+	}
+	return out
 }
 
 // matchesModelPattern checks if either pattern matches the other (for alias remapping tolerance)

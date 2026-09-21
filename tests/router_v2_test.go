@@ -55,7 +55,7 @@ func TestRouter_WildcardMatching(t *testing.T) {
 		{model: "gpt-3.5-turbo", wantProv: "openai"},
 		{model: "claude-sonnet-4-6", wantProv: "anthropic"},
 		{model: "claude-haiku-4-5-20251001", wantProv: "anthropic"},
-		{model: "gemini-2.5-pro", wantProv: "gemini"}, // exact should still match gemini (first exact? but in this registry gemini has exact "gemini-2.5-pro" as first pattern? It is exact but treated as exact if no wildcard? Actually gemini-2.5-pro has no wildcard, so it's exact. It will be in byModel exact map, should resolve.)
+		{model: "gemini-2.5-pro", wantProv: "gemini"},   // exact should still match gemini (first exact? but in this registry gemini has exact "gemini-2.5-pro" as first pattern? It is exact but treated as exact if no wildcard? Actually gemini-2.5-pro has no wildcard, so it's exact. It will be in byModel exact map, should resolve.)
 		{model: "gemini-2.5-flash", wantProv: "gemini"}, // wildcard gemini-*
 		{model: "gemini-unknown", wantProv: "gemini"},
 		{model: "llama-3-70b", wantErr: true},

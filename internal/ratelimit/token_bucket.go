@@ -14,6 +14,21 @@ type Limiter struct {
 	rate   float64
 	burst  float64
 	ttl    time.Duration
+	stop   chan struct{}
+	done   chan struct{}
+	close  sync.Once
+}
+
+// Backend is the rate-limit contract used by HTTP middleware and handlers.
+// Both the in-process and Redis implementations satisfy it, which keeps the
+// storage choice from being silently ignored by the gateway wiring.
+type Backend interface {
+	Allow(key string) bool
+	AllowN(key string, n int) bool
+	AllowWithLimits(key string, n, requestsPerMinute, burst int) bool
+	RetryAfter(key string) time.Duration
+	RetryAfterWithLimits(key string, requestsPerMinute, burst int) time.Duration
+	UpdateLimits(requestsPerMinute, burst int)
 }
 
 type shard struct {
@@ -34,6 +49,8 @@ func New(requestsPerMinute, burst int) *Limiter {
 		rate:  float64(requestsPerMinute) / 60.0,
 		burst: float64(burst),
 		ttl:   10 * time.Minute,
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
 	}
 	for i := range l.shards {
 		l.shards[i] = &shard{buckets: make(map[string]*bucket)}
@@ -56,14 +73,27 @@ func (l *Limiter) Allow(key string) bool {
 
 // AllowN consumes n tokens if available (token-aware, Fase 6).
 func (l *Limiter) AllowN(key string, n int) bool {
+	rpm, burst := l.GetLimits()
+	return l.AllowWithLimits(key, n, rpm, burst)
+}
+
+// AllowWithLimits consumes n tokens using a per-key override. The override is
+// evaluated at request time so hot-reloaded tenant/model limits take effect
+// without creating a second limiter per tenant.
+func (l *Limiter) AllowWithLimits(key string, n, requestsPerMinute, burst int) bool {
 	if n <= 0 {
 		n = 1
 	}
+	if requestsPerMinute <= 0 || burst <= 0 {
+		return false
+	}
+	rate := float64(requestsPerMinute) / 60.0
+	maxTokens := float64(burst)
 	sh := l.shardFor(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
-	b := l.refillLocked(sh, key)
+	b := l.refillLocked(sh, key, rate, maxTokens)
 	if b.tokens < float64(n) {
 		return false
 	}
@@ -100,17 +130,24 @@ func (l *Limiter) SetBurstForTesting(burst int) {
 // RetryAfter returns how long the caller should wait before key's bucket has
 // at least one token available again.
 func (l *Limiter) RetryAfter(key string) time.Duration {
+	rpm, burst := l.GetLimits()
+	return l.RetryAfterWithLimits(key, rpm, burst)
+}
+
+// RetryAfterWithLimits returns the wait time for one token using an override.
+func (l *Limiter) RetryAfterWithLimits(key string, requestsPerMinute, burst int) time.Duration {
+	if requestsPerMinute <= 0 || burst <= 0 {
+		return time.Second
+	}
 	sh := l.shardFor(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
-	b := l.refillLocked(sh, key)
+	rate := float64(requestsPerMinute) / 60.0
+	b := l.refillLocked(sh, key, rate, float64(burst))
 	if b.tokens >= 1 {
 		return 0
 	}
-	l.mu.RLock()
-	rate := l.rate
-	l.mu.RUnlock()
 	seconds := (1 - b.tokens) / rate
 	return time.Duration(seconds * float64(time.Second))
 }
@@ -120,16 +157,16 @@ func (l *Limiter) Tokens(key string) float64 {
 	sh := l.shardFor(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
-	b := l.refillLocked(sh, key)
-	return b.tokens
-}
-
-// refillLocked applies elapsed-time refill to key's bucket. Callers must hold shard mu.
-func (l *Limiter) refillLocked(sh *shard, key string) *bucket {
 	l.mu.RLock()
 	rate := l.rate
 	burst := l.burst
 	l.mu.RUnlock()
+	b := l.refillLocked(sh, key, rate, burst)
+	return b.tokens
+}
+
+// refillLocked applies elapsed-time refill to key's bucket. Callers must hold shard mu.
+func (l *Limiter) refillLocked(sh *shard, key string, rate, burst float64) *bucket {
 	now := time.Now()
 	b, ok := sh.buckets[key]
 	if !ok {
@@ -151,9 +188,23 @@ func (l *Limiter) refillLocked(sh *shard, key string) *bucket {
 func (l *Limiter) cleanupLoop() {
 	ticker := time.NewTicker(2 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		l.cleanup()
+	defer close(l.done)
+	for {
+		select {
+		case <-ticker.C:
+			l.cleanup()
+		case <-l.stop:
+			return
+		}
 	}
+}
+
+// Close stops the background cleanup goroutine. It is safe to call multiple
+// times and prevents limiter goroutines from surviving server shutdown.
+func (l *Limiter) Close() error {
+	l.close.Do(func() { close(l.stop) })
+	<-l.done
+	return nil
 }
 
 func (l *Limiter) cleanup() {

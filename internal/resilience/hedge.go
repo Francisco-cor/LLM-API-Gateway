@@ -69,7 +69,17 @@ func DoHedge(ctx context.Context, delay time.Duration, primary func() (any, erro
 			return nil, ctx.Err()
 		}
 	case r := <-fallbackCh:
-		return r.val, r.err
+		if r.err == nil {
+			return r.val, nil
+		}
+		// A hedge failure must not mask a still-running primary that may
+		// succeed. Wait for it before returning an error.
+		select {
+		case pr := <-primaryCh:
+			return pr.val, pr.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}

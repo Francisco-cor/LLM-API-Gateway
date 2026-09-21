@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"bytes"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -105,7 +107,7 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			// also allow X-Admin-API-Key header
 			token = r.Header.Get("X-Admin-API-Key")
 		}
-		if token != s.apiKey {
+		if subtle.ConstantTimeCompare([]byte(token), []byte(s.apiKey)) != 1 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid admin api key"})
@@ -194,9 +196,8 @@ func (s *Server) handleGetProviders(w http.ResponseWriter, _ *http.Request) {
 // Only fields present are applied. Durations are strings like "30s", "5m".
 type AdminPatch struct {
 	RateLimit *struct {
-		RequestsPerMinute *int    `json:"requests_per_minute"`
-		Burst             *int    `json:"burst"`
-		RedisURL          *string `json:"redis_url"`
+		RequestsPerMinute *int `json:"requests_per_minute"`
+		Burst             *int `json:"burst"`
 	} `json:"rate_limit"`
 	Cache *struct {
 		TTL               *string  `json:"ttl"`
@@ -237,10 +238,23 @@ func (s *Server) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var patch AdminPatch
-	if err := json.Unmarshal(body, &patch); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&patch); err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid JSON: " + err.Error()})
+		return
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		msg := "multiple JSON values are not allowed"
+		if err != nil {
+			msg = "invalid JSON: " + err.Error()
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 		return
 	}
 	// if onApply is set, delegate patch apply to it (it will validate and swap)
@@ -307,9 +321,6 @@ func applyPatch(cfg *config.Config, patch *AdminPatch) error {
 		}
 		if patch.RateLimit.Burst != nil {
 			cfg.RateLimit.Burst = *patch.RateLimit.Burst
-		}
-		if patch.RateLimit.RedisURL != nil {
-			cfg.RateLimit.RedisURL = *patch.RateLimit.RedisURL
 		}
 	}
 	if patch.Cache != nil {
@@ -400,6 +411,9 @@ func redactConfig(cfg *config.Config) *config.Config {
 	}
 	if out.Admin.APIKey != "" {
 		out.Admin.APIKey = "***"
+	}
+	if out.RateLimit.RedisURL != "" {
+		out.RateLimit.RedisURL = "***"
 	}
 	// also redact auth keys
 	for i := range out.Auth.Keys {

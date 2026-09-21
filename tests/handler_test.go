@@ -9,12 +9,44 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/fcordero/llm-api-gateway/internal/budget"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/proxy"
 )
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func TestHandler_BudgetReservationBlocksConcurrentQuotaOverrun(t *testing.T) {
+	providerResp := provider.ChatResponse{
+		ID:    "budgeted",
+		Model: "gpt-4o",
+		Usage: provider.Usage{PromptTokens: 1, TotalTokens: 1},
+	}
+	registry := proxy.NewRegistry([]provider.Provider{
+		&mockProvider{name: "openai", models: []string{"gpt-4o"}, resp: providerResp},
+	})
+	manager := budget.New(2, 0, nil)
+	handler := proxy.NewHandlerWithBudget(registry, []string{"openai"}, discardLogger(), manager)
+
+	body := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+		req.Header.Set("X-Tenant-ID", "tenant-a")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d got %d, want 200: %s", i+1, w.Code, w.Body.String())
+		}
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	req.Header.Set("X-Tenant-ID", "tenant-a")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("third request got %d, want 429: %s", w.Code, w.Body.String())
+	}
 }
 
 func TestHandler_ChatCompletions(t *testing.T) {

@@ -52,8 +52,11 @@ func Do(ctx context.Context, cfg RetryConfig, isRetryable func(error) bool, fn f
 			}
 			if cfg.Jitter {
 				// +-25% jitter
-				j := time.Duration(rand.Int63n(int64(delay)/2)) - delay/4
-				delay += j
+				jitterRange := int64(delay) / 2
+				if jitterRange > 0 {
+					j := time.Duration(rand.Int63n(jitterRange)) - delay/4
+					delay += j
+				}
 			}
 			select {
 			case <-time.After(delay):

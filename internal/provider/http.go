@@ -3,8 +3,11 @@ package provider
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -73,4 +76,51 @@ func GetPooledBuffer() *bytes.Buffer {
 
 func PutPooledBuffer(buf *bytes.Buffer) {
 	bufPool.Put(buf)
+}
+
+const maxProviderResponseSize = 8 << 20
+
+// readProviderResponse bounds upstream payloads so a malformed or compromised
+// provider cannot make the gateway allocate without limit.
+func readProviderResponse(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxProviderResponseSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxProviderResponseSize {
+		return nil, fmt.Errorf("provider response exceeds %d bytes", maxProviderResponseSize)
+	}
+	return data, nil
+}
+
+const maxProviderErrorMessage = 4096
+
+// providerErrorMessage extracts the useful provider error field and bounds
+// the fallback body. Upstream errors are logged and returned to callers, so a
+// provider must not be able to flood logs/responses with an arbitrarily large
+// or echoed payload.
+func providerErrorMessage(body []byte) string {
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &envelope); err == nil {
+		if envelope.Error.Message != "" {
+			return truncateProviderError(envelope.Error.Message)
+		}
+		if envelope.Message != "" {
+			return truncateProviderError(envelope.Message)
+		}
+	}
+	return truncateProviderError(string(body))
+}
+
+func truncateProviderError(message string) string {
+	message = strings.TrimSpace(message)
+	if len(message) <= maxProviderErrorMessage {
+		return message
+	}
+	return message[:maxProviderErrorMessage] + "…"
 }

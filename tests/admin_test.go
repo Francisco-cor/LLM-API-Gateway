@@ -110,6 +110,7 @@ func TestAdmin_Auth(t *testing.T) {
 
 func TestAdmin_GetConfigRedacted(t *testing.T) {
 	cfg, _ := config.Load(writeTempConfig(t, minimalValidConfig()))
+	cfg.RateLimit.RedisURL = "redis://:supersecret@redis:6379/0"
 	registry := proxy.NewRegistry([]provider.Provider{&mockProvider{name: "openai", models: []string{"gpt-4o"}}})
 	srv := admin.New(slog.New(slog.NewTextHandler(io.Discard, nil)), "secret123", "", cfg, registry, nil, nil)
 	h := srv.Handler()
@@ -133,6 +134,9 @@ func TestAdmin_GetConfigRedacted(t *testing.T) {
 	}
 	if openai["APIKey"] != "***" {
 		t.Errorf("APIKey not redacted: %v", openai["APIKey"])
+	}
+	if rateLimit, ok := body["RateLimit"].(map[string]any); !ok || rateLimit["RedisURL"] != "***" {
+		t.Errorf("RedisURL not redacted: %v", body["RateLimit"])
 	}
 }
 

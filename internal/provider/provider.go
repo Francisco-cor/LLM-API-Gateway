@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/fcordero/llm-api-gateway/internal/types"
@@ -63,10 +64,11 @@ func (e *ProviderError) Error() string {
 
 // IsRetryable reports whether err signals that another provider should be tried.
 func IsRetryable(err error) bool {
-	if pe, ok := err.(*ProviderError); ok {
-		return pe.Retryable
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
 	}
-	return false
+	var pe *ProviderError
+	return errors.As(err, &pe) && pe.Retryable
 }
 
 // IsNoProvider reports whether err indicates an unknown model.
@@ -81,8 +83,14 @@ func parseRetryAfter(v string) time.Duration {
 	if secs, err := time.ParseDuration(v + "s"); err == nil {
 		return secs
 	}
-	var s int
-	if _, err := fmt.Sscanf(v, "%d", &s); err == nil {
+	if t, err := http.ParseTime(v); err == nil {
+		if d := time.Until(t); d > 0 {
+			return d
+		}
+		return 0
+	}
+	var s int64
+	if _, err := fmt.Sscanf(v, "%d", &s); err == nil && s >= 0 {
 		return time.Duration(s) * time.Second
 	}
 	return 0

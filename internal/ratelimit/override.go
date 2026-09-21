@@ -1,6 +1,7 @@
 package ratelimit
 
 import (
+	"path"
 	"strings"
 	"sync"
 
@@ -38,10 +39,16 @@ func (o *OverrideStore) Resolve(tenant, model string) (rpm, burst int) {
 	defer o.mu.RUnlock()
 	rpm = o.defaultRPM
 	burst = o.defaultBurst
+	bestScore := -1
 	for _, ov := range o.overrides {
 		tenantMatch := ov.Tenant == "" || ov.Tenant == tenant || ov.Tenant == "*"
 		modelMatch := ov.ModelPattern == "" || ov.ModelPattern == "*" || matchPattern(ov.ModelPattern, model)
 		if tenantMatch && modelMatch {
+			score := matchSpecificity(ov.Tenant, tenant) + matchSpecificity(ov.ModelPattern, model)
+			if score < bestScore {
+				continue
+			}
+			bestScore = score
 			if ov.RPM > 0 {
 				rpm = ov.RPM
 			}
@@ -58,15 +65,19 @@ func matchPattern(pattern, s string) bool {
 		return true
 	}
 	if strings.Contains(pattern, "*") {
-		if strings.HasSuffix(pattern, "*") {
-			prefix := strings.TrimSuffix(pattern, "*")
-			return strings.HasPrefix(s, prefix)
-		}
-		if strings.HasPrefix(pattern, "*") {
-			suffix := strings.TrimPrefix(pattern, "*")
-			return strings.HasSuffix(s, suffix)
-		}
+		matched, err := path.Match(pattern, s)
+		return err == nil && matched
 	}
 	// fallback to exact
 	return false
+}
+
+func matchSpecificity(pattern, value string) int {
+	if pattern == "" || pattern == "*" {
+		return 0
+	}
+	if pattern == value {
+		return 2
+	}
+	return 1
 }
