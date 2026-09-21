@@ -10,7 +10,7 @@ Original `Limiter.buckets` single `sync.Mutex` + never expiry → leak + content
 - **TTL 10m** `cleanupLoop 2m` deletes `lastSeen < cutoff`. Fixes leak (`fix(ratelimit): sharded 16x + TTL`).
 - **Token-aware** `AllowN(key, n)` where `n = EstimateTokens(chars/4)` (`handler.go:237`); before dispatch check `limiter.AllowN(key+"_tokens", est)`.
 - **Overrides** `overrideStore.Resolve(tenant, modelPattern)` supports `tenant:"pro", model:"gpt-4*"` → per-tier RPM/burst (`config.yaml:rate_limit.overrides`).
-- **Distributed** `ratelimit/redis.go` Lua `INCR+EXPIRE` if `REDIS_URL` set; 50ms timeout → fallback memory (no SPOF).
+- **Distributed** `ratelimit/redis.go` Lua token bucket if `REDIS_URL` set; 100ms timeout → fallback memory (no SPOF).
 - **Hot-reload** `UpdateLimits(rpm,burst)` `RWMutex` + `GetLimits()` (Fase 9).
 
 ## Alternatives

@@ -15,14 +15,6 @@ spec:
       port: 80
       targetPort: 8080
       protocol: TCP
-    - name: admin
-      port: 8081
-      targetPort: 8081
-      protocol: TCP
-    - name: pprof
-      port: 6060
-      targetPort: 6060
-      protocol: TCP
     - name: metrics
       port: 8080
       targetPort: 8080

@@ -24,7 +24,7 @@ C4Context
     Rel(gw, anthropic, "Anthropic Messages", "HTTPS")
     Rel(gw, gemini, "Gemini generateContent", "HTTPS")
     Rel(gw, redis, "INCR+EXPIRE / GET/SET", "TCP")
-    Rel(gw, otel, "OTLP traces, Prometheus scrape", "HTTP/gRPC")
+    Rel(gw, otel, "trace context; Prometheus scrape", "HTTP; optional OTLP/gRPC")
 ```
 
 **External actors:**
@@ -65,7 +65,7 @@ flowchart TB
 | `gateway` | `8080` | `cmd/gateway/main.go` `http.Server{ReadHeaderTimeout 5s, IdleTimeout 120s}` | All `POST /v1/*` + `/health*` + `/metrics` |
 | `admin`   | `8081` | `internal/admin/server.go` + pprof | `Bearer ADMIN_API_KEY`, `GET /admin/config` redacted `***`, `POST /admin/reload` 400 rollback |
 | `pprof`   | `6060` | same `admin.Handler()` | `GET /debug/pprof/*` behind same auth |
-| `redis`   | `6379` | `go-redis/v9` | optional `REDIS_URL`; 50ms timeout → fallback memory |
+| `redis`   | `6379` | `go-redis/v9` | optional `REDIS_URL`; 100ms timeout → fallback memory |
 | `jaeger`  | `4317/16686` | OTEL collector | `OTEL_EXPORTER_OTLP_ENDPOINT` |
 | `prometheus`/`grafana` | `9090/3000` | `deploy/prometheus.yml` | `ServiceMonitor` in K8s |
 
@@ -200,8 +200,8 @@ Streaming variant: `handler.go:390 handleStream` branches `req.Stream` → `Cont
 ## 5. Data flow — rate-limit / budget / cache knobs
 
 - **RateLimit:** `RateLimit(limiter)` middleware uses `Authorization` header as key; `handler.go:234 overrideStore.Resolve(tenant, model)` → per-tenant/model RPM; `tokenAware` → `EstimateTokens(chars/4)` → `AllowN(key+"_tokens", n)`; `Retry-After` seconds.
-- **Budget:** `budget.Manager.Check(tenant)` before dispatch; `Record(tenant, tokens, usd=tokens*0.00001)` after success → `429 insufficient_quota` if monthly exceeded.
-- **Cache:** `cache.BuildKey(model,messages,temperature,max_tokens,tools)` → `sha256(canonicalJSON)`; respect `X-Cache-Skip:true` and `X-Cache-TTL:100ms`; only `200` non-stream; `memory LRU` → `redis` if `REDIS_URL` → `semantic` wrapper `cosine 0.97`.
+- **Budget:** `budget.Manager.Reserve` atomically reserves an estimated prompt/max-token amount before dispatch; `Commit` adjusts to actual usage and `Cancel` releases failed requests. Redis uses Lua and hashed tenant keys; `cost_per_token_usd` controls the fallback USD estimate. Quota exhaustion returns `429 insufficient_quota`; unavailable Redis fails closed with `503`.
+- **Cache:** `cache.BuildKey` includes response-shaping fields (`model`, messages, sampling, tools, tool choice, response format, stop, n, stream options) and the handler salts it by client identity; respect `X-Cache-Skip:true` and `X-Cache-TTL:100ms`; only `200` non-stream; `memory LRU` → `redis` if `REDIS_URL`. The semantic wrapper currently delegates exact lookup and is not an embedding index.
 
 ---
 
@@ -210,8 +210,8 @@ Streaming variant: `handler.go:390 handleStream` branches `req.Stream` → `Cont
 - **Hot reload:** `config.Watch(ctx, path, 1s, onChange)` polls `ModTime` + 100ms debounce; `SIGHUP` handler; `applyConfig(newCfg)` → `Validate` → `buildProviders` → `registry.Reload` → `limiter.UpdateLimits` → `overrideStore.Reload` → `authStore.Reload` → `handlerOpts.SetCache/Circuit/Retry/Hedge/Fallback` → `adminSrv.SetConfig(Clone)`; invalid → 400 rollback keep old (see `tests/admin_test.go` rollback).
 - **Graceful drain:** `HealthHandler.SetReady(false)` → `/readyz` 503 draining → 5s sleep for K8s endpoint removal → `admin/pprof Shutdown 5s` → `srv.Shutdown 30s` with `IdleTimeout 120s` (`main.go:326`).
 - **Performance:** `sharedTransport MaxIdleConns100/PerHost20/IdleConnTimeout90s/KeepAlive30s/ForceAttemptHTTP2` (`provider/http.go:10`), `bufPool` for `marshalJSON`, `sharded 16× fnv` limiter (56ns/op), `BuildKey 1.8µs`, `Cache hit 75ns` (`BENCH.md`).
-- **Observability:** `metrics.RequestsTotal{method,path,status,provider}` `RequestDuration` `TokensTotal` `CacheHits` `ProviderErrors` `CircuitState`; `Tracing` OTEL `traceparent` inject; `Logging` `request_id/tenant/provider/latency_ms`.
-- **Security:** `auth` static YAML+env, `hash` not plaintext (TODO), `SecurityHeaders` `nosniff DENY no-referrer`, `CORS` allowlist, `Authorization` redacted in logs (`logger/logger.go`), `Admin` Bearer/X-Admin-API-Key `***` redacted (`admin/server.go:380 redactConfig`).
+- **Observability:** `metrics.RequestsTotal{method,path,status,provider}` `RequestDuration` `TokensTotal` `CacheHits` `ProviderErrors` `CircuitState`; paths are bounded to known routes; `Tracing` injects OTEL trace context and optionally batches spans to OTLP/gRPC; `Logging` uses `request_id/tenant/provider/latency_ms`.
+- **Security:** `auth` static YAML+env stores SHA-256 key digests, enforces endpoint scopes/expiry, `SecurityHeaders` `nosniff DENY no-referrer`, CORS allowlist, `Authorization` redacted in logs (`logger/logger.go`), `Admin` Bearer/X-Admin-API-Key `***` redacted (`admin/server.go:380 redactConfig`).
 
 ---
 
@@ -227,6 +227,6 @@ Streaming variant: `handler.go:390 handleStream` branches `req.Stream` → `Cont
 - No `sony/gobreaker` dep — own 188 LOC circuit simplifies hot-reload `UpdateConfig`.
 - No framework — `ServeMux` Go 1.22 path patterns enough; avoids Gin/Echo.
 - Single dep `yaml.v3` + 5 justified: `prometheus`, `redis`, `otel`, `sync`. See ADR-002/003.
-- Backlog (post 1.0): Azure/Bedrock, Ollama, PII guardrails, Stripe billing, WASM plugins — see `PLAN.md:10`.
+- Backlog (post 1.0): Azure/Bedrock, Ollama, PII guardrails, Stripe billing, WASM plugins, provider/model pricing catalog and real embedding-based semantic cache.
 
-Refs: `PLAN.md` roadmap 11 fases, `BENCH.md`, `config.yaml`, `deploy/k8s/`, `examples/`.
+Refs: `BENCH.md`, `config.yaml`, `deploy/k8s/`, `examples/`.

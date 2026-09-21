@@ -4,6 +4,8 @@ bin/
 .env.*
 !.env.example
 config.local.yaml
+coverage.out
+AUDITORIA_Y_PLAN.md
 
 # Local handoff/pending notes and Claude Code project files
 HANDOFF.md

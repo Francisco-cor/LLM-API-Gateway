@@ -64,6 +64,12 @@ spec:
                   name: llm-gateway-secrets
                   key: gemini-api-key
                   optional: true
+            - name: GATEWAY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: llm-gateway-secrets
+                  key: gateway-api-key
+                  optional: false
             - name: REDIS_URL
               valueFrom:
                 secretKeyRef:
@@ -75,9 +81,11 @@ spec:
                 secretKeyRef:
                   name: llm-gateway-secrets
                   key: admin-api-key
-                  optional: true
+                  optional: false
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
               value: "http://jaeger-collector.observability.svc.cluster.local:4317"
+            - name: OTEL_TRACES_EXPORTER
+              value: "otlp"
           volumeMounts:
             - name: config
               mountPath: /app/config.yaml

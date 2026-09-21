@@ -7,7 +7,7 @@
 [![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?logo=docker&logoColor=white)](Dockerfile)
 [![K8s](https://img.shields.io/badge/k8s-Deploy-326CE5.svg?logo=kubernetes)](deploy/k8s/)
 
-A lightweight reverse proxy in Go that unifies OpenAI, Anthropic & Gemini behind a single **OpenAI-compatible** API — with fallback, streaming, resilience, observability, rate-limit, cache, routing, embeddings & control plane hot-reload + performance hardening. Fases 1-11 complete, `v1.0.0` production-ready.
+A lightweight reverse proxy in Go that unifies OpenAI, Anthropic & Gemini behind a single **OpenAI-compatible** API — with fallback, streaming, resilience, observability, rate-limit, cache, routing, embeddings & control plane hot-reload + performance hardening. Fases 1-11 complete; `v1.0.0` is production-oriented beta pending the remaining product hardening items.
 
 ```mermaid
 flowchart LR
@@ -27,13 +27,13 @@ flowchart LR
 - **Unified endpoint** — `POST /v1/chat/completions` + `POST /v1/embeddings` OpenAI-compatible. Auto-translation via `internal/translate` (Fase 8).
 - **Provider interface** — `Name/Send/SendStream/Embed/Models/HealthCheck/DiscoverModels` — add a provider = 1 file + translate (see `CONTRIBUTING.md`).
 - **Intelligent routing** — `providers.<name>.models` wildcards `gpt-4*`, regex `gpt-4.*`; `routing.weighted` canary 90/10 ±5% in 1k reqs; auto-discovery `models: []` → `GET /v1/models`.
-- **Streaming SSE** — `stream:true` `text/event-stream` + Anthropic/Gemini → OpenAI `data: {...}` + `data: [DONE]` + `GET /v1/models`, `tools`/`tool_choice`/`response_format`.
+- **Streaming SSE** — `stream:true` `text/event-stream` + Anthropic/Gemini → OpenAI `data: {...}` + `data: [DONE]`, with retryable fallback before the first chunk; `tools`/`tool_choice`/`response_format`.
 - **Resilience** — retry jitter 3×200ms, circuit breaker 5→open 30s half-open 1, hedge 300ms race, `Retry-After` propagation, `X-Gateway-Provider`.
-- **Observability** — Prometheus `/metrics` (`gateway_requests_total`, `tokens_total`, `cache_hits`, `ProviderErrors`, `CircuitState`), OTEL `traceparent` span per provider, `slog` with `request_id/tenant/provider/latency_ms`, Jaeger/Prometheus/Grafana via `docker-compose`.
-- **Traffic control** — sharded 16× `fnv` + TTL 10m limiter (56ns `Allow`), token-aware `AllowN`, per-tenant/model overrides, monthly budget `insufficient_quota`, Redis Lua `INCR+EXPIRE` with memory fallback.
-- **Cache** — `X-Cache:HIT/MISS` LRU 1000 TTL 5m + Redis + semantic 0.97, `X-Cache-TTL/Skip`, only 200 non-stream, `sha256` key 1.8µs, hit 75ns.
+- **Observability** — Prometheus `/metrics` (`gateway_requests_total`, `tokens_total`, `cache_hits`, `ProviderErrors`, `CircuitState`), OTEL `traceparent` span context with optional OTLP/gRPC batch export, `slog` with `request_id/tenant/provider/latency_ms`, plus optional Jaeger/Prometheus/Grafana containers.
+- **Traffic control** — sharded 16× `fnv` + TTL 10m limiter (56ns `Allow`), token-aware `AllowN`, per-tenant/model overrides, atomic monthly budget reservation/commit, atomic Redis Lua buckets with in-process fallback on Redis errors.
+- **Cache** — `X-Cache:HIT/MISS` LRU 1000 TTL 5m + Redis, identity-isolated SHA-256 keys covering response-shaping fields, `X-Cache-TTL/Skip`, only 200 non-stream. The semantic wrapper is currently a lightweight placeholder, not embedding retrieval.
 - **Security** — Bearer multi-tenant + scopes/expiry, CORS allowlist, `X-Content-Type-Options nosniff` etc, secrets redacted `***`.
-- **Health** — `GET /health` (uptime), `/health/providers` fan-out 3s parallel `degraded` handling, `/livez`/`/readyz` (K8s, `SetReady(false)` draining).
+- **Health** — `GET /health` (uptime), `/health/providers` fan-out 3s parallel `degraded` handling, `/livez`/`/readyz` (K8s, cached provider readiness for 15s, `SetReady(false)` draining).
 - **Control plane** — Admin `:8081` `GET /admin/config` redacted, `POST /admin/reload` 400 rollback, `GET /admin/providers`, `PATCH /admin/config` hot knobs (`rate_limit/cache/circuit/hedge/routing/logging`), file watcher 1s poll + `SIGHUP`.
 - **Perf & Ops** — `ReadHeaderTimeout 5s` anti-Slowloris, `IdleTimeout 120s` keep-alive, shared `Transport MaxIdleConns100/PerHost20/KeepAlive30s`, `sync.Pool` JSON buffers, K8s `Deployment/HPA 3→10/PDB min 2/ServiceMonitor`, `pprof :6060` behind admin auth, `BENCH.md` + `k6` 1k RPS p95<30ms, `readOnlyRootFilesystem` + `runAsNonRoot`.
 - **DX & Release** — `examples/` (curl/python/node/langchain/postman), `CONTRIBUTING.md` (<10 min), `docs/ARCHITECTURE.md` C4 + ADR-001..003, `CHANGELOG.md` + `VERSION` SemVer `v1.0.0`, `make dev` air live-reload.
@@ -78,7 +78,7 @@ curl -s http://localhost:8080/metrics | grep gateway_requests_total
 curl -s http://localhost:8081/admin/config -H "Authorization: Bearer $ADMIN_API_KEY" | jq '.admin.api_key' # "***"
 ```
 
-No keys? Gateway runs with mocks in tests: `go test ./... -v` 46 PASS. For load with mocks: `k6 run tests/load/k6.js`.
+No keys? Gateway runs with mocks in tests: `go test ./... -v`. For load with mocks: `k6 run tests/load/k6.js`.
 
 Stop: `docker-compose down`.
 
@@ -98,9 +98,9 @@ go run ./cmd/gateway -config config.yaml   # or make dev (air live-reload)
 | `GEMINI_API_KEY` | one of three | Gemini key | `${GEMINI_API_KEY}` |
 | `GATEWAY_API_KEY` | opt | Tenant key when `auth.enabled:true` (see `config.yaml:auth.keys`) | `${GATEWAY_API_KEY}` |
 | `ADMIN_API_KEY` | opt (prod) | Protects `:8081` + `:6060/pprof` (`Bearer` or `X-Admin-API-Key`); empty → open in dev | `${ADMIN_API_KEY}` `admin.api_key` |
-| `REDIS_URL` | opt | `redis://localhost:6379/0` enables distributed limiter + cache; 50ms timeout → memory fallback | `${REDIS_URL}` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | opt | `http://jaeger:4317` enables tracing | `http://localhost:4317` |
-| `OTEL_TRACES_EXPORTER` | opt | `otlp` | `otlp` |
+| `REDIS_URL` | opt | `redis://localhost:6379/0` enables distributed limiter + cache; 100ms timeout → memory fallback | `${REDIS_URL}` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | opt | OTLP/gRPC trace export endpoint; accepts `host:port`, `http://` or `https://` | `http://localhost:4317` |
+| `OTEL_TRACES_EXPORTER` | opt | set to `none` to disable export while retaining local trace IDs | `otlp` |
 
 See `.env.example` + `config.yaml` for full keys.
 
@@ -119,7 +119,7 @@ See `.env.example` + `config.yaml` for full keys.
 | `routing.weighted` | `gpt-4o: [{provider: openai, weight:90}]` canary |
 | `resilience.retry/circuit/hedge` | `max_attempts`, `failure_threshold`, `open_timeout`, `hedge.delay` |
 | `cache.enabled/ttl/max_size` | exact + `semantic_enabled/threshold` 0.97 |
-| `rate_limit.enabled/requests_per_minute/burst/redis_url/token_aware` | + `overrides` per tenant/model + `budget` |
+| `rate_limit.enabled/requests_per_minute/burst/redis_url/token_aware` | + `overrides` per tenant/model + `budget.monthly_tokens/monthly_usd/cost_per_token_usd` |
 | `auth.enabled/keys` | `key`, `tenant`, `scopes`, `expires_at` |
 | `admin.port/api_key` | `:8081` + `${ADMIN_API_KEY}` |
 | `cors.allowed_origins` | CORS |
@@ -205,7 +205,7 @@ Run any: `docker-compose up -d && ./examples/curl/chat.sh`.
 
 ```bash
 go test ./... -v -cover
-# 2026-09-01 v1.0.0: 53 PASS (router 90/10, embeddings, translate, admin/Watch, handler cache, contract)
+# v1.0.0: the suite covers router, embeddings, translate, admin/Watch, cache, auth and contract behavior
 go test ./... -race -coverprofile=coverage.out && go tool cover -html=coverage.out
 go test ./tests/contract -run TestOpenAI -v   # OpenAI SDK compat (no external deps, httptest)
 ```
@@ -233,7 +233,7 @@ make clean
 
 ## Contributing
 
-See `CONTRIBUTING.md` (<10 min setup, branch/commit/DoD, adding provider, PR checklist). First external PR simulation is DoD for Fase 11.
+See `CONTRIBUTING.md` (<10 min setup, branch/commit/DoD, adding provider, PR checklist).
 
 ## Release
 

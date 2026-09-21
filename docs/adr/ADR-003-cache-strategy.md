@@ -13,7 +13,7 @@ Same prompt pays 2×. Need exact-hit cache with low overhead; semantic optional.
 - **Hot reload** `SetCache(cache, ttl)` (`proxy/handler.go:132`).
 
 ## Alternatives
-- Always Redis — adds latency for miss (50ms timeout) vs 75ns memory hit.
+- Always Redis — adds latency for miss (100ms timeout) vs 75ns memory hit.
 - Semantic first — cost of embeddings, threshold tuning 0.97 default disabled.
 
 ## Consequences

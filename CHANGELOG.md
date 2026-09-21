@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Wire the OTLP/gRPC exporter, bound Prometheus path cardinality, cache readiness provider checks for 15s, clear SSE write deadlines for active streams, and close limiter cleanup goroutines during shutdown.
+- Make rate-limit enablement hot-reloadable, make overlapping weighted patterns deterministic, use constant-time admin-key comparison, remove the ineffective runtime Redis URL patch, and bound provider error messages.
+- Add atomic tenant budget reservations with Redis Lua/local mutex semantics, configurable `cost_per_token_usd`, and retry/circuit/budget integration for embeddings.
+- Wire the configured Redis rate-limit backend into the gateway; make token-aware Redis consumption atomic and apply tenant/model overrides.
+- Preserve streaming capabilities through response-recording middleware and add retryable fallback before the first SSE chunk.
+- Enforce API-key scopes, isolate cache keys by client identity, validate complete cache semantics, reject trailing JSON and unknown YAML fields.
+- Bound upstream response bodies, keep provider `Retry-After` errors intact, fix error codes such as `model_not_found`, and move Gemini API keys out of URLs.
+- Harden container/Kubernetes deployment metadata and move the K8s ConfigMap into its own manifest.
+
 ## [v1.0.0] - 2026-09-01
 
 ### Added

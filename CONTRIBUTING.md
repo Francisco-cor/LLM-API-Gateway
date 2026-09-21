@@ -1,6 +1,6 @@
 # Contributing — LLM API Gateway
 
-Thanks for considering a contribution! This is `v1.0.0` production-ready; first external PR simulation is DoD for Fase 11.
+Thanks for considering a contribution! This is `v1.0.0` production-oriented beta; the remaining production hardening work is tracked in the local audit handoff and the issue tracker.
 
 ## Quick start for contributors (<10 min)
 
@@ -19,7 +19,7 @@ make bench   # limiter 56ns BuildKey 1.8µs
 - **Branches:** `main` protected, PR with CI green (test, lint, vulncheck, docker), 1 review, squash merge.
 - **Conventional Commits:** `feat(scope):` `fix:` `perf:` `chore:` `docs:` `test:` `refactor:` + scope `provider|proxy|config|ratelimit|cache|auth|metrics|admin|deploy`.
   Example: `feat(provider): add Azure OpenAI Embed`.
-- **DoD per commit (see `PLAN.md` 7):**
+- **DoD per commit:**
   - `go test ./... -race -cover` passes (>85% target)
   - `golangci-lint run` 0 warnings (`make lint`)
   - `go vet ./...` ok

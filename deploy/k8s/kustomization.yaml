@@ -6,5 +6,6 @@ resources:
   - hpa.yaml
   - pdb.yaml
   - servicemonitor.yaml
+  - configmap.yaml
 commonLabels:
   app: llm-api-gateway
