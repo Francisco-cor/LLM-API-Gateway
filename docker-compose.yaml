@@ -9,6 +9,8 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GATEWAY_API_KEY=${GATEWAY_API_KEY}
+      - ADMIN_API_KEY=${ADMIN_API_KEY}
       - REDIS_URL=redis://redis:6379/0
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
       - OTEL_TRACES_EXPORTER=otlp
@@ -21,9 +23,12 @@ services:
       retries: 3
     restart: unless-stopped
     depends_on:
-      - redis
-      - prometheus
-      - jaeger
+      redis:
+        condition: service_healthy
+      prometheus:
+        condition: service_started
+      jaeger:
+        condition: service_started
 
   redis:
     image: redis:7-alpine
