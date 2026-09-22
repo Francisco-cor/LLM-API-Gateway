@@ -158,7 +158,7 @@ type Embedder interface { Embed(ctx, EmbeddingRequest) (EmbeddingResponse, error
 
 **`Translate` pivot** (`internal/translate/`):
 - Canonical = OpenAI `ChatRequest`. `ToAnthropic`: `system` extracted → `system` field, `assistant→model`? actually `messages` with `role:assistant→model`. `ToGemini`: `messages→contents` with `role:model` for assistant.
-- The canonical contract preserves multimodal content, tool calls, audio fields, logprobs, and modern completion controls for OpenAI-compatible clients; providers that need translation consume the text projection where their native contract is narrower.
+- The canonical contract preserves multimodal content, tool calls, audio fields, logprobs, and modern completion controls for OpenAI-compatible clients; Anthropic/Gemini tools and tool results are translated to their native function-call blocks, while unsupported multimodal details use the safe text projection.
 - Keeps `Provider` pure; translation is unit-tested isolated (`tests/translate_test.go`).
 
 ---

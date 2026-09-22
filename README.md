@@ -24,7 +24,7 @@ flowchart LR
 
 ## Features
 
-- **Unified endpoint** — `POST /v1/chat/completions` + `POST /v1/embeddings` OpenAI-compatible, including multimodal content, tool calls, audio fields, logprobs and modern completion controls. Auto-translation via `internal/translate` (Fase 8).
+- **Unified endpoint** — `POST /v1/chat/completions` + `POST /v1/embeddings` OpenAI-compatible, including multimodal content, tool calls, audio fields, logprobs and modern completion controls. Anthropic/Gemini tools are translated to their native function-call contracts. Auto-translation via `internal/translate` (Fase 8).
 - **Provider interface** — `Name/Send/SendStream/Embed/Models/HealthCheck/DiscoverModels` — add a provider = 1 file + translate (see `CONTRIBUTING.md`).
 - **Intelligent routing** — `providers.<name>.models` wildcards `gpt-4*`, regex `gpt-4.*`; `routing.weighted` canary 90/10 ±5% in 1k reqs; auto-discovery `models: []` → `GET /v1/models`.
 - **Streaming SSE** — `stream:true` `text/event-stream` + Anthropic/Gemini → OpenAI `data: {...}` + `data: [DONE]`, with retryable fallback before the first chunk and optional final usage via `stream_options.include_usage`; `tools`/`tool_choice`/`response_format`.

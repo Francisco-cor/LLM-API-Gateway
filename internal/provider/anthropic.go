@@ -157,6 +157,10 @@ func (a *Anthropic) SendStream(ctx context.Context, req ChatRequest) (<-chan Str
 		buf := make([]byte, 0, 4096)
 		scanner.Buffer(buf, 1<<20)
 		var currentEvent string
+		toolBlocks := make(map[int]struct {
+			id   string
+			name string
+		})
 		includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
 		promptTokens, completionTokens := 0, 0
 		emit := func(chunk StreamChunk) bool {
@@ -209,32 +213,79 @@ func (a *Anthropic) SendStream(ctx context.Context, req ChatRequest) (<-chan Str
 				if json.Unmarshal([]byte(payload), &evt) == nil {
 					promptTokens = evt.Message.Usage.InputTokens
 				}
+			case "content_block_start":
+				var evt struct {
+					Index        int `json:"index"`
+					ContentBlock struct {
+						Type string `json:"type"`
+						ID   string `json:"id"`
+						Name string `json:"name"`
+					} `json:"content_block"`
+				}
+				if json.Unmarshal([]byte(payload), &evt) == nil && evt.ContentBlock.Type == "tool_use" {
+					toolBlocks[evt.Index] = struct {
+						id   string
+						name string
+					}{id: evt.ContentBlock.ID, name: evt.ContentBlock.Name}
+					if !emit(StreamChunk{
+						ID:      "chatcmpl-anthropic",
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   req.Model,
+						Choices: []StreamChoice{{
+							Index: 0,
+							Delta: ChatMessage{Role: "assistant", ToolCalls: []ToolCall{{
+								ID: evt.ContentBlock.ID, Type: "function",
+								Function: ToolCallFunction{Name: evt.ContentBlock.Name},
+							}}},
+						}},
+					}) {
+						return
+					}
+				}
 			case "content_block_delta":
 				var evt struct {
 					Delta struct {
-						Text string `json:"text"`
+						Type        string `json:"type"`
+						Text        string `json:"text"`
+						PartialJSON string `json:"partial_json"`
 					} `json:"delta"`
 					Index int `json:"index"`
 				}
 				if err := json.Unmarshal([]byte(payload), &evt); err != nil {
 					continue
 				}
-				delta := evt.Delta.Text
-				if delta == "" {
-					continue
+				if evt.Delta.Text != "" {
+					if !emit(StreamChunk{
+						ID:      "chatcmpl-anthropic",
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   req.Model,
+						Choices: []StreamChoice{{
+							Index: 0,
+							Delta: ChatMessage{Role: "assistant", Content: evt.Delta.Text},
+						}},
+					}) {
+						return
+					}
 				}
-				chunk := StreamChunk{
-					ID:      "chatcmpl-anthropic",
-					Object:  "chat.completion.chunk",
-					Created: time.Now().Unix(),
-					Model:   req.Model,
-					Choices: []StreamChoice{{
-						Index: 0,
-						Delta: ChatMessage{Role: "assistant", Content: delta},
-					}},
-				}
-				if !emit(chunk) {
-					return
+				if evt.Delta.PartialJSON != "" {
+					block, ok := toolBlocks[evt.Index]
+					if ok && !emit(StreamChunk{
+						ID:      "chatcmpl-anthropic",
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   req.Model,
+						Choices: []StreamChoice{{
+							Index: 0,
+							Delta: ChatMessage{ToolCalls: []ToolCall{{
+								ID: block.id, Type: "function",
+								Function: ToolCallFunction{Name: block.name, Arguments: evt.Delta.PartialJSON},
+							}}},
+						}},
+					}) {
+						return
+					}
 				}
 			case "message_delta":
 				var evt struct {

@@ -22,7 +22,7 @@ Providers implement `Send(ctx, ChatRequest) (ChatResponse, error)` + `SendStream
 + SDK compat: `openai-python/node/go` work unchanged (`base_url` swap).
 + Tests: `tests/translate_test.go` 85%+ cover, isolated.
 + Provider add = 1 file + translate funcs.
-- OpenAI quirks leak: `Tool` shape must be translated for Gemini `functionDeclarations` (future).
+- OpenAI tool definitions and calls are translated to Gemini `functionDeclarations/functionCall` and Anthropic `tool_use/tool_result`; provider-specific capabilities still require contract fixtures.
 - `Gemini API key` in query `?key=` is log-sensitive → redacted in logger (`fix(security)`).
 
 ## Links

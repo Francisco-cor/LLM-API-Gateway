@@ -1,14 +1,18 @@
 package translate
 
 import (
+	"encoding/json"
+
 	"github.com/fcordero/llm-api-gateway/internal/types"
 )
 
 // GeminiRequest is the native Gemini generateContent request body.
 type GeminiRequest struct {
-	Contents          []GeminiContent  `json:"contents"`
-	SystemInstruction *GeminiContent   `json:"systemInstruction,omitempty"`
-	GenerationConfig  *GeminiGenConfig `json:"generationConfig,omitempty"`
+	Contents          []GeminiContent   `json:"contents"`
+	SystemInstruction *GeminiContent    `json:"systemInstruction,omitempty"`
+	GenerationConfig  *GeminiGenConfig  `json:"generationConfig,omitempty"`
+	Tools             []GeminiTool      `json:"tools,omitempty"`
+	ToolConfig        *GeminiToolConfig `json:"toolConfig,omitempty"`
 }
 
 type GeminiContent struct {
@@ -17,7 +21,38 @@ type GeminiContent struct {
 }
 
 type GeminiPart struct {
-	Text string `json:"text"`
+	Text             string                  `json:"text,omitempty"`
+	FunctionCall     *GeminiFunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *GeminiFunctionResponse `json:"functionResponse,omitempty"`
+}
+
+type GeminiFunctionCall struct {
+	Name string `json:"name"`
+	Args any    `json:"args"`
+}
+
+type GeminiFunctionResponse struct {
+	Name     string `json:"name"`
+	Response any    `json:"response"`
+}
+
+type GeminiTool struct {
+	FunctionDeclarations []GeminiFunctionDeclaration `json:"functionDeclarations"`
+}
+
+type GeminiFunctionDeclaration struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Parameters  any    `json:"parameters,omitempty"`
+}
+
+type GeminiToolConfig struct {
+	FunctionCallingConfig GeminiFunctionCallingConfig `json:"functionCallingConfig"`
+}
+
+type GeminiFunctionCallingConfig struct {
+	Mode                 string   `json:"mode"`
+	AllowedFunctionNames []string `json:"allowedFunctionNames,omitempty"`
 }
 
 type GeminiGenConfig struct {
@@ -59,6 +94,14 @@ func ToGemini(req types.ChatRequest) GeminiRequest {
 			Temperature:     req.Temperature,
 			MaxOutputTokens: req.EffectiveMaxTokens(),
 		},
+		Tools:      toGeminiTools(req.Tools),
+		ToolConfig: toGeminiToolConfig(req.ToolChoice),
+	}
+	toolNames := make(map[string]string)
+	for _, msg := range req.Messages {
+		for _, call := range msg.ToolCalls {
+			toolNames[call.ID] = call.Function.Name
+		}
 	}
 	for _, msg := range req.Messages {
 		if msg.Role == "system" {
@@ -71,26 +114,118 @@ func ToGemini(req types.ChatRequest) GeminiRequest {
 		if msg.Role == "assistant" {
 			role = "model"
 		}
-		native.Contents = append(native.Contents, GeminiContent{
-			Role:  role,
-			Parts: []GeminiPart{{Text: msg.Text()}},
-		})
+		parts := make([]GeminiPart, 0, len(msg.ToolCalls)+1)
+		if text := msg.Text(); text != "" {
+			parts = append(parts, GeminiPart{Text: text})
+		}
+		for _, call := range msg.ToolCalls {
+			parts = append(parts, GeminiPart{FunctionCall: &GeminiFunctionCall{
+				Name: call.Function.Name,
+				Args: decodeGeminiArguments(call.Function.Arguments),
+			}})
+		}
+		if msg.Role == "tool" {
+			role = "user"
+			name := msg.ToolCallID
+			if mapped := toolNames[msg.ToolCallID]; mapped != "" {
+				name = mapped
+			}
+			parts = []GeminiPart{{FunctionResponse: &GeminiFunctionResponse{
+				Name:     name,
+				Response: map[string]any{"content": msg.Text()},
+			}}}
+		}
+		if len(parts) == 0 {
+			parts = []GeminiPart{{Text: ""}}
+		}
+		native.Contents = append(native.Contents, GeminiContent{Role: role, Parts: parts})
 	}
 	return native
+}
+
+func toGeminiTools(tools []types.Tool) []GeminiTool {
+	if len(tools) == 0 {
+		return nil
+	}
+	declarations := make([]GeminiFunctionDeclaration, 0, len(tools))
+	for _, tool := range tools {
+		declarations = append(declarations, GeminiFunctionDeclaration{
+			Name:        tool.Function.Name,
+			Description: tool.Function.Description,
+			Parameters:  tool.Function.Parameters,
+		})
+	}
+	return []GeminiTool{{FunctionDeclarations: declarations}}
+}
+
+func toGeminiToolConfig(choice any) *GeminiToolConfig {
+	if choice == nil {
+		return nil
+	}
+	config := &GeminiToolConfig{}
+	switch value := choice.(type) {
+	case string:
+		switch value {
+		case "none":
+			config.FunctionCallingConfig.Mode = "NONE"
+		case "required":
+			config.FunctionCallingConfig.Mode = "ANY"
+		default:
+			config.FunctionCallingConfig.Mode = "AUTO"
+		}
+	case map[string]any:
+		config.FunctionCallingConfig.Mode = "ANY"
+		if function, ok := value["function"].(map[string]any); ok {
+			if name, ok := function["name"].(string); ok {
+				config.FunctionCallingConfig.AllowedFunctionNames = []string{name}
+			}
+		}
+	default:
+		return nil
+	}
+	return config
+}
+
+func decodeGeminiArguments(arguments string) any {
+	if arguments == "" {
+		return map[string]any{}
+	}
+	var decoded any
+	if json.Unmarshal([]byte(arguments), &decoded) == nil {
+		return decoded
+	}
+	return map[string]any{"raw": arguments}
 }
 
 // FromGemini converts a Gemini generateContent response back into the
 // gateway's OpenAI-compatible format.
 func FromGemini(resp GeminiResponse, model string) types.ChatResponse {
 	text := ""
+	var toolCalls []types.ToolCall
 	finishReason := "stop"
 	if len(resp.Candidates) > 0 {
 		candidate := resp.Candidates[0]
-		if len(candidate.Content.Parts) > 0 {
-			text = candidate.Content.Parts[0].Text
+		for _, part := range candidate.Content.Parts {
+			text += part.Text
+			if part.FunctionCall != nil {
+				arguments := "{}"
+				if data, err := json.Marshal(part.FunctionCall.Args); err == nil {
+					arguments = string(data)
+				}
+				toolCalls = append(toolCalls, types.ToolCall{
+					ID:   part.FunctionCall.Name,
+					Type: "function",
+					Function: types.ToolCallFunction{
+						Name:      part.FunctionCall.Name,
+						Arguments: arguments,
+					},
+				})
+			}
 		}
 		if candidate.FinishReason == "MAX_TOKENS" {
 			finishReason = "length"
+		} else if candidate.FinishReason == "STOP" && len(toolCalls) > 0 {
+			finishReason = "tool_calls"
 		}
 	}
 	return types.ChatResponse{
@@ -98,7 +233,7 @@ func FromGemini(resp GeminiResponse, model string) types.ChatResponse {
 		Model:  model,
 		Choices: []types.Choice{{
 			Index:        0,
-			Message:      types.ChatMessage{Role: "assistant", Content: text},
+			Message:      types.ChatMessage{Role: "assistant", Content: text, ToolCalls: toolCalls},
 			FinishReason: finishReason,
 		}},
 		Usage: types.Usage{

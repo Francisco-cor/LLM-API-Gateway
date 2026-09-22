@@ -197,10 +197,23 @@ func (g *Gemini) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 			}
 			candidate := native.Candidates[0]
 			text := ""
-			if len(candidate.Content.Parts) > 0 {
-				text = candidate.Content.Parts[0].Text
+			var toolCalls []ToolCall
+			for _, part := range candidate.Content.Parts {
+				text += part.Text
+				if part.FunctionCall != nil {
+					arguments := "{}"
+					if data, err := json.Marshal(part.FunctionCall.Args); err == nil {
+						arguments = string(data)
+					}
+					toolCalls = append(toolCalls, ToolCall{
+						ID: part.FunctionCall.Name, Type: "function",
+						Function: ToolCallFunction{
+							Name: part.FunctionCall.Name, Arguments: arguments,
+						},
+					})
+				}
 			}
-			if text == "" && candidate.FinishReason == "" {
+			if text == "" && len(toolCalls) == 0 && candidate.FinishReason == "" {
 				continue
 			}
 			chunk := StreamChunk{
@@ -210,7 +223,7 @@ func (g *Gemini) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 				Model:   req.Model,
 				Choices: []StreamChoice{{
 					Index: 0,
-					Delta: ChatMessage{Role: "assistant", Content: text},
+					Delta: ChatMessage{Role: "assistant", Content: text, ToolCalls: toolCalls},
 				}},
 			}
 			// Map finishReason if present
@@ -218,6 +231,8 @@ func (g *Gemini) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 				fr := "stop"
 				if candidate.FinishReason == "MAX_TOKENS" {
 					fr = "length"
+				} else if len(toolCalls) > 0 {
+					fr = "tool_calls"
 				}
 				chunk.Choices[0].FinishReason = &fr
 			}

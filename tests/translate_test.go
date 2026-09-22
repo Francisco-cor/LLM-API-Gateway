@@ -57,12 +57,9 @@ func TestTranslate_ToAnthropic(t *testing.T) {
 
 func TestTranslate_FromAnthropic(t *testing.T) {
 	resp := translate.AnthropicResponse{
-		ID:    "msg_1",
-		Model: "claude-sonnet-4-6",
-		Content: []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}{{Type: "text", Text: "hello"}},
+		ID:         "msg_1",
+		Model:      "claude-sonnet-4-6",
+		Content:    []translate.AnthropicContentBlock{{Type: "text", Text: "hello"}},
 		StopReason: "end_turn",
 	}
 	resp.Usage.InputTokens = 10
@@ -169,5 +166,94 @@ func TestTranslate_NormalizeChat(t *testing.T) {
 	got := translate.NormalizeChatRequest(req)
 	if got.Model != req.Model {
 		t.Error("normalize changed model")
+	}
+}
+
+func toolRequest() types.ChatRequest {
+	return types.ChatRequest{
+		Model: "tool-model",
+		Tools: []types.Tool{{
+			Type: "function",
+			Function: types.ToolFunc{
+				Name:        "lookup",
+				Description: "look something up",
+				Parameters:  map[string]any{"type": "object", "properties": map[string]any{"q": map[string]string{"type": "string"}}},
+			},
+		}},
+		ToolChoice: map[string]any{"type": "function", "function": map[string]any{"name": "lookup"}},
+		Messages: []types.ChatMessage{
+			{Role: "user", Content: "find x"},
+			{Role: "assistant", ToolCalls: []types.ToolCall{{ID: "call-1", Type: "function", Function: types.ToolCallFunction{Name: "lookup", Arguments: `{"q":"x"}`}}}},
+			{Role: "tool", ToolCallID: "call-1", Content: `{"result":"ok"}`},
+		},
+	}
+}
+
+func TestTranslate_ToolsToAnthropicAndBack(t *testing.T) {
+	native := translate.ToAnthropic(toolRequest())
+	if len(native.Tools) != 1 || native.Tools[0].Name != "lookup" {
+		t.Fatalf("anthropic tools = %+v", native.Tools)
+	}
+	choice, ok := native.ToolChoice.(map[string]string)
+	if !ok || choice["type"] != "tool" || choice["name"] != "lookup" {
+		t.Fatalf("anthropic tool choice = %#v", native.ToolChoice)
+	}
+	if len(native.Messages) != 3 {
+		t.Fatalf("anthropic messages = %d, want 3", len(native.Messages))
+	}
+	blocks, ok := native.Messages[1].Content.([]translate.AnthropicContentBlock)
+	if !ok || len(blocks) != 1 || blocks[0].Type != "tool_use" || blocks[0].Name != "lookup" {
+		t.Fatalf("anthropic tool_use = %#v", native.Messages[1].Content)
+	}
+	result, ok := native.Messages[2].Content.([]translate.AnthropicContentBlock)
+	if !ok || result[0].Type != "tool_result" || result[0].ToolUseID != "call-1" {
+		t.Fatalf("anthropic tool_result = %#v", native.Messages[2].Content)
+	}
+
+	resp := translate.AnthropicResponse{
+		Content: []translate.AnthropicContentBlock{
+			{Type: "text", Text: "I found it"},
+			{Type: "tool_use", ID: "call-2", Name: "lookup", Input: map[string]any{"q": "y"}},
+		},
+		StopReason: "tool_use",
+	}
+	got := translate.FromAnthropic(resp)
+	if got.Choices[0].FinishReason != "tool_calls" || len(got.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("anthropic response = %+v", got.Choices[0])
+	}
+	if got.Choices[0].Message.ToolCalls[0].Function.Arguments != `{"q":"y"}` {
+		t.Fatalf("anthropic arguments = %s", got.Choices[0].Message.ToolCalls[0].Function.Arguments)
+	}
+}
+
+func TestTranslate_ToolsToGeminiAndBack(t *testing.T) {
+	native := translate.ToGemini(toolRequest())
+	if len(native.Tools) != 1 || len(native.Tools[0].FunctionDeclarations) != 1 {
+		t.Fatalf("gemini tools = %+v", native.Tools)
+	}
+	if native.ToolConfig == nil || native.ToolConfig.FunctionCallingConfig.Mode != "ANY" || len(native.ToolConfig.FunctionCallingConfig.AllowedFunctionNames) != 1 {
+		t.Fatalf("gemini tool config = %+v", native.ToolConfig)
+	}
+	if native.Contents[1].Parts[0].FunctionCall == nil || native.Contents[1].Parts[0].FunctionCall.Name != "lookup" {
+		t.Fatalf("gemini function call = %+v", native.Contents[1].Parts)
+	}
+	if native.Contents[2].Parts[0].FunctionResponse == nil {
+		t.Fatalf("gemini function response = %+v", native.Contents[2].Parts)
+	}
+
+	resp := translate.GeminiResponse{
+		Candidates: []struct {
+			Content      translate.GeminiContent `json:"content"`
+			FinishReason string                  `json:"finishReason"`
+		}{
+			{Content: translate.GeminiContent{Parts: []translate.GeminiPart{{FunctionCall: &translate.GeminiFunctionCall{Name: "lookup", Args: map[string]any{"q": "z"}}}}}, FinishReason: "STOP"},
+		},
+	}
+	got := translate.FromGemini(resp, "tool-model")
+	if got.Choices[0].FinishReason != "tool_calls" || len(got.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("gemini response = %+v", got.Choices[0])
+	}
+	if got.Choices[0].Message.ToolCalls[0].Function.Name != "lookup" {
+		t.Fatalf("gemini function name = %+v", got.Choices[0].Message.ToolCalls)
 	}
 }
