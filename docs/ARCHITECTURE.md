@@ -194,7 +194,7 @@ sequenceDiagram
     Note over B: after 5 failures B→open 30s,<br>half-open probe 1
 ```
 
-Streaming variant: `handler.go:390 handleStream` branches `req.Stream` → `Content-Type:text/event-stream`, `http.Flusher`, translates `event:content_block_delta` → `ChatCompletionChunk`, no cache, same fallback notification (warn, not yet implemented hedge for streams).
+Streaming variant: `handler.go:390 handleStream` branches `req.Stream` → `Content-Type:text/event-stream`, `http.Flusher`, translates `event:content_block_delta` → `ChatCompletionChunk`, preserves optional terminal usage from provider stream metadata, no cache, same fallback notification (warn, not yet implemented hedge for streams).
 
 ---
 

@@ -157,6 +157,33 @@ func (a *Anthropic) SendStream(ctx context.Context, req ChatRequest) (<-chan Str
 		buf := make([]byte, 0, 4096)
 		scanner.Buffer(buf, 1<<20)
 		var currentEvent string
+		includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+		promptTokens, completionTokens := 0, 0
+		emit := func(chunk StreamChunk) bool {
+			select {
+			case ch <- chunk:
+				return true
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return false
+			}
+		}
+		emitUsage := func() bool {
+			if !includeUsage || (promptTokens == 0 && completionTokens == 0) {
+				return true
+			}
+			return emit(StreamChunk{
+				ID:      "chatcmpl-anthropic",
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   req.Model,
+				Usage: &Usage{
+					PromptTokens:     promptTokens,
+					CompletionTokens: completionTokens,
+					TotalTokens:      promptTokens + completionTokens,
+				},
+			})
+		}
 		for scanner.Scan() {
 			line := scanner.Text()
 			if strings.HasPrefix(line, "event:") {
@@ -171,6 +198,17 @@ func (a *Anthropic) SendStream(ctx context.Context, req ChatRequest) (<-chan Str
 				continue
 			}
 			switch currentEvent {
+			case "message_start":
+				var evt struct {
+					Message struct {
+						Usage struct {
+							InputTokens int `json:"input_tokens"`
+						} `json:"usage"`
+					} `json:"message"`
+				}
+				if json.Unmarshal([]byte(payload), &evt) == nil {
+					promptTokens = evt.Message.Usage.InputTokens
+				}
 			case "content_block_delta":
 				var evt struct {
 					Delta struct {
@@ -195,19 +233,49 @@ func (a *Anthropic) SendStream(ctx context.Context, req ChatRequest) (<-chan Str
 						Delta: ChatMessage{Role: "assistant", Content: delta},
 					}},
 				}
-				select {
-				case ch <- chunk:
-				case <-ctx.Done():
-					errCh <- ctx.Err()
+				if !emit(chunk) {
 					return
 				}
+			case "message_delta":
+				var evt struct {
+					Delta struct {
+						StopReason string `json:"stop_reason"`
+					} `json:"delta"`
+					Usage struct {
+						OutputTokens int `json:"output_tokens"`
+					} `json:"usage"`
+				}
+				if json.Unmarshal([]byte(payload), &evt) != nil {
+					continue
+				}
+				completionTokens = evt.Usage.OutputTokens
+				if evt.Delta.StopReason != "" {
+					finishReason := "stop"
+					if evt.Delta.StopReason == "max_tokens" {
+						finishReason = "length"
+					}
+					if !emit(StreamChunk{
+						ID:      "chatcmpl-anthropic",
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   req.Model,
+						Choices: []StreamChoice{{Index: 0, FinishReason: &finishReason}},
+					}) {
+						return
+					}
+				}
 			case "message_stop":
+				if !emitUsage() {
+					return
+				}
 				return
 			}
 		}
 		if err := scanner.Err(); err != nil && err != io.EOF {
 			errCh <- err
+			return
 		}
+		_ = emitUsage()
 	}()
 
 	return ch, errCh

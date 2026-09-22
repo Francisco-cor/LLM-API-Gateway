@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserve provider usage metadata in the final SSE chunk when `stream_options.include_usage` is requested, including Anthropic message events and Gemini usage-only terminal events.
 - Pin `govulncheck` in CI and Release workflows for reproducible security scans with the Go 1.24 toolchain.
 - Share one replaceable Redis connection manager across rate-limit, budget, and cache; hot reload now pings/swaps/closes Redis safely and preserves the previous backend if the replacement is unavailable.
 - Expand the OpenAI-compatible chat contract for multimodal content, tool calls, audio, logprobs, parallel tool calls, and modern completion controls; preserve those fields in cache namespaces and use safe text projections for narrower translated providers.

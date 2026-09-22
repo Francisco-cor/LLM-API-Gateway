@@ -144,6 +144,31 @@ func (g *Gemini) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 		scanner := bufio.NewScanner(resp.Body)
 		buf := make([]byte, 0, 4096)
 		scanner.Buffer(buf, 1<<20)
+		includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+		var lastUsage *Usage
+		emit := func(chunk StreamChunk) bool {
+			select {
+			case ch <- chunk:
+				return true
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return false
+			}
+		}
+		emitUsage := func() bool {
+			if !includeUsage || lastUsage == nil {
+				return true
+			}
+			usage := *lastUsage
+			lastUsage = nil
+			return emit(StreamChunk{
+				ID:      "chatcmpl-gemini",
+				Object:  "chat.completion.chunk",
+				Created: time.Now().Unix(),
+				Model:   req.Model,
+				Usage:   &usage,
+			})
+		}
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
@@ -160,10 +185,24 @@ func (g *Gemini) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 			if err := json.Unmarshal([]byte(payload), &native); err != nil {
 				continue
 			}
-			if len(native.Candidates) == 0 || len(native.Candidates[0].Content.Parts) == 0 {
+			if total := native.UsageMetadata.TotalTokenCount; total > 0 {
+				lastUsage = &Usage{
+					PromptTokens:     native.UsageMetadata.PromptTokenCount,
+					CompletionTokens: native.UsageMetadata.CandidatesTokenCount,
+					TotalTokens:      total,
+				}
+			}
+			if len(native.Candidates) == 0 {
 				continue
 			}
-			text := native.Candidates[0].Content.Parts[0].Text
+			candidate := native.Candidates[0]
+			text := ""
+			if len(candidate.Content.Parts) > 0 {
+				text = candidate.Content.Parts[0].Text
+			}
+			if text == "" && candidate.FinishReason == "" {
+				continue
+			}
 			chunk := StreamChunk{
 				ID:      "chatcmpl-gemini",
 				Object:  "chat.completion.chunk",
@@ -175,26 +214,28 @@ func (g *Gemini) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 				}},
 			}
 			// Map finishReason if present
-			if native.Candidates[0].FinishReason == "STOP" || native.Candidates[0].FinishReason == "MAX_TOKENS" {
+			if candidate.FinishReason == "STOP" || candidate.FinishReason == "MAX_TOKENS" {
 				fr := "stop"
-				if native.Candidates[0].FinishReason == "MAX_TOKENS" {
+				if candidate.FinishReason == "MAX_TOKENS" {
 					fr = "length"
 				}
 				chunk.Choices[0].FinishReason = &fr
 			}
-			select {
-			case ch <- chunk:
-			case <-ctx.Done():
-				errCh <- ctx.Err()
+			if !emit(chunk) {
 				return
 			}
 			if chunk.Choices[0].FinishReason != nil {
+				if !emitUsage() {
+					return
+				}
 				return
 			}
 		}
 		if err := scanner.Err(); err != nil && err != io.EOF {
 			errCh <- err
+			return
 		}
+		_ = emitUsage()
 	}()
 
 	return ch, errCh
