@@ -255,7 +255,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if h.tokenAwareEnabled() {
 			chars := 0
 			for _, m := range req.Messages {
-				chars += len(m.Content)
+				chars += len(m.Text())
 			}
 			estTokens := ratelimit.EstimateTokens(chars)
 			key := clientRateLimitKey(r)
@@ -436,8 +436,8 @@ func (h *Handler) reserveChatBudget(tenant string, req provider.ChatRequest) (*b
 	}
 	tokens := chatPromptTokens(req)
 	completionTokens := 0
-	if req.MaxTokens != nil && *req.MaxTokens > 0 {
-		completionTokens = *req.MaxTokens
+	if max := req.EffectiveMaxTokens(); max != nil && *max > 0 {
+		completionTokens = *max
 	}
 	tokens += completionTokens
 	estimate, err := h.budgetMgr.EstimateChat(req.Model, tokens-completionTokens, completionTokens)
@@ -452,7 +452,7 @@ func (h *Handler) reserveChatBudget(tenant string, req provider.ChatRequest) (*b
 func chatPromptTokens(req provider.ChatRequest) int {
 	chars := 0
 	for _, message := range req.Messages {
-		chars += len(message.Content)
+		chars += len(message.Text())
 	}
 	return ratelimit.EstimateTokens(chars)
 }

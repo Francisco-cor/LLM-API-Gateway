@@ -57,13 +57,13 @@ func ToGemini(req types.ChatRequest) GeminiRequest {
 	native := GeminiRequest{
 		GenerationConfig: &GeminiGenConfig{
 			Temperature:     req.Temperature,
-			MaxOutputTokens: req.MaxTokens,
+			MaxOutputTokens: req.EffectiveMaxTokens(),
 		},
 	}
 	for _, msg := range req.Messages {
 		if msg.Role == "system" {
 			native.SystemInstruction = &GeminiContent{
-				Parts: []GeminiPart{{Text: msg.Content}},
+				Parts: []GeminiPart{{Text: msg.Text()}},
 			}
 			continue
 		}
@@ -73,7 +73,7 @@ func ToGemini(req types.ChatRequest) GeminiRequest {
 		}
 		native.Contents = append(native.Contents, GeminiContent{
 			Role:  role,
-			Parts: []GeminiPart{{Text: msg.Content}},
+			Parts: []GeminiPart{{Text: msg.Text()}},
 		})
 	}
 	return native

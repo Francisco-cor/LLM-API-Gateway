@@ -43,8 +43,8 @@ type AnthropicResponse struct {
 // inside the messages array.
 func ToAnthropic(req types.ChatRequest) AnthropicRequest {
 	maxTokens := DefaultMaxTokens
-	if req.MaxTokens != nil {
-		maxTokens = *req.MaxTokens
+	if max := req.EffectiveMaxTokens(); max != nil {
+		maxTokens = *max
 	}
 	native := AnthropicRequest{
 		Model:       req.Model,
@@ -53,12 +53,12 @@ func ToAnthropic(req types.ChatRequest) AnthropicRequest {
 	}
 	for _, msg := range req.Messages {
 		if msg.Role == "system" {
-			native.System = msg.Content
+			native.System = msg.Text()
 			continue
 		}
 		native.Messages = append(native.Messages, AnthropicMessage{
 			Role:    msg.Role,
-			Content: msg.Content,
+			Content: msg.Text(),
 		})
 	}
 	return native
