@@ -128,6 +128,9 @@ func main() {
 	}{Enabled: cfg.Resilience.Hedge.Enabled, Delay: cfg.Resilience.Hedge.Delay}
 
 	health := proxy.NewHealthHandler()
+	healthOptions := buildHealthOptions(cfg)
+	readiness := proxy.NewReadinessHandlerWithOptions(registry, health, healthOptions)
+	healthProviders := proxy.NewHealthProvidersHandlerWithOptions(registry, healthOptions)
 	mux := http.NewServeMux()
 	rateLimitEnabled := &atomic.Bool{}
 	rateLimitEnabled.Store(cfg.RateLimit.Enabled)
@@ -137,9 +140,9 @@ func main() {
 	mux.Handle("POST /v1/embeddings", embedHandler)
 	mux.Handle("GET /v1/models", proxy.NewModelsHandler(registry))
 	mux.Handle("GET /health", health)
-	mux.Handle("GET /health/providers", proxy.NewHealthProvidersHandler(registry))
+	mux.Handle("GET /health/providers", healthProviders)
 	mux.Handle("GET /livez", proxy.NewLivenessHandler(health))
-	mux.Handle("GET /readyz", proxy.NewReadinessHandlerWithHealth(registry, health))
+	mux.Handle("GET /readyz", readiness)
 	mux.Handle("GET /metrics", proxy.NewMetricsHandler())
 
 	var handler http.Handler = mux
@@ -215,6 +218,9 @@ func main() {
 
 		// auth
 		authStore.Reload(newCfg.Auth.Keys)
+		healthOptions = buildHealthOptions(newCfg)
+		readiness.SetOptions(healthOptions)
+		healthProviders.SetOptions(healthOptions)
 
 		// cache: handle enable/disable and TTL (recreate if enabled)
 		var newCache cache.Cache
@@ -410,6 +416,15 @@ func buildPricingCatalog(cfg *config.Config) (*pricing.Catalog, error) {
 		})
 	}
 	return pricing.NewCatalog(rules, cfg.RateLimit.Budget.CostPerTokenUSD, p.Currency, p.Version, p.UnknownModelPolicy)
+}
+
+func buildHealthOptions(cfg *config.Config) proxy.HealthOptions {
+	return proxy.HealthOptions{
+		ReadinessCacheTTL:   cfg.Health.ReadinessCacheTTL,
+		CheckTimeout:        cfg.Health.CheckTimeout,
+		ProviderTimeout:     cfg.Health.ProviderTimeout,
+		SkipExpensiveChecks: cfg.Health.SkipExpensiveChecks,
+	}
 }
 
 func buildCache(cfg *config.Config, redisClient *redis.Client, registry *proxy.Registry, log *slog.Logger) cache.Cache {

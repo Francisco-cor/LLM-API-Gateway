@@ -11,12 +11,40 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// healthCheckTimeout bounds how long GET /health/providers waits for all
-// providers to respond.
-const healthCheckTimeout = 10 * time.Second
+const (
+	defaultHealthCheckTimeout = 10 * time.Second
+	defaultProviderTimeout    = 3 * time.Second
+	defaultReadinessCacheTTL  = 15 * time.Second
+)
 
-// perProviderTimeout bounds each individual provider health check.
-const perProviderTimeout = 3 * time.Second
+type HealthOptions struct {
+	ReadinessCacheTTL   time.Duration
+	CheckTimeout        time.Duration
+	ProviderTimeout     time.Duration
+	SkipExpensiveChecks bool
+}
+
+func DefaultHealthOptions() HealthOptions {
+	return HealthOptions{
+		ReadinessCacheTTL: defaultReadinessCacheTTL,
+		CheckTimeout:      defaultHealthCheckTimeout,
+		ProviderTimeout:   defaultProviderTimeout,
+	}
+}
+
+func normalizeHealthOptions(options HealthOptions) HealthOptions {
+	defaults := DefaultHealthOptions()
+	if options.ReadinessCacheTTL <= 0 {
+		options.ReadinessCacheTTL = defaults.ReadinessCacheTTL
+	}
+	if options.CheckTimeout <= 0 {
+		options.CheckTimeout = defaults.CheckTimeout
+	}
+	if options.ProviderTimeout <= 0 {
+		options.ProviderTimeout = defaults.ProviderTimeout
+	}
+	return options
+}
 
 // HealthHandler serves GET /health, a liveness probe for the gateway itself.
 // It also tracks readiness for graceful drain (Fase 10): SetReady(false) makes
@@ -63,14 +91,14 @@ func (h *LivenessHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // ReadinessHandler is GET /readyz (k8s readiness) - checks providers are at least one healthy.
 type ReadinessHandler struct {
-	registry *Registry
-	health   *HealthHandler
-	cacheMu  sync.Mutex
-	refresh  sync.Mutex
-	last     readinessSnapshot
+	registry  *Registry
+	health    *HealthHandler
+	cacheMu   sync.Mutex
+	refresh   sync.Mutex
+	optionsMu sync.RWMutex
+	options   HealthOptions
+	last      readinessSnapshot
 }
-
-const readinessCacheTTL = 15 * time.Second
 
 type readinessSnapshot struct {
 	at        time.Time
@@ -80,12 +108,31 @@ type readinessSnapshot struct {
 }
 
 func NewReadinessHandler(registry *Registry) *ReadinessHandler {
-	return &ReadinessHandler{registry: registry}
+	return NewReadinessHandlerWithOptions(registry, nil, DefaultHealthOptions())
 }
 
 // NewReadinessHandlerWithHealth links readiness to HealthHandler ready flag (for graceful drain).
 func NewReadinessHandlerWithHealth(registry *Registry, health *HealthHandler) *ReadinessHandler {
-	return &ReadinessHandler{registry: registry, health: health}
+	return NewReadinessHandlerWithOptions(registry, health, DefaultHealthOptions())
+}
+
+func NewReadinessHandlerWithOptions(registry *Registry, health *HealthHandler, options HealthOptions) *ReadinessHandler {
+	return &ReadinessHandler{registry: registry, health: health, options: normalizeHealthOptions(options)}
+}
+
+func (h *ReadinessHandler) SetOptions(options HealthOptions) {
+	h.optionsMu.Lock()
+	h.options = normalizeHealthOptions(options)
+	h.optionsMu.Unlock()
+	h.cacheMu.Lock()
+	h.last = readinessSnapshot{}
+	h.cacheMu.Unlock()
+}
+
+func (h *ReadinessHandler) getOptions() HealthOptions {
+	h.optionsMu.RLock()
+	defer h.optionsMu.RUnlock()
+	return h.options
 }
 
 func (h *ReadinessHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -108,9 +155,10 @@ func (h *ReadinessHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *ReadinessHandler) cachedSnapshot() (readinessSnapshot, bool) {
+	ttl := h.getOptions().ReadinessCacheTTL
 	h.cacheMu.Lock()
 	defer h.cacheMu.Unlock()
-	if h.last.at.IsZero() || time.Since(h.last.at) >= readinessCacheTTL {
+	if h.last.at.IsZero() || time.Since(h.last.at) >= ttl {
 		return readinessSnapshot{}, false
 	}
 	return cloneReadinessSnapshot(h.last), true
@@ -123,7 +171,8 @@ func (h *ReadinessHandler) refreshSnapshot(parent context.Context) readinessSnap
 	if snapshot, ok := h.cachedSnapshot(); ok {
 		return snapshot
 	}
-	ctx, cancel := context.WithTimeout(parent, healthCheckTimeout)
+	options := h.getOptions()
+	ctx, cancel := context.WithTimeout(parent, options.CheckTimeout)
 	defer cancel()
 
 	var mu sync.Mutex
@@ -134,8 +183,15 @@ func (h *ReadinessHandler) refreshSnapshot(parent context.Context) readinessSnap
 	for _, p := range h.registry.All() {
 		p := p
 		g.Go(func() error {
-			pCtx, pCancel := context.WithTimeout(ctx, perProviderTimeout)
+			pCtx, pCancel := context.WithTimeout(ctx, options.ProviderTimeout)
 			defer pCancel()
+			if options.SkipExpensiveChecks && p.Name() == "anthropic" {
+				mu.Lock()
+				results[p.Name()] = providerStatus{Status: "skipped"}
+				healthy++
+				mu.Unlock()
+				return nil
+			}
 			err := p.HealthCheck(pCtx)
 			mu.Lock()
 			defer mu.Unlock()
@@ -194,15 +250,34 @@ type providerStatus struct {
 // HealthProvidersHandler serves GET /health/providers, pinging every
 // configured provider and reporting per-provider status.
 type HealthProvidersHandler struct {
-	registry *Registry
+	registry  *Registry
+	optionsMu sync.RWMutex
+	options   HealthOptions
 }
 
 func NewHealthProvidersHandler(registry *Registry) *HealthProvidersHandler {
-	return &HealthProvidersHandler{registry: registry}
+	return NewHealthProvidersHandlerWithOptions(registry, DefaultHealthOptions())
+}
+
+func NewHealthProvidersHandlerWithOptions(registry *Registry, options HealthOptions) *HealthProvidersHandler {
+	return &HealthProvidersHandler{registry: registry, options: normalizeHealthOptions(options)}
+}
+
+func (h *HealthProvidersHandler) SetOptions(options HealthOptions) {
+	h.optionsMu.Lock()
+	h.options = normalizeHealthOptions(options)
+	h.optionsMu.Unlock()
+}
+
+func (h *HealthProvidersHandler) getOptions() HealthOptions {
+	h.optionsMu.RLock()
+	defer h.optionsMu.RUnlock()
+	return h.options
 }
 
 func (h *HealthProvidersHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), healthCheckTimeout)
+	options := h.getOptions()
+	ctx, cancel := context.WithTimeout(r.Context(), options.CheckTimeout)
 	defer cancel()
 
 	var mu sync.Mutex
@@ -212,8 +287,14 @@ func (h *HealthProvidersHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	for _, p := range h.registry.All() {
 		p := p
 		g.Go(func() error {
-			pCtx, pCancel := context.WithTimeout(ctx, perProviderTimeout)
+			pCtx, pCancel := context.WithTimeout(ctx, options.ProviderTimeout)
 			defer pCancel()
+			if options.SkipExpensiveChecks && p.Name() == "anthropic" {
+				mu.Lock()
+				results[p.Name()] = providerStatus{Status: "skipped"}
+				mu.Unlock()
+				return nil
+			}
 			err := p.HealthCheck(pCtx)
 			mu.Lock()
 			defer mu.Unlock()

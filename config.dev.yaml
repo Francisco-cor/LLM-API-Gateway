@@ -47,6 +47,12 @@ cache:
   semantic_top_k: 3
   semantic_max_entries: 1000
 
+health:
+  readiness_cache_ttl: 15s
+  check_timeout: 10s
+  provider_timeout: 3s
+  skip_expensive_checks: false
+
 auth:
   enabled: false
 

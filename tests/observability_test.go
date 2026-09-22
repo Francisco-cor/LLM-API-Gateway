@@ -2,6 +2,7 @@ package tests
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -67,6 +68,28 @@ func TestHealth_LivezReadyz(t *testing.T) {
 	readyz.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Errorf("/readyz status %d, want 200 (mock healthy)", w.Code)
+	}
+}
+
+func TestHealth_SkipExpensiveChecksIsVisible(t *testing.T) {
+	registry := proxy.NewRegistry([]provider.Provider{
+		&mockProvider{name: "anthropic", models: []string{"claude-sonnet-4-6"}},
+	})
+	options := proxy.DefaultHealthOptions()
+	options.SkipExpensiveChecks = true
+	readyz := proxy.NewReadinessHandlerWithOptions(registry, nil, options)
+	w := httptest.NewRecorder()
+	readyz.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("readyz status %d, want 200", w.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	providers, ok := body["providers"].(map[string]any)
+	if !ok || providers["anthropic"].(map[string]any)["status"] != "skipped" {
+		t.Fatalf("unexpected readiness providers: %+v", body["providers"])
 	}
 }
 

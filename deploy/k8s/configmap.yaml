@@ -59,6 +59,11 @@ data:
       enabled: false
       ttl: 5m
       max_size: 1000
+    health:
+      readiness_cache_ttl: 30s
+      check_timeout: 10s
+      provider_timeout: 3s
+      skip_expensive_checks: true
     resilience:
       retry:
         max_attempts: 3

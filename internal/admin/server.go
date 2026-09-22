@@ -208,6 +208,12 @@ type AdminPatch struct {
 		SemanticTopK           *int     `json:"semantic_top_k"`
 		SemanticMaxEntries     *int     `json:"semantic_max_entries"`
 	} `json:"cache"`
+	Health *struct {
+		ReadinessCacheTTL   *string `json:"readiness_cache_ttl"`
+		CheckTimeout        *string `json:"check_timeout"`
+		ProviderTimeout     *string `json:"provider_timeout"`
+		SkipExpensiveChecks *bool   `json:"skip_expensive_checks"`
+	} `json:"health"`
 	Resilience *struct {
 		Retry *struct {
 			MaxAttempts *int    `json:"max_attempts"`
@@ -396,6 +402,32 @@ func applyPatch(cfg *config.Config, patch *AdminPatch) error {
 				}
 				cfg.Resilience.Hedge.Delay = d
 			}
+		}
+	}
+	if patch.Health != nil {
+		if patch.Health.ReadinessCacheTTL != nil {
+			d, err := time.ParseDuration(*patch.Health.ReadinessCacheTTL)
+			if err != nil {
+				return fmt.Errorf("health.readiness_cache_ttl invalid %q", *patch.Health.ReadinessCacheTTL)
+			}
+			cfg.Health.ReadinessCacheTTL = d
+		}
+		if patch.Health.CheckTimeout != nil {
+			d, err := time.ParseDuration(*patch.Health.CheckTimeout)
+			if err != nil {
+				return fmt.Errorf("health.check_timeout invalid %q", *patch.Health.CheckTimeout)
+			}
+			cfg.Health.CheckTimeout = d
+		}
+		if patch.Health.ProviderTimeout != nil {
+			d, err := time.ParseDuration(*patch.Health.ProviderTimeout)
+			if err != nil {
+				return fmt.Errorf("health.provider_timeout invalid %q", *patch.Health.ProviderTimeout)
+			}
+			cfg.Health.ProviderTimeout = d
+		}
+		if patch.Health.SkipExpensiveChecks != nil {
+			cfg.Health.SkipExpensiveChecks = *patch.Health.SkipExpensiveChecks
 		}
 	}
 	if patch.Routing != nil && patch.Routing.Weighted != nil {

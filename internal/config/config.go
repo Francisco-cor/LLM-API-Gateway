@@ -22,6 +22,7 @@ type Config struct {
 	Resilience    ResilienceConfig          `yaml:"resilience"`
 	ModelAliases  map[string][]string       `yaml:"model_aliases"`
 	Cache         CacheConfig               `yaml:"cache"`
+	Health        HealthConfig              `yaml:"health"`
 	Routing       RoutingConfig             `yaml:"routing"`
 	Admin         AdminConfig               `yaml:"admin"`
 }
@@ -155,6 +156,13 @@ type CacheConfig struct {
 	SemanticEmbeddingModel string        `yaml:"semantic_embedding_model"`
 	SemanticTopK           int           `yaml:"semantic_top_k"`
 	SemanticMaxEntries     int           `yaml:"semantic_max_entries"`
+}
+
+type HealthConfig struct {
+	ReadinessCacheTTL   time.Duration `yaml:"readiness_cache_ttl"`
+	CheckTimeout        time.Duration `yaml:"check_timeout"`
+	ProviderTimeout     time.Duration `yaml:"provider_timeout"`
+	SkipExpensiveChecks bool          `yaml:"skip_expensive_checks"`
 }
 
 func Load(path string) (*Config, error) {
@@ -334,6 +342,9 @@ func (c *Config) Validate() error {
 	if c.Cache.SemanticMaxEntries < 0 {
 		return fmt.Errorf("cache.semantic_max_entries must be >=0")
 	}
+	if c.Health.ReadinessCacheTTL < 0 || c.Health.CheckTimeout < 0 || c.Health.ProviderTimeout < 0 {
+		return fmt.Errorf("health timeouts must be >=0")
+	}
 	for model, entries := range c.Routing.Weighted {
 		if model == "" {
 			return fmt.Errorf("routing.weighted key must be non-empty")
@@ -428,6 +439,15 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Cache.SemanticMaxEntries == 0 {
 		cfg.Cache.SemanticMaxEntries = 1000
+	}
+	if cfg.Health.ReadinessCacheTTL == 0 {
+		cfg.Health.ReadinessCacheTTL = 15 * time.Second
+	}
+	if cfg.Health.CheckTimeout == 0 {
+		cfg.Health.CheckTimeout = 10 * time.Second
+	}
+	if cfg.Health.ProviderTimeout == 0 {
+		cfg.Health.ProviderTimeout = 3 * time.Second
 	}
 	if cfg.Admin.Port == 0 {
 		cfg.Admin.Port = 8081

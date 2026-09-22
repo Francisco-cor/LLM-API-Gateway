@@ -129,6 +129,14 @@ cache:
   semantic_top_k: 3
   semantic_max_entries: 1000
 
+health:
+  readiness_cache_ttl: 15s
+  check_timeout: 10s
+  provider_timeout: 3s
+  # When true, readiness treats Anthropic as configured without spending a
+  # messages request; /health/providers reports it as skipped.
+  skip_expensive_checks: false
+
 cors:
   allowed_origins: [] # e.g. ["https://app.example.com", "*"]
 
