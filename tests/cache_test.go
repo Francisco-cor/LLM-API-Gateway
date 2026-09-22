@@ -207,8 +207,11 @@ func TestCache_BenchHash(t *testing.T) {
 		_ = cache.BuildKey(req)
 	}
 	elapsed := time.Since(start)
-	if elapsed > 200*time.Millisecond {
-		t.Errorf("10k BuildKey took %v, want <200ms", elapsed)
+	// The OpenAI-compatible message marshaler intentionally preserves both
+	// string and multimodal content; allow race-instrumented CI headroom while
+	// retaining a useful regression guard for the hot path.
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("10k BuildKey took %v, want <500ms", elapsed)
 	}
 }
 

@@ -196,8 +196,9 @@ func (s *Server) handleGetProviders(w http.ResponseWriter, _ *http.Request) {
 // Only fields present are applied. Durations are strings like "30s", "5m".
 type AdminPatch struct {
 	RateLimit *struct {
-		RequestsPerMinute *int `json:"requests_per_minute"`
-		Burst             *int `json:"burst"`
+		RequestsPerMinute *int    `json:"requests_per_minute"`
+		Burst             *int    `json:"burst"`
+		RedisURL          *string `json:"redis_url"`
 	} `json:"rate_limit"`
 	Cache *struct {
 		TTL                    *string  `json:"ttl"`
@@ -330,6 +331,9 @@ func applyPatch(cfg *config.Config, patch *AdminPatch) error {
 		}
 		if patch.RateLimit.Burst != nil {
 			cfg.RateLimit.Burst = *patch.RateLimit.Burst
+		}
+		if patch.RateLimit.RedisURL != nil {
+			cfg.RateLimit.RedisURL = *patch.RateLimit.RedisURL
 		}
 	}
 	if patch.Cache != nil {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/fcordero/llm-api-gateway/internal/pricing"
+	"github.com/fcordero/llm-api-gateway/internal/redisstore"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -31,7 +32,7 @@ type Manager struct {
 	mu              sync.Mutex
 	mem             map[string]*usage
 	configMu        sync.RWMutex
-	redis           *redis.Client
+	redisStore      redisstore.Store
 	enabled         bool
 	tokens          int
 	usd             float64
@@ -78,6 +79,12 @@ func NewWithPricing(tokens int, usd, costPerTokenUSD float64, redisClient *redis
 // NewConfigured creates a manager even when disabled. Keeping the manager
 // installed lets a config reload enable budgets without rebuilding handlers.
 func NewConfigured(enabled bool, tokens int, usd, costPerTokenUSD float64, redisClient *redis.Client, catalog *pricing.Catalog) *Manager {
+	return NewConfiguredWithStore(enabled, tokens, usd, costPerTokenUSD, redisstore.NewStatic(redisClient), catalog)
+}
+
+// NewConfiguredWithStore creates a manager backed by a replaceable Redis
+// store. The store may be empty while the gateway uses its local fallback.
+func NewConfiguredWithStore(enabled bool, tokens int, usd, costPerTokenUSD float64, store redisstore.Store, catalog *pricing.Catalog) *Manager {
 	if costPerTokenUSD < 0 {
 		costPerTokenUSD = 0
 	}
@@ -86,13 +93,28 @@ func NewConfigured(enabled bool, tokens int, usd, costPerTokenUSD float64, redis
 	}
 	return &Manager{
 		mem:             make(map[string]*usage),
-		redis:           redisClient,
+		redisStore:      store,
 		enabled:         enabled,
 		tokens:          tokens,
 		usd:             usd,
 		costPerTokenUSD: costPerTokenUSD,
 		catalog:         catalog,
 	}
+}
+
+// SetRedisStore swaps the distributed budget backend without replacing the
+// manager used by request handlers.
+func (m *Manager) SetRedisStore(store redisstore.Store) {
+	m.configMu.Lock()
+	m.redisStore = store
+	m.configMu.Unlock()
+}
+
+func (m *Manager) redisStoreSnapshot() redisstore.Store {
+	m.configMu.RLock()
+	store := m.redisStore
+	m.configMu.RUnlock()
+	return store
 }
 
 // UpdateConfig atomically swaps budget limits and pricing. Existing monthly
@@ -174,7 +196,7 @@ func (m *Manager) Check(tenant string) error {
 	if !enabled || tenant == "" {
 		return nil
 	}
-	if m.redis != nil {
+	if store := m.redisStoreSnapshot(); store != nil && store.Active() {
 		return m.checkRedis(tenant)
 	}
 	return m.checkMem(tenant, monthKey())
@@ -194,7 +216,7 @@ func (m *Manager) Reserve(tenant string, tokens int, usd float64) (*Reservation,
 		usd = 0
 	}
 	month := monthKey()
-	if m.redis != nil {
+	if store := m.redisStoreSnapshot(); store != nil && store.Active() {
 		if err := m.reserveRedis(tenant, month, tokens, usd); err != nil {
 			return nil, err
 		}
@@ -257,10 +279,16 @@ func (m *Manager) checkMem(tenant, month string) error {
 
 func (m *Manager) checkRedis(tenant string) error {
 	_, tokenLimit, usdLimit := m.limitsSnapshot()
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
 	key := budgetKey(tenant, monthKey())
-	val, err := m.redis.HMGet(ctx, key, "tokens", "usd").Result()
+	var val []interface{}
+	store := m.redisStoreSnapshot()
+	err := store.WithClient(func(client *redis.Client) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		var err error
+		val, err = client.HMGet(ctx, key, "tokens", "usd").Result()
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
@@ -289,10 +317,16 @@ func (m *Manager) reserveMem(tenant, month string, tokens int, usd float64) erro
 
 func (m *Manager) reserveRedis(tenant, month string, tokens int, usd float64) error {
 	_, tokenLimit, usdLimit := m.limitsSnapshot()
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	result, err := budgetReserveScript.Run(ctx, m.redis, []string{budgetKey(tenant, month)},
-		tokenLimit, usdLimit, tokens, usd, budgetTTLSeconds).Result()
+	var result interface{}
+	store := m.redisStoreSnapshot()
+	err := store.WithClient(func(client *redis.Client) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		var err error
+		result, err = budgetReserveScript.Run(ctx, client, []string{budgetKey(tenant, month)},
+			tokenLimit, usdLimit, tokens, usd, budgetTTLSeconds).Result()
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
@@ -317,7 +351,7 @@ func (m *Manager) Record(tenant string, tokens int, usd float64) {
 }
 
 func (m *Manager) adjust(tenant, month string, deltaTokens int, deltaUSD float64) error {
-	if m.redis != nil {
+	if store := m.redisStoreSnapshot(); store != nil && store.Active() {
 		return m.adjustRedis(tenant, month, deltaTokens, deltaUSD)
 	}
 	m.mu.Lock()
@@ -345,10 +379,16 @@ func (m *Manager) adjust(tenant, month string, deltaTokens int, deltaUSD float64
 
 func (m *Manager) adjustRedis(tenant, month string, deltaTokens int, deltaUSD float64) error {
 	_, tokenLimit, usdLimit := m.limitsSnapshot()
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	result, err := budgetAdjustScript.Run(ctx, m.redis, []string{budgetKey(tenant, month)},
-		deltaTokens, deltaUSD, tokenLimit, usdLimit, budgetTTLSeconds).Result()
+	var result interface{}
+	store := m.redisStoreSnapshot()
+	err := store.WithClient(func(client *redis.Client) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		var err error
+		result, err = budgetAdjustScript.Run(ctx, client, []string{budgetKey(tenant, month)},
+			deltaTokens, deltaUSD, tokenLimit, usdLimit, budgetTTLSeconds).Result()
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}

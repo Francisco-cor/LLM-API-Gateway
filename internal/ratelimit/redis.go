@@ -7,13 +7,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fcordero/llm-api-gateway/internal/redisstore"
 	"github.com/redis/go-redis/v9"
 )
 
 // RedisLimiter implements distributed rate limiting via a Redis Lua token
 // bucket. It falls back to an in-process limiter if Redis becomes unavailable.
 type RedisLimiter struct {
-	client   *redis.Client
+	store    redisstore.Store
+	ownStore bool
 	mu       sync.RWMutex
 	rate     float64
 	burst    float64
@@ -69,7 +71,8 @@ func NewRedis(redisURL string, requestsPerMinute, burst int) (*RedisLimiter, err
 		return nil, fmt.Errorf("redis ping: %w", err)
 	}
 	return &RedisLimiter{
-		client:   client,
+		store:    redisstore.NewStatic(client),
+		ownStore: true,
 		rate:     float64(requestsPerMinute) / 60.0,
 		burst:    float64(burst),
 		script:   luaScript,
@@ -102,7 +105,17 @@ func (r *RedisLimiter) AllowWithLimits(key string, n, requestsPerMinute, burst i
 	rate := float64(requestsPerMinute) / 60.0
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
-	res, err := r.script.Run(ctx, r.client, []string{"ratelimit:" + key}, rate, float64(burst), float64(time.Now().UnixNano())/1e9, 600, n).Result()
+	var res interface{}
+	var err error
+	if r.store == nil {
+		err = redisstore.ErrUnavailable
+	} else {
+		err = r.store.WithClient(func(client *redis.Client) error {
+			var err error
+			res, err = r.script.Run(ctx, client, []string{"ratelimit:" + key}, rate, float64(burst), float64(time.Now().UnixNano())/1e9, 600, n).Result()
+			return err
+		})
+	}
 	if err != nil {
 		// Preserve availability while retaining local protection during a Redis
 		// outage. The next successful Redis operation leaves degraded mode.
@@ -117,6 +130,19 @@ func (r *RedisLimiter) AllowWithLimits(key string, n, requestsPerMinute, burst i
 	}
 	r.degraded.Store(true)
 	return r.fallback.AllowWithLimits(key, n, requestsPerMinute, burst)
+}
+
+// NewRedisWithStore creates a Redis limiter using a shared, replaceable Redis
+// store. The store is allowed to have no active connection; requests then use
+// the local fallback until the store is connected.
+func NewRedisWithStore(store redisstore.Store, requestsPerMinute, burst int) *RedisLimiter {
+	return &RedisLimiter{
+		store:    store,
+		rate:     float64(requestsPerMinute) / 60.0,
+		burst:    float64(burst),
+		script:   luaScript,
+		fallback: New(requestsPerMinute, burst),
+	}
 }
 
 // RetryAfter approximates; Redis Lua returns tokens, but we estimate 1/rate.
@@ -155,5 +181,10 @@ func (r *RedisLimiter) Close() error {
 	if r.fallback != nil {
 		_ = r.fallback.Close()
 	}
-	return r.client.Close()
+	if r.ownStore {
+		if closer, ok := r.store.(interface{ Close() error }); ok {
+			return closer.Close()
+		}
+	}
+	return nil
 }

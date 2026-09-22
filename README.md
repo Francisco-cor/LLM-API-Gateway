@@ -30,7 +30,7 @@ flowchart LR
 - **Streaming SSE** — `stream:true` `text/event-stream` + Anthropic/Gemini → OpenAI `data: {...}` + `data: [DONE]`, with retryable fallback before the first chunk; `tools`/`tool_choice`/`response_format`.
 - **Resilience** — retry jitter 3×200ms, circuit breaker 5→open 30s half-open 1, hedge 300ms race, `Retry-After` propagation, `X-Gateway-Provider`.
 - **Observability** — Prometheus `/metrics` (`gateway_requests_total`, `tokens_total`, `gateway_cost_usd_total`, `cache_hits`, `ProviderErrors`, `CircuitState`), OTEL `traceparent` span context with optional OTLP/gRPC batch export, `slog` with `request_id/tenant/provider/latency_ms`, plus optional Jaeger/Prometheus/Grafana containers.
-- **Traffic control** — sharded 16× `fnv` + TTL 10m limiter (56ns `Allow`), token-aware `AllowN`, per-tenant/model overrides, atomic monthly budget reservation/commit, provider/model pricing catalog with hot reload, atomic Redis Lua buckets with in-process fallback on Redis errors.
+- **Traffic control** — sharded 16× `fnv` + TTL 10m limiter (56ns `Allow`), token-aware `AllowN`, per-tenant/model overrides, atomic monthly budget reservation/commit, provider/model pricing catalog with hot reload, atomic Redis Lua buckets with in-process fallback on Redis errors, and shared Redis reconnects on configuration reload.
 - **Cache** — `X-Cache:HIT/MISS` LRU 1000 TTL 5m + Redis, identity-isolated SHA-256 keys covering response-shaping fields for chat and embeddings, `X-Cache-TTL/Skip`, only 200 non-stream. Semantic mode is opt-in and uses provider embeddings with threshold/top-k/max-entry limits.
 - **Security** — Bearer multi-tenant + scopes/expiry, CORS allowlist, `X-Content-Type-Options nosniff` etc, secrets redacted `***`.
 - **Health** — `GET /health` (uptime), `/health/providers` fan-out with configurable timeouts, `/livez`/`/readyz` (K8s, cached provider readiness, optional skip for credit-bearing checks, `SetReady(false)` draining).
@@ -121,7 +121,7 @@ See `.env.example` + `config.yaml` for full keys.
 | `routing.weighted` | `gpt-4o: [{provider: openai, weight:90}]` canary |
 | `resilience.retry/circuit/hedge` | `max_attempts`, `failure_threshold`, `open_timeout`, `hedge.delay` |
 | `cache.enabled/ttl/max_size` | exact + embeddings; semantic mode uses `semantic_enabled/threshold`, `semantic_embedding_model`, `semantic_top_k`, `semantic_max_entries` |
-| `rate_limit.enabled/requests_per_minute/burst/redis_url/token_aware` | + `overrides` per tenant/model + `budget.monthly_tokens/monthly_usd/cost_per_token_usd` |
+| `rate_limit.enabled/requests_per_minute/burst/redis_url/token_aware` | + `overrides` per tenant/model + `budget.monthly_tokens/monthly_usd/cost_per_token_usd`; `redis_url` is hot-reloadable with local fallback |
 | `rate_limit.budget.pricing` | `currency`, `version`, `unknown_model_policy` (`fallback`/`reject`) and provider/model rates per 1M input/output/embedding tokens |
 | `health` | readiness cache/check/provider timeouts and `skip_expensive_checks` for credit-bearing provider probes |
 | `auth.enabled/keys` | `key`, `tenant`, `scopes`, `expires_at` |
@@ -145,7 +145,7 @@ Provider registered only if key non-empty → subset fine.
 | `GET` | `/admin/config` | redacted `***` (auth `ADMIN_API_KEY`) |
 | `POST` | `/admin/reload` | validate 400 rollback |
 | `GET` | `/admin/providers` | list |
-| `PATCH` | `/admin/config` | hot knobs `rate_limit/cache/circuit/hedge/routing/logging`; semantic cache settings are reloadable |
+| `PATCH` | `/admin/config` | hot knobs `rate_limit/cache/circuit/hedge/routing/logging/health`; Redis URL changes are applied through the shared reconnect manager |
 | `GET` | `/debug/pprof/*` | heap/goroutine/mutex on `:6060` & `:8081` (admin auth) |
 
 ## Benchmarks

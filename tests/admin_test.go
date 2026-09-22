@@ -236,7 +236,7 @@ func TestAdmin_PatchRuntime(t *testing.T) {
 
 	// valid patch: change rate_limit burst and cache ttl
 	patch := map[string]any{
-		"rate_limit": map[string]any{"burst": 99},
+		"rate_limit": map[string]any{"burst": 99, "redis_url": "redis://:secret@redis:6379/0"},
 		"cache":      map[string]any{"ttl": "10m"},
 		"resilience": map[string]any{"circuit": map[string]any{"failure_threshold": 10}},
 	}
@@ -252,6 +252,9 @@ func TestAdmin_PatchRuntime(t *testing.T) {
 	mu.Lock()
 	if applied == nil || applied.RateLimit.Burst != 99 {
 		t.Errorf("patch not applied burst %v", applied)
+	}
+	if applied.RateLimit.RedisURL != "redis://:secret@redis:6379/0" {
+		t.Errorf("redis url not applied: %q", applied.RateLimit.RedisURL)
 	}
 	if applied.Cache.TTL != 10*time.Minute {
 		t.Errorf("cache ttl %v want 10m", applied.Cache.TTL)

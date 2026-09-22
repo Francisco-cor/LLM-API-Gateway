@@ -24,9 +24,9 @@ import (
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/proxy"
 	"github.com/fcordero/llm-api-gateway/internal/ratelimit"
+	"github.com/fcordero/llm-api-gateway/internal/redisstore"
 	"github.com/fcordero/llm-api-gateway/internal/resilience"
 	"github.com/fcordero/llm-api-gateway/internal/tracing"
-	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -72,22 +72,17 @@ func main() {
 		registry = proxy.NewRegistryWithAliases(providers, cfg.ModelAliases)
 	}
 	registry.SetRandSeed(time.Now().UnixNano())
-	var limiter ratelimit.Backend = ratelimit.New(cfg.RateLimit.RequestsPerMinute, cfg.RateLimit.Burst)
-	// Redis distributed limiter (optional, Fase 6)
-	var redisClient *redis.Client
-	if cfg.RateLimit.RedisURL != "" && cfg.RateLimit.RedisURL != "${REDIS_URL}" {
-		if rl, err := ratelimit.NewRedis(cfg.RateLimit.RedisURL, cfg.RateLimit.RequestsPerMinute, cfg.RateLimit.Burst); err == nil {
-			log.Info("redis limiter enabled")
-			limiter = rl
-			opts, _ := redis.ParseURL(cfg.RateLimit.RedisURL)
-			redisClient = redis.NewClient(opts)
-		} else {
-			log.Warn("redis limiter failed, using memory", "error", err)
-		}
+	// Redis is shared by rate-limit, budget, and cache. Its manager can swap
+	// connections during a config reload while waiting for active operations.
+	redisStore := redisstore.New()
+	if err := redisStore.ReplaceURL(cfg.RateLimit.RedisURL); err != nil {
+		log.Warn("redis backend unavailable, using local fallbacks", "error", err)
+	} else if redisStore.URL() != "" {
+		log.Info("redis backend enabled")
 	}
-	if closer, ok := limiter.(interface{ Close() error }); ok {
-		defer func() { _ = closer.Close() }()
-	}
+	limiter := ratelimit.NewRedisWithStore(redisStore, cfg.RateLimit.RequestsPerMinute, cfg.RateLimit.Burst)
+	defer func() { _ = limiter.Close() }()
+	defer func() { _ = redisStore.Close() }()
 	authStore := auth.New(cfg.Auth.Keys)
 
 	// Budget manager (Fase 6): keep the manager installed while disabled so a
@@ -98,7 +93,7 @@ func main() {
 		os.Exit(1)
 	}
 	budgetCfg := cfg.RateLimit.Budget
-	budgetMgr := budget.NewConfigured(false, 0, 0, 0, redisClient, pricingCatalog)
+	budgetMgr := budget.NewConfiguredWithStore(false, 0, 0, 0, redisStore, pricingCatalog)
 	if budgetCfg != nil {
 		budgetMgr.UpdateConfig(budgetCfg.Enabled, budgetCfg.MonthlyTokens, budgetCfg.MonthlyUSD, budgetCfg.CostPerTokenUSD, pricingCatalog)
 		if budgetCfg.Enabled {
@@ -108,7 +103,7 @@ func main() {
 	overrideStore := ratelimit.NewOverrideStore(cfg.RateLimit)
 
 	// Cache (Fase 7)
-	cacheInst := buildCache(cfg, redisClient, registry, log)
+	cacheInst := buildCache(cfg, redisStore, registry, log)
 
 	// Build resilience configs from YAML
 	retryCfg := resilience.RetryConfig{
@@ -200,6 +195,9 @@ func main() {
 		if err != nil {
 			return fmt.Errorf("pricing setup failed: %w", err)
 		}
+		if err := redisStore.ReplaceURL(newCfg.RateLimit.RedisURL); err != nil {
+			return fmt.Errorf("redis backend update failed: %w", err)
+		}
 
 		// check weighted references are valid (already validated)
 		// atomically update registry in place
@@ -225,7 +223,7 @@ func main() {
 		// cache: handle enable/disable and TTL (recreate if enabled)
 		var newCache cache.Cache
 		newCacheTTL := newCfg.Cache.TTL
-		newCache = buildCache(newCfg, redisClient, registry, log)
+		newCache = buildCache(newCfg, redisStore, registry, log)
 		handlerOpts.SetCache(newCache, newCacheTTL)
 		embedHandler.SetCache(newCache, newCacheTTL)
 		cacheInst = newCache
@@ -427,13 +425,13 @@ func buildHealthOptions(cfg *config.Config) proxy.HealthOptions {
 	}
 }
 
-func buildCache(cfg *config.Config, redisClient *redis.Client, registry *proxy.Registry, log *slog.Logger) cache.Cache {
+func buildCache(cfg *config.Config, redisStore redisstore.Store, registry *proxy.Registry, log *slog.Logger) cache.Cache {
 	if !cfg.Cache.Enabled {
 		return nil
 	}
 	var base cache.Cache = cache.NewMemory(cfg.Cache.MaxSize)
-	if redisClient != nil {
-		base = cache.NewRedis(redisClient)
+	if active, ok := redisStore.(interface{ Active() bool }); ok && active.Active() {
+		base = cache.NewRedisWithStore(redisStore)
 		log.Info("cache redis enabled", "ttl", cfg.Cache.TTL)
 	}
 	if cfg.Cache.SemanticEnabled {
