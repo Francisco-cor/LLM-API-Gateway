@@ -108,20 +108,7 @@ func main() {
 	overrideStore := ratelimit.NewOverrideStore(cfg.RateLimit)
 
 	// Cache (Fase 7)
-	var cacheInst cache.Cache
-	if cfg.Cache.Enabled {
-		var baseCache cache.Cache = cache.NewMemory(cfg.Cache.MaxSize)
-		if redisClient != nil {
-			baseCache = cache.NewRedis(redisClient)
-			log.Info("cache redis enabled", "ttl", cfg.Cache.TTL)
-		}
-		if cfg.Cache.SemanticEnabled {
-			baseCache = cache.NewSemantic(baseCache, true, cfg.Cache.SemanticThreshold)
-			log.Info("semantic cache enabled", "threshold", cfg.Cache.SemanticThreshold)
-		}
-		cacheInst = baseCache
-		log.Info("cache enabled", "ttl", cfg.Cache.TTL, "max_size", cfg.Cache.MaxSize)
-	}
+	cacheInst := buildCache(cfg, redisClient, registry, log)
 
 	// Build resilience configs from YAML
 	retryCfg := resilience.RetryConfig{
@@ -232,18 +219,7 @@ func main() {
 		// cache: handle enable/disable and TTL (recreate if enabled)
 		var newCache cache.Cache
 		newCacheTTL := newCfg.Cache.TTL
-		if newCfg.Cache.Enabled {
-			var base cache.Cache = cache.NewMemory(newCfg.Cache.MaxSize)
-			if redisClient != nil {
-				base = cache.NewRedis(redisClient)
-			}
-			if newCfg.Cache.SemanticEnabled {
-				base = cache.NewSemantic(base, true, newCfg.Cache.SemanticThreshold)
-			}
-			newCache = base
-		} else {
-			newCache = nil
-		}
+		newCache = buildCache(newCfg, redisClient, registry, log)
 		handlerOpts.SetCache(newCache, newCacheTTL)
 		embedHandler.SetCache(newCache, newCacheTTL)
 		cacheInst = newCache
@@ -434,6 +410,52 @@ func buildPricingCatalog(cfg *config.Config) (*pricing.Catalog, error) {
 		})
 	}
 	return pricing.NewCatalog(rules, cfg.RateLimit.Budget.CostPerTokenUSD, p.Currency, p.Version, p.UnknownModelPolicy)
+}
+
+func buildCache(cfg *config.Config, redisClient *redis.Client, registry *proxy.Registry, log *slog.Logger) cache.Cache {
+	if !cfg.Cache.Enabled {
+		return nil
+	}
+	var base cache.Cache = cache.NewMemory(cfg.Cache.MaxSize)
+	if redisClient != nil {
+		base = cache.NewRedis(redisClient)
+		log.Info("cache redis enabled", "ttl", cfg.Cache.TTL)
+	}
+	if cfg.Cache.SemanticEnabled {
+		embed := semanticEmbedder(registry, cfg.Cache.SemanticEmbeddingModel)
+		if embed == nil {
+			log.Warn("semantic cache enabled without a usable embedding provider; exact cache remains active", "model", cfg.Cache.SemanticEmbeddingModel)
+		} else {
+			base = cache.NewSemanticWithEmbedder(base, true, cfg.Cache.SemanticThreshold, cfg.Cache.SemanticTopK, cfg.Cache.SemanticMaxEntries, embed)
+			log.Info("semantic cache enabled", "model", cfg.Cache.SemanticEmbeddingModel, "threshold", cfg.Cache.SemanticThreshold, "top_k", cfg.Cache.SemanticTopK)
+		}
+	}
+	log.Info("cache enabled", "ttl", cfg.Cache.TTL, "max_size", cfg.Cache.MaxSize)
+	return base
+}
+
+func semanticEmbedder(registry *proxy.Registry, model string) cache.EmbeddingFunc {
+	if registry == nil || model == "" {
+		return nil
+	}
+	return func(ctx context.Context, text string) ([]float32, error) {
+		p, err := registry.Resolve(model)
+		if err != nil {
+			return nil, err
+		}
+		embedder, ok := p.(provider.Embedder)
+		if !ok {
+			return nil, fmt.Errorf("provider %s does not support embeddings", p.Name())
+		}
+		resp, err := embedder.Embed(ctx, provider.EmbeddingRequest{Model: model, Input: text})
+		if err != nil {
+			return nil, err
+		}
+		if len(resp.Data) == 0 || len(resp.Data[0].Embedding) == 0 {
+			return nil, fmt.Errorf("provider returned an empty embedding")
+		}
+		return resp.Data[0].Embedding, nil
+	}
 }
 
 // buildProviders constructs a Provider for each configured backend that has

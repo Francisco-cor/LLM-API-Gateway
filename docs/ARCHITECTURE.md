@@ -110,7 +110,7 @@ flowchart LR
     subgraph cache
         Mem[memory.go<br>LRU 1000 TTL 5m]
         RCache[redis.go]
-        Sem[semantic.go<br>cosine 0.97]
+        Sem[semantic.go<br>provider embeddings<br>threshold/top-k/limit]
         Key[key.go<br>sha256 canonicalJSON]
     end
     subgraph auth/budget/metrics/tracing/config/admin
@@ -200,14 +200,14 @@ Streaming variant: `handler.go:390 handleStream` branches `req.Stream` → `Cont
 ## 5. Data flow — rate-limit / budget / cache knobs
 
 - **RateLimit:** `RateLimit(limiter)` middleware uses `Authorization` header as key; `handler.go:234 overrideStore.Resolve(tenant, model)` → per-tenant/model RPM; `tokenAware` → `EstimateTokens(chars/4)` → `AllowN(key+"_tokens", n)`; `Retry-After` seconds.
-- **Budget:** `budget.Manager.Reserve` atomically reserves an estimated prompt/max-token amount before dispatch; `Commit` adjusts to actual usage and `Cancel` releases failed requests. Redis uses Lua and hashed tenant keys; `cost_per_token_usd` controls the fallback USD estimate. Quota exhaustion returns `429 insufficient_quota`; unavailable Redis fails closed with `503`.
-- **Cache:** `cache.BuildKey` includes response-shaping fields (`model`, messages, sampling, tools, tool choice, response format, stop, n, stream options) and the handler salts it by client identity; respect `X-Cache-Skip:true` and `X-Cache-TTL:100ms`; only `200` non-stream; `memory LRU` → `redis` if `REDIS_URL`. The semantic wrapper currently delegates exact lookup and is not an embedding index.
+- **Budget:** `budget.Manager.Reserve` atomically reserves an estimated prompt/max-token amount before dispatch; `Commit` adjusts to actual usage and `Cancel` releases failed requests. Redis uses Lua and hashed tenant keys. `rate_limit.budget.pricing` selects exact or wildcard provider/model rates for chat input/output and embeddings, while `cost_per_token_usd` remains the fallback for unknown prices. Limits and the immutable pricing catalog swap atomically during reload. Quota exhaustion returns `429 insufficient_quota`; unavailable Redis fails closed with `503`.
+- **Cache:** `cache.BuildKey` includes response-shaping fields (`model`, messages, sampling, tools, tool choice, response format, stop, n, stream options) and the handler salts it by client identity; embedding keys include model/input/format/dimensions/user. Respect `X-Cache-Skip:true` and `X-Cache-TTL:100ms`; only `200` non-stream; `memory LRU` → `redis` if `REDIS_URL`. Opt-in semantic lookup embeds the query, searches a local namespace-scoped top-k vector index, and retrieves the exact cached response; response-shape options remain part of the semantic namespace.
 
 ---
 
 ## 6. Operational concerns
 
-- **Hot reload:** `config.Watch(ctx, path, 1s, onChange)` polls `ModTime` + 100ms debounce; `SIGHUP` handler; `applyConfig(newCfg)` → `Validate` → `buildProviders` → `registry.Reload` → `limiter.UpdateLimits` → `overrideStore.Reload` → `authStore.Reload` → `handlerOpts.SetCache/Circuit/Retry/Hedge/Fallback` → `adminSrv.SetConfig(Clone)`; invalid → 400 rollback keep old (see `tests/admin_test.go` rollback).
+- **Hot reload:** `config.Watch(ctx, path, 1s, onChange)` polls `ModTime` + 100ms debounce; `SIGHUP` handler; `applyConfig(newCfg)` → `Validate` → `buildProviders` → `registry.Reload` → `limiter.UpdateLimits` → `overrideStore.Reload` → `budget.Manager.UpdateConfig` → `authStore.Reload` → `handlerOpts.SetCache/Circuit/Retry/Hedge/Fallback` → `embeddings.SetCache` → `adminSrv.SetConfig(Clone)`; invalid → 400 rollback keep old (see `tests/admin_test.go` rollback).
 - **Graceful drain:** `HealthHandler.SetReady(false)` → `/readyz` 503 draining → 5s sleep for K8s endpoint removal → `admin/pprof Shutdown 5s` → `srv.Shutdown 30s` with `IdleTimeout 120s` (`main.go:326`).
 - **Performance:** `sharedTransport MaxIdleConns100/PerHost20/IdleConnTimeout90s/KeepAlive30s/ForceAttemptHTTP2` (`provider/http.go:10`), `bufPool` for `marshalJSON`, `sharded 16× fnv` limiter (56ns/op), `BuildKey 1.8µs`, `Cache hit 75ns` (`BENCH.md`).
 - **Observability:** `metrics.RequestsTotal{method,path,status,provider}` `RequestDuration` `TokensTotal` `CacheHits` `ProviderErrors` `CircuitState`; paths are bounded to known routes; `Tracing` injects OTEL trace context and optionally batches spans to OTLP/gRPC; `Logging` uses `request_id/tenant/provider/latency_ms`.
@@ -227,6 +227,6 @@ Streaming variant: `handler.go:390 handleStream` branches `req.Stream` → `Cont
 - No `sony/gobreaker` dep — own 188 LOC circuit simplifies hot-reload `UpdateConfig`.
 - No framework — `ServeMux` Go 1.22 path patterns enough; avoids Gin/Echo.
 - Single dep `yaml.v3` + 5 justified: `prometheus`, `redis`, `otel`, `sync`. See ADR-002/003.
-- Backlog (post 1.0): Azure/Bedrock, Ollama, PII guardrails, Stripe billing, WASM plugins, provider/model pricing catalog and real embedding-based semantic cache.
+- Backlog (post 1.0): Azure/Bedrock, Ollama, PII guardrails, Stripe billing, WASM plugins, distributed semantic-index sharing, and external price-catalog synchronization.
 
 Refs: `BENCH.md`, `config.yaml`, `deploy/k8s/`, `examples/`.

@@ -124,6 +124,10 @@ cache:
   max_size: 1000
   semantic_enabled: false
   semantic_threshold: 0.97
+  # Semantic mode requires an embedding-capable configured provider.
+  semantic_embedding_model: text-embedding-3-small
+  semantic_top_k: 3
+  semantic_max_entries: 1000
 
 cors:
   allowed_origins: [] # e.g. ["https://app.example.com", "*"]

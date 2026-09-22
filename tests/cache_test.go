@@ -2,6 +2,7 @@ package tests
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -179,6 +180,23 @@ func TestCache_SemanticWrapper(t *testing.T) {
 	sem.Set("k", []byte("v"), 5*time.Minute)
 	if v, ok := sem.Get("k"); !ok || string(v) != "v" {
 		t.Error("semantic wrapper should delegate to exact")
+	}
+}
+
+func TestCache_EmbeddingBackedSemanticLookup(t *testing.T) {
+	embedding := func(_ context.Context, text string) ([]float32, error) {
+		if text == "weather forecast" || text == "what is the weather" {
+			return []float32{0.99, 0.1}, nil
+		}
+		return []float32{0, 1}, nil
+	}
+	sem := cache.NewSemanticWithEmbedder(cache.NewMemory(10), true, 0.95, 2, 2, embedding)
+	sem.SetSemantic(context.Background(), "tenant-a", "what is the weather", "key-a", []byte("answer"), time.Minute)
+	if value, ok := sem.Lookup(context.Background(), "tenant-a", "weather forecast"); !ok || string(value) != "answer" {
+		t.Fatalf("semantic lookup = %q, %v", value, ok)
+	}
+	if _, ok := sem.Lookup(context.Background(), "tenant-b", "weather forecast"); ok {
+		t.Fatal("semantic lookup must isolate namespaces")
 	}
 }
 

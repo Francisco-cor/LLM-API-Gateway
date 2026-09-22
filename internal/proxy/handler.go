@@ -298,6 +298,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.log.Info("cache hit", "model", req.Model, "request_id", requestID, "cache_key", cacheKey[:8])
 			return
 		}
+		if semantic, ok := cached.(cache.SemanticLookup); ok {
+			namespace := cache.BuildSemanticNamespace(req, r.Header.Get("Authorization"))
+			if data, ok := semantic.Lookup(ctx, namespace, cache.SemanticQuery(req)); ok {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Cache", "HIT")
+				w.Header().Set("X-Gateway-Provider", "cache-semantic")
+				metrics.CacheHits.WithLabelValues("hit").Inc()
+				metrics.CacheSize.Set(float64(cached.Stats().Size))
+				_, _ = w.Write(data)
+				return
+			}
+		}
 		metrics.CacheHits.WithLabelValues("miss").Inc()
 	}
 
@@ -380,7 +392,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// metrics + cache store
 	metrics.ObserveTokens(providerName, resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
 	metrics.CircuitState.WithLabelValues(providerName).Set(float64(h.breakerFor(providerName).State()))
-	if budgetReservation != nil {
+	if h.budgetMgr != nil {
 		actualUSD := h.budgetMgr.CostForTokens(resp.Usage.TotalTokens)
 		pricingKnown := false
 		if estimate, err := h.budgetMgr.CostForChat(providerName, req.Model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens); err == nil {
@@ -390,10 +402,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.log.Warn("provider/model price unavailable after dispatch; using fallback estimate", "provider", providerName, "model", req.Model, "error", err)
 		}
 		metrics.ObserveCost(providerName, req.Model, actualUSD, pricingKnown)
-		if err := budgetReservation.Commit(resp.Usage.TotalTokens, actualUSD); err != nil {
-			h.log.Warn("budget adjustment exceeded estimate", "tenant", tenant, "error", err)
+		if budgetReservation != nil {
+			if err := budgetReservation.Commit(resp.Usage.TotalTokens, actualUSD); err != nil {
+				h.log.Warn("budget adjustment exceeded estimate", "tenant", tenant, "error", err)
+			}
+			budgetCommitted = true
 		}
-		budgetCommitted = true
 	}
 	// Fase 7: cache store (only cache successful non-streaming)
 	w.Header().Set("Content-Type", "application/json")
@@ -401,7 +415,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	cch, _ := h.getCache()
 	if cch != nil && cacheKey != "" {
 		data, _ := json.Marshal(resp)
-		cch.Set(cacheKey, data, cacheTTL)
+		if semantic, ok := cch.(cache.SemanticLookup); ok {
+			semantic.SetSemantic(ctx, cache.BuildSemanticNamespace(req, r.Header.Get("Authorization")), cache.SemanticQuery(req), cacheKey, data, cacheTTL)
+		} else {
+			cch.Set(cacheKey, data, cacheTTL)
+		}
 		w.Header().Set("X-Cache", "MISS")
 		metrics.CacheSize.Set(float64(cch.Stats().Size))
 		_, _ = w.Write(data)

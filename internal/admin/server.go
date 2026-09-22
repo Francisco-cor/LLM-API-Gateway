@@ -200,10 +200,13 @@ type AdminPatch struct {
 		Burst             *int `json:"burst"`
 	} `json:"rate_limit"`
 	Cache *struct {
-		TTL               *string  `json:"ttl"`
-		MaxSize           *int     `json:"max_size"`
-		SemanticEnabled   *bool    `json:"semantic_enabled"`
-		SemanticThreshold *float64 `json:"semantic_threshold"`
+		TTL                    *string  `json:"ttl"`
+		MaxSize                *int     `json:"max_size"`
+		SemanticEnabled        *bool    `json:"semantic_enabled"`
+		SemanticThreshold      *float64 `json:"semantic_threshold"`
+		SemanticEmbeddingModel *string  `json:"semantic_embedding_model"`
+		SemanticTopK           *int     `json:"semantic_top_k"`
+		SemanticMaxEntries     *int     `json:"semantic_max_entries"`
 	} `json:"cache"`
 	Resilience *struct {
 		Retry *struct {
@@ -339,6 +342,15 @@ func applyPatch(cfg *config.Config, patch *AdminPatch) error {
 		}
 		if patch.Cache.SemanticThreshold != nil {
 			cfg.Cache.SemanticThreshold = *patch.Cache.SemanticThreshold
+		}
+		if patch.Cache.SemanticEmbeddingModel != nil {
+			cfg.Cache.SemanticEmbeddingModel = *patch.Cache.SemanticEmbeddingModel
+		}
+		if patch.Cache.SemanticTopK != nil {
+			cfg.Cache.SemanticTopK = *patch.Cache.SemanticTopK
+		}
+		if patch.Cache.SemanticMaxEntries != nil {
+			cfg.Cache.SemanticMaxEntries = *patch.Cache.SemanticMaxEntries
 		}
 	}
 	if patch.Resilience != nil {

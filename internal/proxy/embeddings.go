@@ -297,7 +297,7 @@ func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "provider_error", err.Error())
 		return
 	}
-	if budgetReservation != nil {
+	if h.budgetMgr != nil {
 		estimate, estimateErr := h.budgetMgr.CostForEmbedding(provName, req.Model, resp.Usage.TotalTokens)
 		if estimateErr != nil {
 			h.log.Warn("embedding price unavailable after dispatch; using fallback estimate", "provider", provName, "model", req.Model, "error", estimateErr)
@@ -305,10 +305,12 @@ func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		metrics.ObserveTokens(provName, resp.Usage.TotalTokens, 0)
 		metrics.ObserveCost(provName, req.Model, estimate.USD, estimate.Known)
-		if err := budgetReservation.Commit(resp.Usage.TotalTokens, estimate.USD); err != nil {
-			h.log.Warn("embedding budget adjustment exceeded estimate", "tenant", r.Header.Get("X-Tenant-ID"), "error", err)
+		if budgetReservation != nil {
+			if err := budgetReservation.Commit(resp.Usage.TotalTokens, estimate.USD); err != nil {
+				h.log.Warn("embedding budget adjustment exceeded estimate", "tenant", r.Header.Get("X-Tenant-ID"), "error", err)
+			}
+			budgetCommitted = true
 		}
-		budgetCommitted = true
 	}
 	span.SetAttributes(attribute.String("provider", provName))
 	h.log.Info("embeddings", "model", req.Model, "provider", provName, "request_id", requestID, "input_count", len(resp.Data))

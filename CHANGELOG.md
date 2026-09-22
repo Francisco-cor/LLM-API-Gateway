@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Add provider/model pricing catalogs with input/output/embedding rates, unknown-price policy, cost metrics, atomic budget hot reload, embedding response cache, and opt-in embedding-backed semantic cache with identity/shape namespaces.
 - Wire the OTLP/gRPC exporter, bound Prometheus path cardinality, cache readiness provider checks for 15s, clear SSE write deadlines for active streams, and close limiter cleanup goroutines during shutdown.
 - Make rate-limit enablement hot-reloadable, make overlapping weighted patterns deterministic, use constant-time admin-key comparison, remove the ineffective runtime Redis URL patch, and bound provider error messages.
 - Add atomic tenant budget reservations with Redis Lua/local mutex semantics, configurable `cost_per_token_usd`, and retry/circuit/budget integration for embeddings.

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 )
@@ -51,4 +52,32 @@ func BuildKeyForIdentity(req provider.ChatRequest, identity string) string {
 	base := BuildKey(req)
 	sum := sha256.Sum256([]byte(identity + ":" + base))
 	return hex.EncodeToString(sum[:])
+}
+
+// BuildSemanticNamespace isolates semantic candidates by identity and every
+// response-shaping option except message content. A semantically similar
+// prompt must not cross model, tool, sampling, or response-format boundaries.
+func BuildSemanticNamespace(req provider.ChatRequest, identity string) string {
+	scope := req
+	scope.Messages = nil
+	scope.Stream = false
+	base := BuildKey(scope)
+	if identity == "" {
+		return base
+	}
+	sum := sha256.Sum256([]byte(identity + ":" + base))
+	return hex.EncodeToString(sum[:])
+}
+
+// SemanticQuery returns the text that is embedded for a chat request. Roles
+// are retained so system/user/assistant content remains distinguishable.
+func SemanticQuery(req provider.ChatRequest) string {
+	var b strings.Builder
+	for _, message := range req.Messages {
+		b.WriteString(message.Role)
+		b.WriteByte(':')
+		b.WriteString(message.Content)
+		b.WriteByte('\n')
+	}
+	return b.String()
 }

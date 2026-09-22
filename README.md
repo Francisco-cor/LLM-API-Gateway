@@ -29,9 +29,9 @@ flowchart LR
 - **Intelligent routing** — `providers.<name>.models` wildcards `gpt-4*`, regex `gpt-4.*`; `routing.weighted` canary 90/10 ±5% in 1k reqs; auto-discovery `models: []` → `GET /v1/models`.
 - **Streaming SSE** — `stream:true` `text/event-stream` + Anthropic/Gemini → OpenAI `data: {...}` + `data: [DONE]`, with retryable fallback before the first chunk; `tools`/`tool_choice`/`response_format`.
 - **Resilience** — retry jitter 3×200ms, circuit breaker 5→open 30s half-open 1, hedge 300ms race, `Retry-After` propagation, `X-Gateway-Provider`.
-- **Observability** — Prometheus `/metrics` (`gateway_requests_total`, `tokens_total`, `cache_hits`, `ProviderErrors`, `CircuitState`), OTEL `traceparent` span context with optional OTLP/gRPC batch export, `slog` with `request_id/tenant/provider/latency_ms`, plus optional Jaeger/Prometheus/Grafana containers.
-- **Traffic control** — sharded 16× `fnv` + TTL 10m limiter (56ns `Allow`), token-aware `AllowN`, per-tenant/model overrides, atomic monthly budget reservation/commit, atomic Redis Lua buckets with in-process fallback on Redis errors.
-- **Cache** — `X-Cache:HIT/MISS` LRU 1000 TTL 5m + Redis, identity-isolated SHA-256 keys covering response-shaping fields, `X-Cache-TTL/Skip`, only 200 non-stream. The semantic wrapper is currently a lightweight placeholder, not embedding retrieval.
+- **Observability** — Prometheus `/metrics` (`gateway_requests_total`, `tokens_total`, `gateway_cost_usd_total`, `cache_hits`, `ProviderErrors`, `CircuitState`), OTEL `traceparent` span context with optional OTLP/gRPC batch export, `slog` with `request_id/tenant/provider/latency_ms`, plus optional Jaeger/Prometheus/Grafana containers.
+- **Traffic control** — sharded 16× `fnv` + TTL 10m limiter (56ns `Allow`), token-aware `AllowN`, per-tenant/model overrides, atomic monthly budget reservation/commit, provider/model pricing catalog with hot reload, atomic Redis Lua buckets with in-process fallback on Redis errors.
+- **Cache** — `X-Cache:HIT/MISS` LRU 1000 TTL 5m + Redis, identity-isolated SHA-256 keys covering response-shaping fields for chat and embeddings, `X-Cache-TTL/Skip`, only 200 non-stream. Semantic mode is opt-in and uses provider embeddings with threshold/top-k/max-entry limits.
 - **Security** — Bearer multi-tenant + scopes/expiry, CORS allowlist, `X-Content-Type-Options nosniff` etc, secrets redacted `***`.
 - **Health** — `GET /health` (uptime), `/health/providers` fan-out 3s parallel `degraded` handling, `/livez`/`/readyz` (K8s, cached provider readiness for 15s, `SetReady(false)` draining).
 - **Control plane** — Admin `:8081` `GET /admin/config` redacted, `POST /admin/reload` 400 rollback, `GET /admin/providers`, `PATCH /admin/config` hot knobs (`rate_limit/cache/circuit/hedge/routing/logging`), file watcher 1s poll + `SIGHUP`.
@@ -82,10 +82,12 @@ No keys? Gateway runs with mocks in tests: `go test ./... -v`. For load with moc
 
 Stop: `docker-compose down`.
 
+Profiles: `config.dev.yaml` is the local unauthenticated profile; `config.prod.yaml` requires `GATEWAY_API_KEY` and `ADMIN_API_KEY` and enables the budget catalog. Kubernetes uses the same production posture through `deploy/k8s/configmap.yaml` and Secret references.
+
 ## Running locally without Docker
 
 ```bash
-go run ./cmd/gateway -config config.yaml   # or make dev (air live-reload)
+go run ./cmd/gateway -config config.dev.yaml   # or make dev (air live-reload)
 # config.yaml uses ${ENV} expansion; see Configuration reference
 ```
 
@@ -118,8 +120,9 @@ See `.env.example` + `config.yaml` for full keys.
 | `model_aliases` | `gpt-4o: [claude-sonnet-4-6]` remap on fallback |
 | `routing.weighted` | `gpt-4o: [{provider: openai, weight:90}]` canary |
 | `resilience.retry/circuit/hedge` | `max_attempts`, `failure_threshold`, `open_timeout`, `hedge.delay` |
-| `cache.enabled/ttl/max_size` | exact + `semantic_enabled/threshold` 0.97 |
+| `cache.enabled/ttl/max_size` | exact + embeddings; semantic mode uses `semantic_enabled/threshold`, `semantic_embedding_model`, `semantic_top_k`, `semantic_max_entries` |
 | `rate_limit.enabled/requests_per_minute/burst/redis_url/token_aware` | + `overrides` per tenant/model + `budget.monthly_tokens/monthly_usd/cost_per_token_usd` |
+| `rate_limit.budget.pricing` | `currency`, `version`, `unknown_model_policy` (`fallback`/`reject`) and provider/model rates per 1M input/output/embedding tokens |
 | `auth.enabled/keys` | `key`, `tenant`, `scopes`, `expires_at` |
 | `admin.port/api_key` | `:8081` + `${ADMIN_API_KEY}` |
 | `cors.allowed_origins` | CORS |
@@ -141,7 +144,7 @@ Provider registered only if key non-empty → subset fine.
 | `GET` | `/admin/config` | redacted `***` (auth `ADMIN_API_KEY`) |
 | `POST` | `/admin/reload` | validate 400 rollback |
 | `GET` | `/admin/providers` | list |
-| `PATCH` | `/admin/config` | hot knobs `rate_limit/cache/circuit/hedge/routing/logging` |
+| `PATCH` | `/admin/config` | hot knobs `rate_limit/cache/circuit/hedge/routing/logging`; semantic cache settings are reloadable |
 | `GET` | `/debug/pprof/*` | heap/goroutine/mutex on `:6060` & `:8081` (admin auth) |
 
 ## Benchmarks

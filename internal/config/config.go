@@ -147,11 +147,14 @@ type HedgeConfig struct {
 }
 
 type CacheConfig struct {
-	Enabled           bool          `yaml:"enabled"`
-	TTL               time.Duration `yaml:"ttl"`
-	MaxSize           int           `yaml:"max_size"`
-	SemanticEnabled   bool          `yaml:"semantic_enabled"`
-	SemanticThreshold float64       `yaml:"semantic_threshold"`
+	Enabled                bool          `yaml:"enabled"`
+	TTL                    time.Duration `yaml:"ttl"`
+	MaxSize                int           `yaml:"max_size"`
+	SemanticEnabled        bool          `yaml:"semantic_enabled"`
+	SemanticThreshold      float64       `yaml:"semantic_threshold"`
+	SemanticEmbeddingModel string        `yaml:"semantic_embedding_model"`
+	SemanticTopK           int           `yaml:"semantic_top_k"`
+	SemanticMaxEntries     int           `yaml:"semantic_max_entries"`
 }
 
 func Load(path string) (*Config, error) {
@@ -322,6 +325,15 @@ func (c *Config) Validate() error {
 	if c.Cache.SemanticThreshold < 0 || c.Cache.SemanticThreshold > 1 {
 		return fmt.Errorf("cache.semantic_threshold must be between 0 and 1")
 	}
+	if c.Cache.SemanticEnabled && c.Cache.SemanticEmbeddingModel == "" {
+		return fmt.Errorf("cache.semantic_embedding_model is required when semantic cache is enabled")
+	}
+	if c.Cache.SemanticTopK < 0 {
+		return fmt.Errorf("cache.semantic_top_k must be >=0")
+	}
+	if c.Cache.SemanticMaxEntries < 0 {
+		return fmt.Errorf("cache.semantic_max_entries must be >=0")
+	}
 	for model, entries := range c.Routing.Weighted {
 		if model == "" {
 			return fmt.Errorf("routing.weighted key must be non-empty")
@@ -410,6 +422,12 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Cache.SemanticThreshold == 0 {
 		cfg.Cache.SemanticThreshold = 0.97
+	}
+	if cfg.Cache.SemanticTopK == 0 {
+		cfg.Cache.SemanticTopK = 3
+	}
+	if cfg.Cache.SemanticMaxEntries == 0 {
+		cfg.Cache.SemanticMaxEntries = 1000
 	}
 	if cfg.Admin.Port == 0 {
 		cfg.Admin.Port = 8081
