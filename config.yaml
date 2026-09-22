@@ -86,6 +86,25 @@ rate_limit:
     monthly_tokens: 1000000
     monthly_usd: 100.0
     cost_per_token_usd: 0.00001
+    pricing:
+      currency: USD
+      version: "2026-09"
+      unknown_model_policy: fallback
+      catalog:
+        # Rates are USD per 1M tokens. Keep this list versioned with the
+        # provider price snapshot used by finance/operations.
+        - provider: openai
+          model: gpt-4o
+          input_per_million_tokens_usd: 5.0
+          output_per_million_tokens_usd: 15.0
+        - provider: openai
+          model: text-embedding-3-small
+          embedding_per_million_tokens_usd: 0.02
+        # Wildcards are allowed for provider model families.
+        # - provider: anthropic
+        #   model: claude-sonnet-*
+        #   input_per_million_tokens_usd: 3.0
+        #   output_per_million_tokens_usd: 15.0
 
 resilience:
   retry:

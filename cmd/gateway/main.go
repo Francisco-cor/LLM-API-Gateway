@@ -20,6 +20,7 @@ import (
 	"github.com/fcordero/llm-api-gateway/internal/cache"
 	"github.com/fcordero/llm-api-gateway/internal/config"
 	"github.com/fcordero/llm-api-gateway/internal/logger"
+	"github.com/fcordero/llm-api-gateway/internal/pricing"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/proxy"
 	"github.com/fcordero/llm-api-gateway/internal/ratelimit"
@@ -89,11 +90,20 @@ func main() {
 	}
 	authStore := auth.New(cfg.Auth.Keys)
 
-	// Budget manager (Fase 6)
-	var budgetMgr *budget.Manager
-	if cfg.RateLimit.Budget != nil && cfg.RateLimit.Budget.Enabled {
-		budgetMgr = budget.NewWithCost(cfg.RateLimit.Budget.MonthlyTokens, cfg.RateLimit.Budget.MonthlyUSD, cfg.RateLimit.Budget.CostPerTokenUSD, redisClient)
-		log.Info("budget enabled", "tokens", cfg.RateLimit.Budget.MonthlyTokens, "usd", cfg.RateLimit.Budget.MonthlyUSD)
+	// Budget manager (Fase 6): keep the manager installed while disabled so a
+	// config reload can enable limits without replacing request handlers.
+	pricingCatalog, err := buildPricingCatalog(cfg)
+	if err != nil {
+		log.Error("pricing setup failed", "error", err)
+		os.Exit(1)
+	}
+	budgetCfg := cfg.RateLimit.Budget
+	budgetMgr := budget.NewConfigured(false, 0, 0, 0, redisClient, pricingCatalog)
+	if budgetCfg != nil {
+		budgetMgr.UpdateConfig(budgetCfg.Enabled, budgetCfg.MonthlyTokens, budgetCfg.MonthlyUSD, budgetCfg.CostPerTokenUSD, pricingCatalog)
+		if budgetCfg.Enabled {
+			log.Info("budget enabled", "tokens", budgetCfg.MonthlyTokens, "usd", budgetCfg.MonthlyUSD, "pricing_rules", len(budgetCfg.Pricing.Catalog))
+		}
 	}
 	overrideStore := ratelimit.NewOverrideStore(cfg.RateLimit)
 
@@ -196,6 +206,10 @@ func main() {
 		}
 		newProviders = discoverModels(newProviders, log)
 		newWeighted := buildWeighted(newCfg, newProviders)
+		newPricingCatalog, err := buildPricingCatalog(newCfg)
+		if err != nil {
+			return fmt.Errorf("pricing setup failed: %w", err)
+		}
 
 		// check weighted references are valid (already validated)
 		// atomically update registry in place
@@ -205,6 +219,12 @@ func main() {
 		limiter.UpdateLimits(newCfg.RateLimit.RequestsPerMinute, newCfg.RateLimit.Burst)
 		overrideStore.Reload(newCfg.RateLimit)
 		rateLimitEnabled.Store(newCfg.RateLimit.Enabled)
+		newBudgetCfg := newCfg.RateLimit.Budget
+		if newBudgetCfg == nil {
+			budgetMgr.UpdateConfig(false, 0, 0, 0, newPricingCatalog)
+		} else {
+			budgetMgr.UpdateConfig(newBudgetCfg.Enabled, newBudgetCfg.MonthlyTokens, newBudgetCfg.MonthlyUSD, newBudgetCfg.CostPerTokenUSD, newPricingCatalog)
+		}
 
 		// auth
 		authStore.Reload(newCfg.Auth.Keys)
@@ -395,6 +415,24 @@ func buildWeighted(cfg *config.Config, providers []provider.Provider) map[string
 		}
 	}
 	return weighted
+}
+
+func buildPricingCatalog(cfg *config.Config) (*pricing.Catalog, error) {
+	if cfg.RateLimit.Budget == nil {
+		return pricing.NewCatalog(nil, 0.00001, pricing.DefaultCurrency, "", pricing.UnknownUseFallback)
+	}
+	p := cfg.RateLimit.Budget.Pricing
+	rules := make([]pricing.Rule, 0, len(p.Catalog))
+	for _, rule := range p.Catalog {
+		rules = append(rules, pricing.Rule{
+			Provider:                     rule.Provider,
+			Model:                        rule.Model,
+			InputPerMillionTokensUSD:     rule.InputPerMillionTokensUSD,
+			OutputPerMillionTokensUSD:    rule.OutputPerMillionTokensUSD,
+			EmbeddingPerMillionTokensUSD: rule.EmbeddingPerMillionTokensUSD,
+		})
+	}
+	return pricing.NewCatalog(rules, cfg.RateLimit.Budget.CostPerTokenUSD, p.Currency, p.Version, p.UnknownModelPolicy)
 }
 
 // buildProviders constructs a Provider for each configured backend that has

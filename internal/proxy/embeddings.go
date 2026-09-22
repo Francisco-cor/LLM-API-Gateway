@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/fcordero/llm-api-gateway/internal/budget"
+	"github.com/fcordero/llm-api-gateway/internal/metrics"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/ratelimit"
 	"github.com/fcordero/llm-api-gateway/internal/resilience"
@@ -204,7 +205,16 @@ func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var budgetReservation *budget.Reservation
 	if h.budgetMgr != nil {
 		var err error
-		budgetReservation, err = h.budgetMgr.Reserve(r.Header.Get("X-Tenant-ID"), estimatedTokens, h.budgetMgr.CostForTokens(estimatedTokens))
+		providerName := ""
+		if primary, resolveErr := h.registry.Resolve(req.Model); resolveErr == nil {
+			providerName = primary.Name()
+		}
+		estimate, estimateErr := h.budgetMgr.CostForEmbedding(providerName, req.Model, estimatedTokens)
+		if estimateErr != nil {
+			writeBudgetError(w, estimateErr)
+			return
+		}
+		budgetReservation, err = h.budgetMgr.Reserve(r.Header.Get("X-Tenant-ID"), estimatedTokens, estimate.USD)
 		if err != nil {
 			writeBudgetError(w, err)
 			return
@@ -239,7 +249,14 @@ func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if budgetReservation != nil {
-		if err := budgetReservation.Commit(resp.Usage.TotalTokens, h.budgetMgr.CostForTokens(resp.Usage.TotalTokens)); err != nil {
+		estimate, estimateErr := h.budgetMgr.CostForEmbedding(provName, req.Model, resp.Usage.TotalTokens)
+		if estimateErr != nil {
+			h.log.Warn("embedding price unavailable after dispatch; using fallback estimate", "provider", provName, "model", req.Model, "error", estimateErr)
+			estimate.USD = h.budgetMgr.CostForTokens(resp.Usage.TotalTokens)
+		}
+		metrics.ObserveTokens(provName, resp.Usage.TotalTokens, 0)
+		metrics.ObserveCost(provName, req.Model, estimate.USD, estimate.Known)
+		if err := budgetReservation.Commit(resp.Usage.TotalTokens, estimate.USD); err != nil {
 			h.log.Warn("embedding budget adjustment exceeded estimate", "tenant", r.Header.Get("X-Tenant-ID"), "error", err)
 		}
 		budgetCommitted = true

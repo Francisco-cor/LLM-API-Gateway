@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fcordero/llm-api-gateway/internal/pricing"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -29,11 +30,13 @@ var ErrUnavailable = errors.New("budget backend unavailable")
 type Manager struct {
 	mu              sync.Mutex
 	mem             map[string]*usage
+	configMu        sync.RWMutex
 	redis           *redis.Client
 	enabled         bool
 	tokens          int
 	usd             float64
 	costPerTokenUSD float64
+	catalog         *pricing.Catalog
 }
 
 type usage struct {
@@ -63,17 +66,52 @@ func New(tokens int, usd float64, redisClient *redis.Client) *Manager {
 // Provider/model-specific pricing can later replace this estimate without
 // changing reservation semantics.
 func NewWithCost(tokens int, usd, costPerTokenUSD float64, redisClient *redis.Client) *Manager {
+	catalog, _ := pricing.NewCatalog(nil, costPerTokenUSD, pricing.DefaultCurrency, "", pricing.UnknownUseFallback)
+	return NewWithPricing(tokens, usd, costPerTokenUSD, redisClient, catalog)
+}
+
+// NewWithPricing creates a manager with an immutable provider/model catalog.
+func NewWithPricing(tokens int, usd, costPerTokenUSD float64, redisClient *redis.Client, catalog *pricing.Catalog) *Manager {
+	return NewConfigured(tokens > 0 || usd > 0, tokens, usd, costPerTokenUSD, redisClient, catalog)
+}
+
+// NewConfigured creates a manager even when disabled. Keeping the manager
+// installed lets a config reload enable budgets without rebuilding handlers.
+func NewConfigured(enabled bool, tokens int, usd, costPerTokenUSD float64, redisClient *redis.Client, catalog *pricing.Catalog) *Manager {
 	if costPerTokenUSD < 0 {
 		costPerTokenUSD = 0
+	}
+	if catalog == nil {
+		catalog, _ = pricing.NewCatalog(nil, costPerTokenUSD, pricing.DefaultCurrency, "", pricing.UnknownUseFallback)
 	}
 	return &Manager{
 		mem:             make(map[string]*usage),
 		redis:           redisClient,
-		enabled:         tokens > 0 || usd > 0,
+		enabled:         enabled,
 		tokens:          tokens,
 		usd:             usd,
 		costPerTokenUSD: costPerTokenUSD,
+		catalog:         catalog,
 	}
+}
+
+// UpdateConfig atomically swaps budget limits and pricing. Existing monthly
+// usage remains intact, so tightening a limit cannot erase already consumed
+// quota and disabling/re-enabling preserves the current month accounting.
+func (m *Manager) UpdateConfig(enabled bool, tokens int, usd, costPerTokenUSD float64, catalog *pricing.Catalog) {
+	if costPerTokenUSD < 0 {
+		costPerTokenUSD = 0
+	}
+	if catalog == nil {
+		catalog, _ = pricing.NewCatalog(nil, costPerTokenUSD, pricing.DefaultCurrency, "", pricing.UnknownUseFallback)
+	}
+	m.configMu.Lock()
+	m.enabled = enabled
+	m.tokens = tokens
+	m.usd = usd
+	m.costPerTokenUSD = costPerTokenUSD
+	m.catalog = catalog
+	m.configMu.Unlock()
 }
 
 func monthKey() string {
@@ -85,14 +123,55 @@ func (m *Manager) CostForTokens(tokens int) float64 {
 	if tokens <= 0 {
 		return 0
 	}
-	return float64(tokens) * m.costPerTokenUSD
+	m.configMu.RLock()
+	cost := m.costPerTokenUSD
+	m.configMu.RUnlock()
+	return float64(tokens) * cost
+}
+
+func (m *Manager) CostForChat(provider, model string, promptTokens, completionTokens int) (pricing.Estimate, error) {
+	catalog := m.catalogSnapshot()
+	if catalog != nil {
+		return catalog.Chat(provider, model, promptTokens, completionTokens)
+	}
+	return pricing.Estimate{USD: m.CostForTokens(promptTokens + completionTokens), Known: false, Currency: pricing.DefaultCurrency}, nil
+}
+
+func (m *Manager) EstimateChat(model string, promptTokens, completionTokens int) (pricing.Estimate, error) {
+	catalog := m.catalogSnapshot()
+	if catalog != nil {
+		return catalog.EstimateChat(model, promptTokens, completionTokens)
+	}
+	return pricing.Estimate{USD: m.CostForTokens(promptTokens + completionTokens), Known: false, Currency: pricing.DefaultCurrency}, nil
+}
+
+func (m *Manager) CostForEmbedding(provider, model string, tokens int) (pricing.Estimate, error) {
+	catalog := m.catalogSnapshot()
+	if catalog != nil {
+		return catalog.Embedding(provider, model, tokens)
+	}
+	return pricing.Estimate{USD: m.CostForTokens(tokens), Known: false, Currency: pricing.DefaultCurrency}, nil
+}
+
+func (m *Manager) catalogSnapshot() *pricing.Catalog {
+	m.configMu.RLock()
+	catalog := m.catalog
+	m.configMu.RUnlock()
+	return catalog
+}
+
+func (m *Manager) limitsSnapshot() (bool, int, float64) {
+	m.configMu.RLock()
+	defer m.configMu.RUnlock()
+	return m.enabled, m.tokens, m.usd
 }
 
 // Check returns an error if the tenant exceeds its monthly budget. New
 // request paths should prefer Reserve so concurrent in-flight requests are
 // accounted for before they call a provider.
 func (m *Manager) Check(tenant string) error {
-	if !m.enabled || tenant == "" {
+	enabled, _, _ := m.limitsSnapshot()
+	if !enabled || tenant == "" {
 		return nil
 	}
 	if m.redis != nil {
@@ -104,7 +183,8 @@ func (m *Manager) Check(tenant string) error {
 // Reserve atomically reserves an estimated amount before an upstream call.
 // The reservation must be committed with actual usage or cancelled on failure.
 func (m *Manager) Reserve(tenant string, tokens int, usd float64) (*Reservation, error) {
-	if !m.enabled || tenant == "" {
+	enabled, _, _ := m.limitsSnapshot()
+	if !enabled || tenant == "" {
 		return nil, nil
 	}
 	if tokens < 0 {
@@ -165,16 +245,18 @@ func (r *Reservation) Cancel() {
 }
 
 func (m *Manager) checkMem(tenant, month string) error {
+	_, tokenLimit, usdLimit := m.limitsSnapshot()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	u := m.mem[memKey(tenant, month)]
 	if u == nil {
 		return nil
 	}
-	return quotaError(m.tokens, m.usd, u.tokens, u.usd)
+	return quotaError(tokenLimit, usdLimit, u.tokens, u.usd)
 }
 
 func (m *Manager) checkRedis(tenant string) error {
+	_, tokenLimit, usdLimit := m.limitsSnapshot()
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	key := budgetKey(tenant, monthKey())
@@ -184,10 +266,11 @@ func (m *Manager) checkRedis(tenant string) error {
 	}
 	tokens := parseInt(val, 0)
 	usd := parseFloat(val, 1)
-	return quotaError(m.tokens, m.usd, tokens, usd)
+	return quotaError(tokenLimit, usdLimit, tokens, usd)
 }
 
 func (m *Manager) reserveMem(tenant, month string, tokens int, usd float64) error {
+	_, tokenLimit, usdLimit := m.limitsSnapshot()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	key := memKey(tenant, month)
@@ -196,7 +279,7 @@ func (m *Manager) reserveMem(tenant, month string, tokens int, usd float64) erro
 		u = &usage{month: month}
 		m.mem[key] = u
 	}
-	if err := reservationQuotaError(m.tokens, m.usd, u.tokens+tokens, u.usd+usd); err != nil {
+	if err := reservationQuotaError(tokenLimit, usdLimit, u.tokens+tokens, u.usd+usd); err != nil {
 		return err
 	}
 	u.tokens += tokens
@@ -205,10 +288,11 @@ func (m *Manager) reserveMem(tenant, month string, tokens int, usd float64) erro
 }
 
 func (m *Manager) reserveRedis(tenant, month string, tokens int, usd float64) error {
+	_, tokenLimit, usdLimit := m.limitsSnapshot()
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	result, err := budgetReserveScript.Run(ctx, m.redis, []string{budgetKey(tenant, month)},
-		m.tokens, m.usd, tokens, usd, budgetTTLSeconds).Result()
+		tokenLimit, usdLimit, tokens, usd, budgetTTLSeconds).Result()
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
@@ -225,7 +309,8 @@ func (m *Manager) reserveRedis(tenant, month string, tokens int, usd float64) er
 // Record remains for callers that already have actual usage but cannot use a
 // reservation. New request paths should use Reserve/Commit instead.
 func (m *Manager) Record(tenant string, tokens int, usd float64) {
-	if !m.enabled || tenant == "" {
+	enabled, _, _ := m.limitsSnapshot()
+	if !enabled || tenant == "" {
 		return
 	}
 	_ = m.adjust(tenant, monthKey(), tokens, usd)
@@ -254,14 +339,16 @@ func (m *Manager) adjust(tenant, month string, deltaTokens int, deltaUSD float64
 	if u.usd < 0 {
 		u.usd = 0
 	}
-	return reservationQuotaError(m.tokens, m.usd, u.tokens, u.usd)
+	_, tokenLimit, usdLimit := m.limitsSnapshot()
+	return reservationQuotaError(tokenLimit, usdLimit, u.tokens, u.usd)
 }
 
 func (m *Manager) adjustRedis(tenant, month string, deltaTokens int, deltaUSD float64) error {
+	_, tokenLimit, usdLimit := m.limitsSnapshot()
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	result, err := budgetAdjustScript.Run(ctx, m.redis, []string{budgetKey(tenant, month)},
-		deltaTokens, deltaUSD, m.tokens, m.usd, budgetTTLSeconds).Result()
+		deltaTokens, deltaUSD, tokenLimit, usdLimit, budgetTTLSeconds).Result()
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}

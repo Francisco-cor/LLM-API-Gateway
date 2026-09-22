@@ -81,10 +81,26 @@ type RateLimitOverride struct {
 }
 
 type BudgetConfig struct {
-	Enabled         bool    `yaml:"enabled"`
-	MonthlyTokens   int     `yaml:"monthly_tokens"`
-	MonthlyUSD      float64 `yaml:"monthly_usd"`
-	CostPerTokenUSD float64 `yaml:"cost_per_token_usd"`
+	Enabled         bool          `yaml:"enabled"`
+	MonthlyTokens   int           `yaml:"monthly_tokens"`
+	MonthlyUSD      float64       `yaml:"monthly_usd"`
+	CostPerTokenUSD float64       `yaml:"cost_per_token_usd"`
+	Pricing         PricingConfig `yaml:"pricing"`
+}
+
+type PricingConfig struct {
+	Currency           string        `yaml:"currency"`
+	Version            string        `yaml:"version"`
+	UnknownModelPolicy string        `yaml:"unknown_model_policy"`
+	Catalog            []PricingRule `yaml:"catalog"`
+}
+
+type PricingRule struct {
+	Provider                     string  `yaml:"provider"`
+	Model                        string  `yaml:"model"`
+	InputPerMillionTokensUSD     float64 `yaml:"input_per_million_tokens_usd"`
+	OutputPerMillionTokensUSD    float64 `yaml:"output_per_million_tokens_usd"`
+	EmbeddingPerMillionTokensUSD float64 `yaml:"embedding_per_million_tokens_usd"`
 }
 
 type LoggingConfig struct {
@@ -212,6 +228,26 @@ func (c *Config) Validate() error {
 		}
 		if c.RateLimit.Budget.CostPerTokenUSD < 0 {
 			return fmt.Errorf("rate_limit.budget.cost_per_token_usd must be >=0")
+		}
+	}
+	if c.RateLimit.Budget != nil {
+		p := c.RateLimit.Budget.Pricing
+		if p.Currency != "" && p.Currency != "USD" {
+			return fmt.Errorf("rate_limit.budget.pricing.currency must be USD, got %q", p.Currency)
+		}
+		if p.UnknownModelPolicy != "" && p.UnknownModelPolicy != "fallback" && p.UnknownModelPolicy != "reject" {
+			return fmt.Errorf("rate_limit.budget.pricing.unknown_model_policy must be fallback or reject")
+		}
+		for i, rule := range p.Catalog {
+			if rule.Provider == "" || rule.Model == "" {
+				return fmt.Errorf("rate_limit.budget.pricing.catalog[%d] provider and model are required", i)
+			}
+			if rule.InputPerMillionTokensUSD < 0 || rule.OutputPerMillionTokensUSD < 0 || rule.EmbeddingPerMillionTokensUSD < 0 {
+				return fmt.Errorf("rate_limit.budget.pricing.catalog[%d] rates must be >=0", i)
+			}
+			if rule.InputPerMillionTokensUSD == 0 && rule.OutputPerMillionTokensUSD == 0 && rule.EmbeddingPerMillionTokensUSD == 0 {
+				return fmt.Errorf("rate_limit.budget.pricing.catalog[%d] needs at least one positive rate", i)
+			}
 		}
 	}
 	// Providers validation — APIKey may be empty or unexpanded "${...}" (treated as disabled, not an error)

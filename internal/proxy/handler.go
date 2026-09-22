@@ -16,6 +16,7 @@ import (
 	"github.com/fcordero/llm-api-gateway/internal/budget"
 	"github.com/fcordero/llm-api-gateway/internal/cache"
 	"github.com/fcordero/llm-api-gateway/internal/metrics"
+	"github.com/fcordero/llm-api-gateway/internal/pricing"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/ratelimit"
 	"github.com/fcordero/llm-api-gateway/internal/resilience"
@@ -381,6 +382,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	metrics.CircuitState.WithLabelValues(providerName).Set(float64(h.breakerFor(providerName).State()))
 	if budgetReservation != nil {
 		actualUSD := h.budgetMgr.CostForTokens(resp.Usage.TotalTokens)
+		pricingKnown := false
+		if estimate, err := h.budgetMgr.CostForChat(providerName, req.Model, resp.Usage.PromptTokens, resp.Usage.CompletionTokens); err == nil {
+			actualUSD = estimate.USD
+			pricingKnown = estimate.Known
+		} else {
+			h.log.Warn("provider/model price unavailable after dispatch; using fallback estimate", "provider", providerName, "model", req.Model, "error", err)
+		}
+		metrics.ObserveCost(providerName, req.Model, actualUSD, pricingKnown)
 		if err := budgetReservation.Commit(resp.Usage.TotalTokens, actualUSD); err != nil {
 			h.log.Warn("budget adjustment exceeded estimate", "tenant", tenant, "error", err)
 		}
@@ -407,22 +416,36 @@ func (h *Handler) reserveChatBudget(tenant string, req provider.ChatRequest) (*b
 	if h.budgetMgr == nil {
 		return nil, 0, 0, nil
 	}
+	tokens := chatPromptTokens(req)
+	completionTokens := 0
+	if req.MaxTokens != nil && *req.MaxTokens > 0 {
+		completionTokens = *req.MaxTokens
+	}
+	tokens += completionTokens
+	estimate, err := h.budgetMgr.EstimateChat(req.Model, tokens-completionTokens, completionTokens)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	usd := estimate.USD
+	reservation, err := h.budgetMgr.Reserve(tenant, tokens, usd)
+	return reservation, tokens, usd, err
+}
+
+func chatPromptTokens(req provider.ChatRequest) int {
 	chars := 0
 	for _, message := range req.Messages {
 		chars += len(message.Content)
 	}
-	tokens := ratelimit.EstimateTokens(chars)
-	if req.MaxTokens != nil && *req.MaxTokens > 0 {
-		tokens += *req.MaxTokens
-	}
-	usd := h.budgetMgr.CostForTokens(tokens)
-	reservation, err := h.budgetMgr.Reserve(tenant, tokens, usd)
-	return reservation, tokens, usd, err
+	return ratelimit.EstimateTokens(chars)
 }
 
 func writeBudgetError(w http.ResponseWriter, err error) {
 	if errors.Is(err, budget.ErrUnavailable) {
 		writeError(w, http.StatusServiceUnavailable, "budget_unavailable", "budget service temporarily unavailable")
+		return
+	}
+	if errors.Is(err, pricing.ErrUnknownPrice) {
+		writeError(w, http.StatusServiceUnavailable, "pricing_unavailable", "provider/model price is not configured")
 		return
 	}
 	writeError(w, http.StatusTooManyRequests, "insufficient_quota", err.Error())
