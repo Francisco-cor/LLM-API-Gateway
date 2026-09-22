@@ -104,12 +104,15 @@ func (c *Catalog) Chat(provider, model string, promptTokens, completionTokens in
 // provider from silently under-reserving a hard budget.
 func (c *Catalog) EstimateChat(model string, promptTokens, completionTokens int) (Estimate, error) {
 	var best *Rule
+	bestCost := -1.0
 	for i := range c.rules {
 		if !modelMatches(c.rules[i].Model, model) {
 			continue
 		}
-		if best == nil || chatRate(&c.rules[i]) > chatRate(best) {
+		candidateCost := perMillion(promptTokens, c.rules[i].InputPerMillionTokensUSD) + perMillion(completionTokens, c.rules[i].OutputPerMillionTokensUSD)
+		if best == nil || candidateCost > bestCost || (candidateCost == bestCost && ruleRank(&c.rules[i], model) > ruleRank(best, model)) {
 			best = &c.rules[i]
+			bestCost = candidateCost
 		}
 	}
 	if best != nil {
@@ -152,12 +155,19 @@ func (c *Catalog) bestRule(provider, model string, embedding bool) (*Rule, bool)
 		}
 		rate := rule.EmbeddingPerMillionTokensUSD
 		if !embedding {
-			rate = chatRate(rule)
+			rate = rule.InputPerMillionTokensUSD + rule.OutputPerMillionTokensUSD
 		}
 		if rate <= 0 {
 			continue
 		}
-		if best == nil || ruleRank(rule, model) > ruleRank(best, model) {
+		bestRate := 0.0
+		if best != nil {
+			bestRate = best.EmbeddingPerMillionTokensUSD
+			if !embedding {
+				bestRate = best.InputPerMillionTokensUSD + best.OutputPerMillionTokensUSD
+			}
+		}
+		if best == nil || ruleRank(rule, model) > ruleRank(best, model) || (ruleRank(rule, model) == ruleRank(best, model) && rate > bestRate) {
 			best = rule
 		}
 	}
@@ -177,10 +187,6 @@ func modelMatches(pattern, model string) bool {
 	}
 	matched, err := path.Match(pattern, model)
 	return err == nil && matched
-}
-
-func chatRate(rule *Rule) float64 {
-	return rule.InputPerMillionTokensUSD + rule.OutputPerMillionTokensUSD
 }
 
 func perMillion(tokens int, rate float64) float64 {
