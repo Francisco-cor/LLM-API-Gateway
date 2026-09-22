@@ -83,7 +83,7 @@ flowchart LR
         Router[router.go<br>Registry weighted+wildcard+regex]
         Embed[embeddings.go]
         Models[models.go]
-        Health[health.go<br>parallel fan-out 3s + SetReady]
+        Health[health.go<br>configurable fan-out/cache + SetReady]
         MW[middleware.go<br>RequestID/Logging/Security/CORS/Metrics/Tracing/RateLimit]
     end
     subgraph provider
@@ -158,6 +158,7 @@ type Embedder interface { Embed(ctx, EmbeddingRequest) (EmbeddingResponse, error
 
 **`Translate` pivot** (`internal/translate/`):
 - Canonical = OpenAI `ChatRequest`. `ToAnthropic`: `system` extracted → `system` field, `assistant→model`? actually `messages` with `role:assistant→model`. `ToGemini`: `messages→contents` with `role:model` for assistant.
+- The canonical contract preserves multimodal content, tool calls, audio fields, logprobs, and modern completion controls for OpenAI-compatible clients; providers that need translation consume the text projection where their native contract is narrower.
 - Keeps `Provider` pure; translation is unit-tested isolated (`tests/translate_test.go`).
 
 ---
@@ -207,7 +208,7 @@ Streaming variant: `handler.go:390 handleStream` branches `req.Stream` → `Cont
 
 ## 6. Operational concerns
 
-- **Hot reload:** `config.Watch(ctx, path, 1s, onChange)` polls `ModTime` + 100ms debounce; `SIGHUP` handler; `applyConfig(newCfg)` → `Validate` → `buildProviders` → `registry.Reload` → `limiter.UpdateLimits` → `overrideStore.Reload` → `budget.Manager.UpdateConfig` → `authStore.Reload` → `handlerOpts.SetCache/Circuit/Retry/Hedge/Fallback` → `embeddings.SetCache` → `adminSrv.SetConfig(Clone)`; invalid → 400 rollback keep old (see `tests/admin_test.go` rollback).
+- **Hot reload:** `config.Watch(ctx, path, 1s, onChange)` polls `ModTime` + 100ms debounce; `SIGHUP` handler; `applyConfig(newCfg)` → `Validate` → `buildProviders` → `registry.Reload` → `limiter.UpdateLimits` → `overrideStore.Reload` → `budget.Manager.UpdateConfig` → `authStore.Reload` → `health.SetOptions` → `handlerOpts.SetCache/Circuit/Retry/Hedge/Fallback` → `embeddings.SetCache` → `adminSrv.SetConfig(Clone)`; invalid → 400 rollback keep old (see `tests/admin_test.go` rollback).
 - **Graceful drain:** `HealthHandler.SetReady(false)` → `/readyz` 503 draining → 5s sleep for K8s endpoint removal → `admin/pprof Shutdown 5s` → `srv.Shutdown 30s` with `IdleTimeout 120s` (`main.go:326`).
 - **Performance:** `sharedTransport MaxIdleConns100/PerHost20/IdleConnTimeout90s/KeepAlive30s/ForceAttemptHTTP2` (`provider/http.go:10`), `bufPool` for `marshalJSON`, `sharded 16× fnv` limiter (56ns/op), `BuildKey 1.8µs`, `Cache hit 75ns` (`BENCH.md`).
 - **Observability:** `metrics.RequestsTotal{method,path,status,provider}` `RequestDuration` `TokensTotal` `CacheHits` `ProviderErrors` `CircuitState`; paths are bounded to known routes; `Tracing` injects OTEL trace context and optionally batches spans to OTLP/gRPC; `Logging` uses `request_id/tenant/provider/latency_ms`.

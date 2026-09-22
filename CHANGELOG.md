@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Expand the OpenAI-compatible chat contract for multimodal content, tool calls, audio, logprobs, parallel tool calls, and modern completion controls; preserve those fields in cache namespaces and use safe text projections for narrower translated providers.
+- Make readiness/provider health cache and timeouts configurable, support hot reload, and allow credit-bearing Anthropic checks to be explicitly skipped and reported as `skipped`.
 - Add provider/model pricing catalogs with input/output/embedding rates, unknown-price policy, cost metrics, atomic budget hot reload, embedding response cache, and opt-in embedding-backed semantic cache with identity/shape namespaces.
 - Wire the OTLP/gRPC exporter, bound Prometheus path cardinality, cache readiness provider checks for 15s, clear SSE write deadlines for active streams, and close limiter cleanup goroutines during shutdown.
 - Make rate-limit enablement hot-reloadable, make overlapping weighted patterns deterministic, use constant-time admin-key comparison, remove the ineffective runtime Redis URL patch, and bound provider error messages.

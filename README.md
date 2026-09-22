@@ -24,7 +24,7 @@ flowchart LR
 
 ## Features
 
-- **Unified endpoint** — `POST /v1/chat/completions` + `POST /v1/embeddings` OpenAI-compatible. Auto-translation via `internal/translate` (Fase 8).
+- **Unified endpoint** — `POST /v1/chat/completions` + `POST /v1/embeddings` OpenAI-compatible, including multimodal content, tool calls, audio fields, logprobs and modern completion controls. Auto-translation via `internal/translate` (Fase 8).
 - **Provider interface** — `Name/Send/SendStream/Embed/Models/HealthCheck/DiscoverModels` — add a provider = 1 file + translate (see `CONTRIBUTING.md`).
 - **Intelligent routing** — `providers.<name>.models` wildcards `gpt-4*`, regex `gpt-4.*`; `routing.weighted` canary 90/10 ±5% in 1k reqs; auto-discovery `models: []` → `GET /v1/models`.
 - **Streaming SSE** — `stream:true` `text/event-stream` + Anthropic/Gemini → OpenAI `data: {...}` + `data: [DONE]`, with retryable fallback before the first chunk; `tools`/`tool_choice`/`response_format`.
@@ -33,7 +33,7 @@ flowchart LR
 - **Traffic control** — sharded 16× `fnv` + TTL 10m limiter (56ns `Allow`), token-aware `AllowN`, per-tenant/model overrides, atomic monthly budget reservation/commit, provider/model pricing catalog with hot reload, atomic Redis Lua buckets with in-process fallback on Redis errors.
 - **Cache** — `X-Cache:HIT/MISS` LRU 1000 TTL 5m + Redis, identity-isolated SHA-256 keys covering response-shaping fields for chat and embeddings, `X-Cache-TTL/Skip`, only 200 non-stream. Semantic mode is opt-in and uses provider embeddings with threshold/top-k/max-entry limits.
 - **Security** — Bearer multi-tenant + scopes/expiry, CORS allowlist, `X-Content-Type-Options nosniff` etc, secrets redacted `***`.
-- **Health** — `GET /health` (uptime), `/health/providers` fan-out 3s parallel `degraded` handling, `/livez`/`/readyz` (K8s, cached provider readiness for 15s, `SetReady(false)` draining).
+- **Health** — `GET /health` (uptime), `/health/providers` fan-out with configurable timeouts, `/livez`/`/readyz` (K8s, cached provider readiness, optional skip for credit-bearing checks, `SetReady(false)` draining).
 - **Control plane** — Admin `:8081` `GET /admin/config` redacted, `POST /admin/reload` 400 rollback, `GET /admin/providers`, `PATCH /admin/config` hot knobs (`rate_limit/cache/circuit/hedge/routing/logging`), file watcher 1s poll + `SIGHUP`.
 - **Perf & Ops** — `ReadHeaderTimeout 5s` anti-Slowloris, `IdleTimeout 120s` keep-alive, shared `Transport MaxIdleConns100/PerHost20/KeepAlive30s`, `sync.Pool` JSON buffers, K8s `Deployment/HPA 3→10/PDB min 2/ServiceMonitor`, `pprof :6060` behind admin auth, `BENCH.md` + `k6` 1k RPS p95<30ms, `readOnlyRootFilesystem` + `runAsNonRoot`.
 - **DX & Release** — `examples/` (curl/python/node/langchain/postman), `CONTRIBUTING.md` (<10 min), `docs/ARCHITECTURE.md` C4 + ADR-001..003, `CHANGELOG.md` + `VERSION` SemVer `v1.0.0`, `make dev` air live-reload.
@@ -123,6 +123,7 @@ See `.env.example` + `config.yaml` for full keys.
 | `cache.enabled/ttl/max_size` | exact + embeddings; semantic mode uses `semantic_enabled/threshold`, `semantic_embedding_model`, `semantic_top_k`, `semantic_max_entries` |
 | `rate_limit.enabled/requests_per_minute/burst/redis_url/token_aware` | + `overrides` per tenant/model + `budget.monthly_tokens/monthly_usd/cost_per_token_usd` |
 | `rate_limit.budget.pricing` | `currency`, `version`, `unknown_model_policy` (`fallback`/`reject`) and provider/model rates per 1M input/output/embedding tokens |
+| `health` | readiness cache/check/provider timeouts and `skip_expensive_checks` for credit-bearing provider probes |
 | `auth.enabled/keys` | `key`, `tenant`, `scopes`, `expires_at` |
 | `admin.port/api_key` | `:8081` + `${ADMIN_API_KEY}` |
 | `cors.allowed_origins` | CORS |
@@ -138,7 +139,7 @@ Provider registered only if key non-empty → subset fine.
 | `POST` | `/v1/embeddings` | `input` string/array → Gemini `embedContent` |
 | `GET` | `/v1/models` | aggregated registry |
 | `GET` | `/health` | liveness `status:ok` + `uptime_seconds` |
-| `GET` | `/health/providers` | fan-out 3s parallel `degraded` if any unhealthy |
+| `GET` | `/health/providers` | configurable parallel provider checks; `degraded` if any unhealthy |
 | `GET` | `/livez` / `/readyz` | K8s probes (`readyz` 503 when draining) |
 | `GET` | `/metrics` | Prometheus |
 | `GET` | `/admin/config` | redacted `***` (auth `ADMIN_API_KEY`) |
