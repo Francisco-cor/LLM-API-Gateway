@@ -82,6 +82,21 @@ func TestCache_BuildKeyDeterministic(t *testing.T) {
 	}
 }
 
+func TestCache_EmbeddingKeyIncludesResponseShapeAndIdentity(t *testing.T) {
+	req := provider.EmbeddingRequest{Model: "text-embedding-3-small", Input: "hello", EncodingFormat: "float", User: "user-a"}
+	if cache.BuildEmbeddingKey(req) != cache.BuildEmbeddingKey(req) {
+		t.Fatal("same embedding request should have the same key")
+	}
+	changed := req
+	changed.EncodingFormat = "base64"
+	if cache.BuildEmbeddingKey(req) == cache.BuildEmbeddingKey(changed) {
+		t.Fatal("encoding format must affect embedding cache key")
+	}
+	if cache.BuildEmbeddingKeyForIdentity(req, "tenant-a") == cache.BuildEmbeddingKeyForIdentity(req, "tenant-b") {
+		t.Fatal("identities must not share embedding cache keys")
+	}
+}
+
 func TestHandler_CacheHITMISS(t *testing.T) {
 	m := cache.NewMemory(100)
 	registry := proxy.NewRegistry([]provider.Provider{

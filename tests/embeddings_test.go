@@ -7,9 +7,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	"github.com/fcordero/llm-api-gateway/internal/cache"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/proxy"
+	"github.com/fcordero/llm-api-gateway/internal/resilience"
 )
 
 func TestEmbeddings_Success(t *testing.T) {
@@ -49,6 +52,43 @@ func TestEmbeddings_Success(t *testing.T) {
 	}
 	if openai.embedCount != 1 {
 		t.Errorf("embed called %d want 1", openai.embedCount)
+	}
+}
+
+func TestEmbeddings_CacheHitAndIdentityIsolation(t *testing.T) {
+	embedResp := provider.EmbeddingResponse{
+		Object: "list",
+		Data:   []provider.EmbeddingData{{Object: "embedding", Index: 0, Embedding: []float32{0.1, 0.2}}},
+		Model:  "text-embedding-3-small",
+		Usage:  provider.EmbeddingUsage{PromptTokens: 2, TotalTokens: 2},
+	}
+	openai := &mockProvider{name: "openai", models: []string{"text-embedding-3-small"}, embedResp: embedResp}
+	registry := proxy.NewRegistry([]provider.Provider{openai})
+	handler := proxy.NewEmbeddingsHandlerWithCache(registry, []string{"openai"}, discardLogger(), nil, nil, false, resilience.DefaultRetryConfig(), resilience.DefaultCircuitConfig(), nil, cache.NewMemory(10), time.Minute)
+	body := []byte(`{"model":"text-embedding-3-small","input":"hello"}`)
+
+	first := httptest.NewRequest(http.MethodPost, "/v1/embeddings", bytes.NewReader(body))
+	first.Header.Set("Authorization", "Bearer tenant-a")
+	w1 := httptest.NewRecorder()
+	handler.ServeHTTP(w1, first)
+	if w1.Header().Get("X-Cache") != "MISS" || openai.embedCount != 1 {
+		t.Fatalf("first request cache=%q embedCount=%d", w1.Header().Get("X-Cache"), openai.embedCount)
+	}
+
+	second := httptest.NewRequest(http.MethodPost, "/v1/embeddings", bytes.NewReader(body))
+	second.Header.Set("Authorization", "Bearer tenant-a")
+	w2 := httptest.NewRecorder()
+	handler.ServeHTTP(w2, second)
+	if w2.Header().Get("X-Cache") != "HIT" || openai.embedCount != 1 {
+		t.Fatalf("same identity cache=%q embedCount=%d", w2.Header().Get("X-Cache"), openai.embedCount)
+	}
+
+	third := httptest.NewRequest(http.MethodPost, "/v1/embeddings", bytes.NewReader(body))
+	third.Header.Set("Authorization", "Bearer tenant-b")
+	w3 := httptest.NewRecorder()
+	handler.ServeHTTP(w3, third)
+	if w3.Header().Get("X-Cache") != "MISS" || openai.embedCount != 2 {
+		t.Fatalf("different identity cache=%q embedCount=%d", w3.Header().Get("X-Cache"), openai.embedCount)
 	}
 }
 

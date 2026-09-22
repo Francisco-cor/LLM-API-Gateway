@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/fcordero/llm-api-gateway/internal/budget"
+	"github.com/fcordero/llm-api-gateway/internal/cache"
 	"github.com/fcordero/llm-api-gateway/internal/metrics"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/ratelimit"
@@ -40,6 +41,8 @@ type EmbeddingsHandler struct {
 	circuits      map[string]*resilience.Breaker
 	circuitsMu    sync.RWMutex
 	budgetMgr     *budget.Manager
+	cache         cache.Cache
+	cacheTTL      time.Duration
 }
 
 func NewEmbeddingsHandler(registry *Registry, fallbackChain []string, log *slog.Logger) *EmbeddingsHandler {
@@ -51,6 +54,10 @@ func NewEmbeddingsHandlerWithRateLimit(registry *Registry, fallbackChain []strin
 }
 
 func NewEmbeddingsHandlerWithResilienceAndBudget(registry *Registry, fallbackChain []string, log *slog.Logger, limiter ratelimit.Backend, overrides *ratelimit.OverrideStore, tokenAware bool, retryCfg resilience.RetryConfig, circuitCfg resilience.CircuitConfig, budgetMgr *budget.Manager) *EmbeddingsHandler {
+	return NewEmbeddingsHandlerWithCache(registry, fallbackChain, log, limiter, overrides, tokenAware, retryCfg, circuitCfg, budgetMgr, nil, 0)
+}
+
+func NewEmbeddingsHandlerWithCache(registry *Registry, fallbackChain []string, log *slog.Logger, limiter ratelimit.Backend, overrides *ratelimit.OverrideStore, tokenAware bool, retryCfg resilience.RetryConfig, circuitCfg resilience.CircuitConfig, budgetMgr *budget.Manager, c cache.Cache, ttl time.Duration) *EmbeddingsHandler {
 	circuits := make(map[string]*resilience.Breaker)
 	for _, p := range registry.All() {
 		circuits[p.Name()] = resilience.NewBreaker(circuitCfg)
@@ -66,7 +73,22 @@ func NewEmbeddingsHandlerWithResilienceAndBudget(registry *Registry, fallbackCha
 		circuitCfg:    circuitCfg,
 		circuits:      circuits,
 		budgetMgr:     budgetMgr,
+		cache:         c,
+		cacheTTL:      ttl,
 	}
+}
+
+func (h *EmbeddingsHandler) SetCache(c cache.Cache, ttl time.Duration) {
+	h.mu.Lock()
+	h.cache = c
+	h.cacheTTL = ttl
+	h.mu.Unlock()
+}
+
+func (h *EmbeddingsHandler) getCache() (cache.Cache, time.Duration) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.cache, h.cacheTTL
 }
 
 func (h *EmbeddingsHandler) SetFallbackChain(chain []string) {
@@ -184,6 +206,33 @@ func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	var cacheKey string
+	var cacheTTL time.Duration
+	cached, ttl := h.getCache()
+	if cached != nil && r.Header.Get("X-Cache-Skip") != "true" {
+		if ttlHeader := r.Header.Get("X-Cache-TTL"); ttlHeader != "" {
+			if d, parseErr := time.ParseDuration(ttlHeader); parseErr == nil && d > 0 {
+				cacheTTL = d
+			}
+		}
+		if cacheTTL == 0 {
+			cacheTTL = ttl
+			if cacheTTL == 0 {
+				cacheTTL = 5 * time.Minute
+			}
+		}
+		cacheKey = cache.BuildEmbeddingKeyForIdentity(req, r.Header.Get("Authorization"))
+		if data, ok := cached.Get(cacheKey); ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("X-Cache", "HIT")
+			w.Header().Set("X-Gateway-Provider", "cache")
+			metrics.CacheHits.WithLabelValues("hit").Inc()
+			metrics.CacheSize.Set(float64(cached.Stats().Size))
+			_, _ = w.Write(data)
+			return
+		}
+		metrics.CacheHits.WithLabelValues("miss").Inc()
+	}
 	if h.limiter != nil && h.overrides != nil && h.tokenAwareEnabled() {
 		tenant := r.Header.Get("X-Tenant-ID")
 		rpm, burst := h.overrides.Resolve(tenant, req.Model)
@@ -266,6 +315,16 @@ func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Gateway-Provider", provName)
+	if cached != nil && cacheKey != "" {
+		data, marshalErr := json.Marshal(resp)
+		if marshalErr == nil {
+			cached.Set(cacheKey, data, cacheTTL)
+			w.Header().Set("X-Cache", "MISS")
+			metrics.CacheSize.Set(float64(cached.Stats().Size))
+			_, _ = w.Write(data)
+			return
+		}
+	}
 	_ = json.NewEncoder(w).Encode(resp)
 }
 

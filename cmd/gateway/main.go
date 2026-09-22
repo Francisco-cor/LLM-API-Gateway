@@ -145,7 +145,7 @@ func main() {
 	rateLimitEnabled := &atomic.Bool{}
 	rateLimitEnabled.Store(cfg.RateLimit.Enabled)
 	handlerOpts := proxy.NewHandlerWithCache(registry, cfg.FallbackChain, log, retryCfg, circuitCfg, hedgeCfg, limiter, overrideStore, budgetMgr, cfg.RateLimit.Enabled && cfg.RateLimit.TokenAware, cacheInst, cfg.Cache.TTL)
-	embedHandler := proxy.NewEmbeddingsHandlerWithResilienceAndBudget(registry, cfg.FallbackChain, log, limiter, overrideStore, cfg.RateLimit.Enabled && cfg.RateLimit.TokenAware, retryCfg, circuitCfg, budgetMgr)
+	embedHandler := proxy.NewEmbeddingsHandlerWithCache(registry, cfg.FallbackChain, log, limiter, overrideStore, cfg.RateLimit.Enabled && cfg.RateLimit.TokenAware, retryCfg, circuitCfg, budgetMgr, cacheInst, cfg.Cache.TTL)
 	mux.Handle("POST /v1/chat/completions", handlerOpts)
 	mux.Handle("POST /v1/embeddings", embedHandler)
 	mux.Handle("GET /v1/models", proxy.NewModelsHandler(registry))
@@ -245,6 +245,7 @@ func main() {
 			newCache = nil
 		}
 		handlerOpts.SetCache(newCache, newCacheTTL)
+		embedHandler.SetCache(newCache, newCacheTTL)
 		cacheInst = newCache
 
 		// resilience
