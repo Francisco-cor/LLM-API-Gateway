@@ -1,0 +1,59 @@
+# Development profile. Auth is intentionally disabled for local curl/SDK use.
+# Use config.prod.yaml (or deploy/k8s) for an authenticated deployment.
+server:
+  port: 8080
+  read_timeout: 30s
+  write_timeout: 60s
+
+providers:
+  openai:
+    api_key: ${OPENAI_API_KEY}
+    base_url: https://api.openai.com/v1
+    timeout: 30s
+    models: [gpt-4o, text-embedding-3-small]
+
+fallback_chain: [openai]
+
+rate_limit:
+  enabled: true
+  requests_per_minute: 60
+  burst: 10
+  token_aware: true
+  budget:
+    enabled: false
+    monthly_tokens: 1000000
+    monthly_usd: 100.0
+    cost_per_token_usd: 0.00001
+
+resilience:
+  retry:
+    max_attempts: 3
+    base_delay: 200ms
+    max_delay: 2s
+  circuit:
+    failure_threshold: 5
+    open_timeout: 30s
+  hedge:
+    enabled: false
+    delay: 300ms
+
+cache:
+  enabled: false
+  ttl: 5m
+  max_size: 1000
+  semantic_enabled: false
+  semantic_threshold: 0.97
+  semantic_embedding_model: text-embedding-3-small
+  semantic_top_k: 3
+  semantic_max_entries: 1000
+
+auth:
+  enabled: false
+
+logging:
+  level: debug
+  format: text
+
+admin:
+  port: 8081
+  api_key: ${ADMIN_API_KEY}
