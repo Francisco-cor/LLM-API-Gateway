@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -19,7 +20,6 @@ import (
 
 	"github.com/fcordero/llm-api-gateway/internal/auth"
 	"github.com/fcordero/llm-api-gateway/internal/metrics"
-	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/ratelimit"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -130,11 +130,35 @@ func Logging(log *slog.Logger, next http.Handler) http.Handler {
 		} else if prov := w.Header().Get("X-Gateway-Provider"); prov != "" {
 			attrs = append(attrs, "provider", prov)
 		}
-		if span := trace.SpanFromContext(r.Context()); span.SpanContext().IsValid() {
-			attrs = append(attrs, "trace_id", span.SpanContext().TraceID().String())
+		if traceID := TraceIDFromContextOrHeader(r.Context(), rec.Header()); traceID != "" {
+			attrs = append(attrs, "trace_id", traceID)
 		}
 		log.Info("request", attrs...)
 	})
+}
+
+// TraceIDFromContextOrHeader returns the trace id for log correlation. It
+// prefers the span attached to ctx, then falls back to the traceparent that
+// Tracing injects into the response. That fallback matters when Logging wraps
+// Tracing: the inner middleware attaches the span to a request copy, so the
+// outer request context never sees it, but the response header does.
+func TraceIDFromContextOrHeader(ctx context.Context, header http.Header) string {
+	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
+		return span.SpanContext().TraceID().String()
+	}
+	return TraceIDFromHeader(header)
+}
+
+// TraceIDFromHeader extracts a trace id from a traceparent header.
+func TraceIDFromHeader(header http.Header) string {
+	if header == nil {
+		return ""
+	}
+	ctx := otel.GetTextMapPropagator().Extract(context.Background(), propagation.HeaderCarrier(header))
+	if spanCtx := trace.SpanContextFromContext(ctx); spanCtx.IsValid() {
+		return spanCtx.TraceID().String()
+	}
+	return ""
 }
 
 // SecurityHeaders adds baseline security headers.
@@ -160,17 +184,26 @@ func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
 				return
 			}
 			origin := r.Header.Get("Origin")
-			if allowed["*"] || allowed[origin] {
+			originAllowed := allowed[origin] || (allowed["*"] && origin != "")
+			if originAllowed {
 				w.Header().Add("Vary", "Origin")
-				w.Header().Set("Access-Control-Allow-Origin", origin)
 				if origin == "" && allowed["*"] {
 					w.Header().Set("Access-Control-Allow-Origin", "*")
+				} else {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
 				}
 				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Request-ID, X-Tenant-ID, X-Cache-Skip, X-Cache-TTL, X-Admin-API-Key")
+				w.Header().Set("Access-Control-Max-Age", "600")
 			}
 			if r.Method == http.MethodOptions {
-				if origin != "" && !allowed["*"] && !allowed[origin] {
+				// A preflight is only successful for an allowed origin. With no
+				// Origin header this is not a preflight, so pass it through.
+				if origin == "" {
+					next.ServeHTTP(w, r)
+					return
+				}
+				if !originAllowed {
 					w.WriteHeader(http.StatusForbidden)
 					return
 				}
@@ -270,7 +303,14 @@ func RateLimitWithEnabled(limiter ratelimit.Backend, overrides *ratelimit.Overri
 		rpm, burst := 0, 0
 		scope := ""
 		if overrides != nil && r.Method == http.MethodPost && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/embeddings") {
+			// Read the body with the same limit as the data plane. The previous
+			// LimitReader silently truncated larger bodies before the handler
+			// could answer 413, turning a size error into a JSON parse error.
 			body, err := io.ReadAll(io.LimitReader(r.Body, maxBodySize+1))
+			if err == nil && len(body) > maxBodySize {
+				writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large (max 8MiB)")
+				return
+			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
 			if err == nil {
 				var meta struct {
@@ -361,17 +401,4 @@ func generateRequestID() string {
 		return fmt.Sprintf("req-%d", time.Now().UnixNano())
 	}
 	return "req-" + hex.EncodeToString(b)
-}
-
-// writeError writes an OpenAI-compatible error response.
-func writeError(w http.ResponseWriter, status int, errType, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(provider.ErrorResponse{
-		Error: provider.Error{
-			Message: message,
-			Type:    errType,
-			Code:    errType,
-		},
-	})
 }
