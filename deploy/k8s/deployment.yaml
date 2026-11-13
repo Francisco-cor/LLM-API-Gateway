@@ -18,12 +18,14 @@ spec:
     metadata:
       labels:
         app: llm-api-gateway
-      annotations:
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "8080"
-        prometheus.io/path: "/metrics"
+      # No prometheus.io/* annotations: metrics are scraped through the
+      # ServiceMonitor, and keeping both causes double scraping.
     spec:
-      terminationGracePeriodSeconds: 35
+      serviceAccountName: llm-api-gateway
+      automountServiceAccountToken: false
+      # Must stay >= the app's shutdown drain window so in-flight requests and
+      # the readiness flip can complete before SIGKILL.
+      terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -31,10 +33,24 @@ spec:
         fsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: llm-api-gateway
       containers:
         - name: gateway
+          # TODO(supply-chain): pin by digest, e.g.
+          #   image: ghcr.io/fcordero/llm-api-gateway@sha256:<digest>
           image: llm-api-gateway:latest
           imagePullPolicy: IfNotPresent
+          # The ConfigMap is mounted as a directory (no subPath) so the file
+          # watcher can reload it in place. Rollout is not required for config
+          # edits; secret changes still require a pod restart.
+          command: ["./gateway"]
+          args: ["-config", "/app/config/config.yaml"]
           ports:
             - name: http
               containerPort: 8080
@@ -85,8 +101,7 @@ spec:
               value: "otlp"
           volumeMounts:
             - name: config
-              mountPath: /app/config.yaml
-              subPath: config.yaml
+              mountPath: /app/config
               readOnly: true
             - name: tmp
               mountPath: /tmp
@@ -112,7 +127,7 @@ spec:
             successThreshold: 1
           startupProbe:
             httpGet:
-              path: /health
+              path: /livez
               port: 8080
             initialDelaySeconds: 5
             periodSeconds: 5

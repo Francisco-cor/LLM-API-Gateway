@@ -1,11 +1,19 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
+  - serviceaccount.yaml
   - deployment.yaml
   - service.yaml
   - hpa.yaml
   - pdb.yaml
   - servicemonitor.yaml
+  - networkpolicy.yaml
   - configmap.yaml
-commonLabels:
-  app: llm-api-gateway
+  # Example placeholder secret; the Deployment consumes `llm-gateway-secrets`,
+  # which must be created from a real (git-ignored) secret.yaml.
+  - secret.example.yaml
+labels:
+  - pairs:
+      app: llm-api-gateway
+    includeSelectors: true
+    includeTemplates: true

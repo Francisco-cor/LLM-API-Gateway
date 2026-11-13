@@ -5,6 +5,8 @@ metadata:
   labels:
     app: llm-api-gateway
 spec:
+  # Coherent with HPA minReplicas=3: at least one pod can always be evicted
+  # while two remain serving.
   minAvailable: 2
   selector:
     matchLabels:

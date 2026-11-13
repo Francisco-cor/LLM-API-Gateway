@@ -1,0 +1,93 @@
+# Default-deny for the whole namespace. This assumes the gateway owns a
+# dedicated namespace; if that is not true, scope the podSelector instead.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: llm-api-gateway-default-deny
+  labels:
+    app: llm-api-gateway
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: llm-api-gateway
+  labels:
+    app: llm-api-gateway
+spec:
+  podSelector:
+    matchLabels:
+      app: llm-api-gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Public data plane: only the ingress controller may reach 8080.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Metrics: Prometheus scrapes /metrics on the same data-plane port.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8080
+    # Admin control plane: only the operations namespace/label.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              llm-gateway.io/role: operations
+      ports:
+        - protocol: TCP
+          port: 8081
+  # NOTE: kubelet probes are host traffic. Most CNIs (Calico, Cilium) exempt
+  # them from pod ingress policies; if yours does not, add an ipBlock for the
+  # node CIDR on ports 8080/8081 or probes will fail under default-deny.
+  egress:
+    # DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Redis (rate limit / budget / cache).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: data
+      ports:
+        - protocol: TCP
+          port: 6379
+    # Upstream provider APIs (OpenAI, Anthropic, Gemini, ...).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+    # OTLP gRPC to the tracing collector.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - protocol: TCP
+          port: 4317

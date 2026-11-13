@@ -1,9 +1,14 @@
+# Two profiles:
+#   dev (default): docker compose up            -> gateway (auth per config.yaml, admin on 8081)
+#   prod:          docker compose --profile prod up gateway-prod
+#                  (starts only gateway-prod plus its deps; requires the
+#                   variables below and never publishes admin/pprof)
 services:
   gateway:
     build: .
     ports:
       - "8080:8080"
-      - "8081:8081" # admin
+      - "8081:8081" # admin API: dev only, keep it off public interfaces in prod
     environment:
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
@@ -16,9 +21,10 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml:ro
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
       interval: 30s
       timeout: 5s
+      start_period: 10s
       retries: 3
     restart: unless-stopped
     depends_on:
@@ -26,6 +32,48 @@ services:
         condition: service_healthy
       prometheus:
         condition: service_started
+      jaeger:
+        condition: service_started
+
+  gateway-prod:
+    profiles: ["prod"]
+    build: .
+    ports:
+      - "8080:8080" # public data plane only; admin/pprof stay unexposed
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:?OPENAI_API_KEY is required}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is required}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:?GEMINI_API_KEY is required}
+      - GATEWAY_API_KEY=${GATEWAY_API_KEY:?GATEWAY_API_KEY is required}
+      - ADMIN_API_KEY=${ADMIN_API_KEY:?ADMIN_API_KEY is required}
+      - REDIS_URL=redis://redis:6379/0
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+      - OTEL_TRACES_EXPORTER=otlp
+    volumes:
+      # Overrides the config baked into the image; config.prod.yaml fails
+      # validation instead of silently running without auth.
+      - ./config.prod.yaml:/app/config.yaml:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/readyz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
       jaeger:
         condition: service_started
 
@@ -40,6 +88,7 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
+      start_period: 5s
       retries: 5
 
   prometheus:
