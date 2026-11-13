@@ -7,11 +7,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/fcordero/llm-api-gateway/internal/budget"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/proxy"
+	"github.com/fcordero/llm-api-gateway/internal/ratelimit"
 )
 
 func discardLogger() *slog.Logger {
@@ -46,6 +48,32 @@ func TestHandler_BudgetReservationBlocksConcurrentQuotaOverrun(t *testing.T) {
 	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("third request got %d, want 429: %s", w.Code, w.Body.String())
+	}
+}
+
+// A large prompt must pass token-aware limiting when the token bucket is sized
+// in tokens, not in request burst units.
+func TestHandler_TokenAwareAllowsLargePrompt(t *testing.T) {
+	registry := proxy.NewRegistry([]provider.Provider{
+		&mockProvider{name: "openai", models: []string{"gpt-4o"}, resp: provider.ChatResponse{ID: "x", Model: "gpt-4o"}},
+	})
+	limiter := ratelimit.New(60, 10)
+	defer limiter.Close()
+	handler := proxy.NewHandlerWithRateLimit(registry, []string{"openai"}, discardLogger(), limiter, nil, nil, true)
+	handler.SetTokenLimits(60000, 10000)
+
+	prompt := strings.Repeat("a", 2000) // ~500 tokens, far above request burst 10
+	body, _ := json.Marshal(map[string]any{
+		"model":    "gpt-4o",
+		"messages": []map[string]string{{"role": "user", "content": prompt}},
+	})
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("request %d got %d, want 200: %s", i+1, w.Code, w.Body.String())
+		}
 	}
 }
 

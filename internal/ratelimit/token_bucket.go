@@ -2,6 +2,8 @@ package ratelimit
 
 import (
 	"hash/fnv"
+	"math"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -89,6 +91,7 @@ func (l *Limiter) AllowWithLimits(key string, n, requestsPerMinute, burst int) b
 	}
 	rate := float64(requestsPerMinute) / 60.0
 	maxTokens := float64(burst)
+	key = limitKey(key, requestsPerMinute, burst)
 	sh := l.shardFor(key)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -117,7 +120,7 @@ func (l *Limiter) UpdateLimits(requestsPerMinute, burst int) {
 func (l *Limiter) GetLimits() (int, int) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
-	return int(l.rate * 60), int(l.burst)
+	return int(math.Round(l.rate * 60)), int(math.Round(l.burst))
 }
 
 // SetBurstForTesting allows tests to set burst directly.
@@ -139,11 +142,12 @@ func (l *Limiter) RetryAfterWithLimits(key string, requestsPerMinute, burst int)
 	if requestsPerMinute <= 0 || burst <= 0 {
 		return time.Second
 	}
-	sh := l.shardFor(key)
+	sh := l.shardFor(limitKey(key, requestsPerMinute, burst))
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 
 	rate := float64(requestsPerMinute) / 60.0
+	key = limitKey(key, requestsPerMinute, burst)
 	b := l.refillLocked(sh, key, rate, float64(burst))
 	if b.tokens >= 1 {
 		return 0
@@ -154,13 +158,15 @@ func (l *Limiter) RetryAfterWithLimits(key string, requestsPerMinute, burst int)
 
 // Tokens returns current available tokens (for testing/metrics).
 func (l *Limiter) Tokens(key string) float64 {
-	sh := l.shardFor(key)
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
 	l.mu.RLock()
 	rate := l.rate
 	burst := l.burst
+	rpm := int(math.Round(rate * 60))
 	l.mu.RUnlock()
+	key = limitKey(key, rpm, int(math.Round(burst)))
+	sh := l.shardFor(key)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
 	b := l.refillLocked(sh, key, rate, burst)
 	return b.tokens
 }
@@ -218,6 +224,13 @@ func (l *Limiter) cleanup() {
 		}
 		sh.mu.Unlock()
 	}
+}
+
+// limitKey fingerprints the effective limits into the bucket key. Without
+// this, changing a limit (hot reload, override, token budget) would reuse a
+// bucket sized for the old limit and reject valid traffic until it refills.
+func limitKey(key string, requestsPerMinute, burst int) string {
+	return key + "|" + strconv.Itoa(requestsPerMinute) + "|" + strconv.Itoa(burst)
 }
 
 // EstimateTokens estimates tokens for a ChatRequest (4 chars ~ 1 token).

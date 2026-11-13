@@ -36,6 +36,8 @@ type EmbeddingsHandler struct {
 	limiter       ratelimit.Backend
 	overrides     *ratelimit.OverrideStore
 	tokenAware    bool
+	tokenRPM      int
+	tokenBurst    int
 	retryCfg      resilience.RetryConfig
 	circuitCfg    resilience.CircuitConfig
 	circuits      map[string]*resilience.Breaker
@@ -101,6 +103,20 @@ func (h *EmbeddingsHandler) getFallbackChain() []string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	return append([]string(nil), h.fallbackChain...)
+}
+
+// SetTokenLimits updates the token-per-minute bucket for embeddings.
+func (h *EmbeddingsHandler) SetTokenLimits(tokensPerMinute, tokenBurst int) {
+	h.mu.Lock()
+	h.tokenRPM = tokensPerMinute
+	h.tokenBurst = tokenBurst
+	h.mu.Unlock()
+}
+
+func (h *EmbeddingsHandler) tokenLimits() (int, int) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.tokenRPM, h.tokenBurst
 }
 
 func (h *EmbeddingsHandler) SetTokenAware(enabled bool) {
@@ -233,13 +249,15 @@ func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		metrics.CacheHits.WithLabelValues("miss").Inc()
 	}
-	if h.limiter != nil && h.overrides != nil && h.tokenAwareEnabled() {
-		tenant := r.Header.Get("X-Tenant-ID")
-		rpm, burst := h.overrides.Resolve(tenant, req.Model)
+	if h.limiter != nil && h.tokenAwareEnabled() {
+		tokenRPM, tokenBurst := h.tokenLimits()
 		estTokens := ratelimit.EstimateTokens(embeddingInputChars(req.Input))
 		key := clientRateLimitKey(r) + ":tokens"
-		if !h.limiter.AllowWithLimits(key, estTokens, rpm, burst) {
-			retryAfter := h.limiter.RetryAfterWithLimits(key, rpm, burst)
+		if tokenRPM <= 0 || tokenBurst <= 0 {
+			estTokens = 0
+		}
+		if estTokens > 0 && !h.limiter.AllowWithLimits(key, estTokens, tokenRPM, tokenBurst) {
+			retryAfter := h.limiter.RetryAfterWithLimits(key, tokenRPM, tokenBurst)
 			seconds := int64(retryAfter / time.Second)
 			if seconds < 1 {
 				seconds = 1

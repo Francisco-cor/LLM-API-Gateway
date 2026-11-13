@@ -73,6 +73,8 @@ type RateLimitConfig struct {
 	Burst             int                 `yaml:"burst"`
 	RedisURL          string              `yaml:"redis_url"`
 	TokenAware        bool                `yaml:"token_aware"`
+	TokensPerMinute   int                 `yaml:"tokens_per_minute"`
+	TokenBurst        int                 `yaml:"token_burst"`
 	Overrides         []RateLimitOverride `yaml:"overrides"`
 	Budget            *BudgetConfig       `yaml:"budget"`
 }
@@ -227,6 +229,16 @@ func (c *Config) Validate() error {
 	}
 	if c.RateLimit.Enabled && c.RateLimit.Burst == 0 {
 		return fmt.Errorf("rate_limit.burst must be > 0 when enabled")
+	}
+	if c.RateLimit.Enabled && c.RateLimit.TokenAware {
+		if c.RateLimit.TokensPerMinute <= 0 {
+			return fmt.Errorf("rate_limit.tokens_per_minute must be > 0 when token_aware is enabled")
+		}
+		// A token bucket whose capacity is smaller than a normal prompt rejects
+		// every request forever. Require a floor large enough for real traffic.
+		if c.RateLimit.TokenBurst < 1024 {
+			return fmt.Errorf("rate_limit.token_burst must be >= 1024 when token_aware is enabled, got %d", c.RateLimit.TokenBurst)
+		}
 	}
 	for i, ov := range c.RateLimit.Overrides {
 		if ov.RPM < 0 || ov.Burst < 0 {
@@ -417,6 +429,22 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.RateLimit.Burst == 0 {
 		cfg.RateLimit.Burst = 10
+	}
+	if cfg.RateLimit.TokenAware {
+		if cfg.RateLimit.TokensPerMinute == 0 {
+			// Assume an average request of 1000 tokens so the default token
+			// budget stays proportional to the request limit.
+			cfg.RateLimit.TokensPerMinute = cfg.RateLimit.RequestsPerMinute * 1000
+			if cfg.RateLimit.TokensPerMinute < 10000 {
+				cfg.RateLimit.TokensPerMinute = 10000
+			}
+		}
+		if cfg.RateLimit.TokenBurst == 0 {
+			cfg.RateLimit.TokenBurst = cfg.RateLimit.TokensPerMinute / 10
+			if cfg.RateLimit.TokenBurst < 1024 {
+				cfg.RateLimit.TokenBurst = 1024
+			}
+		}
 	}
 	if cfg.RateLimit.Budget != nil && cfg.RateLimit.Budget.CostPerTokenUSD == 0 {
 		cfg.RateLimit.Budget.CostPerTokenUSD = 0.00001

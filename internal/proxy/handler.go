@@ -46,6 +46,8 @@ type Handler struct {
 	overrideStore *ratelimit.OverrideStore
 	budgetMgr     *budget.Manager
 	tokenAware    bool
+	tokenRPM      int
+	tokenBurst    int
 	cache         cache.Cache
 	cacheTTL      time.Duration
 }
@@ -75,6 +77,13 @@ func NewHandlerWithBudget(registry *Registry, fallbackChain []string, log *slog.
 // NewHandlerWithResilienceAndBudget extends NewHandlerWithResilience with Fase 6 budget and token-aware rate limit.
 func NewHandlerWithResilienceAndBudget(registry *Registry, fallbackChain []string, log *slog.Logger, retryCfg resilience.RetryConfig, circuitCfg resilience.CircuitConfig, hedge hedgeConfig, limiter ratelimit.Backend, overrides *ratelimit.OverrideStore, budgetMgr *budget.Manager, tokenAware bool) *Handler {
 	return NewHandlerWithCache(registry, fallbackChain, log, retryCfg, circuitCfg, hedge, limiter, overrides, budgetMgr, tokenAware, nil, 0)
+}
+
+// NewHandlerWithRateLimit creates a handler with a rate-limit backend and
+// token-aware budgeting. It keeps the internal hedge type private while
+// giving tests and embedders a way to exercise token limiting.
+func NewHandlerWithRateLimit(registry *Registry, fallbackChain []string, log *slog.Logger, limiter ratelimit.Backend, overrides *ratelimit.OverrideStore, budgetMgr *budget.Manager, tokenAware bool) *Handler {
+	return NewHandlerWithResilienceAndBudget(registry, fallbackChain, log, resilience.DefaultRetryConfig(), resilience.DefaultCircuitConfig(), hedgeConfig{}, limiter, overrides, budgetMgr, tokenAware)
 }
 
 // NewHandlerWithCache extends with Fase 7 cache support.
@@ -107,6 +116,16 @@ func NewHandlerWithCache(registry *Registry, fallbackChain []string, log *slog.L
 func (h *Handler) SetFallbackChain(chain []string) {
 	h.mu.Lock()
 	h.fallbackChain = append([]string(nil), chain...)
+	h.mu.Unlock()
+}
+
+// SetTokenLimits updates the token-per-minute bucket used by token-aware
+// limiting. Request RPM and token budgets are different units and must not
+// share the request burst capacity.
+func (h *Handler) SetTokenLimits(tokensPerMinute, tokenBurst int) {
+	h.mu.Lock()
+	h.tokenRPM = tokensPerMinute
+	h.tokenBurst = tokenBurst
 	h.mu.Unlock()
 }
 
@@ -166,6 +185,12 @@ func (h *Handler) SetCacheTTL(ttl time.Duration) {
 }
 
 // getFallbackChain returns a copy under RLock.
+func (h *Handler) tokenLimits() (int, int) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.tokenRPM, h.tokenBurst
+}
+
 func (h *Handler) getFallbackChain() []string {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -249,18 +274,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	tenant := r.Header.Get("X-Tenant-ID")
 	ctx := r.Context()
 
-	// Fase 6: per-tenant/model token override.
-	if h.overrideStore != nil && h.limiter != nil {
-		rpm, burst := h.overrideStore.Resolve(tenant, req.Model)
-		if h.tokenAwareEnabled() {
-			chars := 0
-			for _, m := range req.Messages {
-				chars += len(m.Text())
-			}
-			estTokens := ratelimit.EstimateTokens(chars)
-			key := clientRateLimitKey(r)
-			if !h.limiter.AllowWithLimits(key+":tokens", estTokens, rpm, burst) {
-				retryAfter := h.limiter.RetryAfterWithLimits(key+":tokens", rpm, burst)
+	// Token budget: tokens per minute, with a bucket sized in tokens. This is
+	// deliberately independent from the request bucket (whose capacity is a
+	// number of requests, not tokens).
+	if h.limiter != nil && h.tokenAwareEnabled() {
+		tokenRPM, tokenBurst := h.tokenLimits()
+		estTokens := chatPromptTokens(req)
+		if tokenRPM > 0 && tokenBurst > 0 {
+			key := clientRateLimitKey(r) + ":tokens"
+			if !h.limiter.AllowWithLimits(key, estTokens, tokenRPM, tokenBurst) {
+				retryAfter := h.limiter.RetryAfterWithLimits(key, tokenRPM, tokenBurst)
 				seconds := int64(retryAfter / time.Second)
 				if seconds < 1 {
 					seconds = 1
@@ -453,6 +476,11 @@ func chatPromptTokens(req provider.ChatRequest) int {
 	chars := 0
 	for _, message := range req.Messages {
 		chars += len(message.Text())
+	}
+	if len(req.Tools) > 0 {
+		if data, err := json.Marshal(req.Tools); err == nil {
+			chars += len(data)
+		}
 	}
 	return ratelimit.EstimateTokens(chars)
 }

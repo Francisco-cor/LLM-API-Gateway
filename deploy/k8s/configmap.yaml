@@ -32,6 +32,8 @@ data:
       requests_per_minute: 600
       burst: 100
       token_aware: true
+      tokens_per_minute: 60000
+      token_burst: 10000
       budget:
         enabled: true
         monthly_tokens: 1000000

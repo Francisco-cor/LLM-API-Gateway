@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fcordero/llm-api-gateway/internal/auth"
 	"github.com/fcordero/llm-api-gateway/internal/metrics"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/ratelimit"
@@ -267,6 +268,7 @@ func RateLimitWithEnabled(limiter ratelimit.Backend, overrides *ratelimit.Overri
 		}
 		key := clientRateLimitKey(r)
 		rpm, burst := 0, 0
+		scope := ""
 		if overrides != nil && r.Method == http.MethodPost && (r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/embeddings") {
 			body, err := io.ReadAll(io.LimitReader(r.Body, maxBodySize+1))
 			r.Body = io.NopCloser(bytes.NewReader(body))
@@ -275,10 +277,18 @@ func RateLimitWithEnabled(limiter ratelimit.Backend, overrides *ratelimit.Overri
 					Model string `json:"model"`
 				}
 				if json.Unmarshal(body, &meta) == nil && meta.Model != "" {
-					rpm, burst = overrides.Resolve(r.Header.Get("X-Tenant-ID"), meta.Model)
+					var matched bool
+					rpm, burst, matched = overrides.ResolveScoped(r.Header.Get("X-Tenant-ID"), meta.Model)
+					if matched {
+						// Each override gets its own bucket. Otherwise a call to a
+						// model with a high RPM limit would refill the shared bucket
+						// and silently raise the limit of every other model.
+						scope = ":model:" + meta.Model
+					}
 				}
 			}
 		}
+		key += scope
 
 		var allowed bool
 		var retryAfter time.Duration
@@ -295,6 +305,8 @@ func RateLimitWithEnabled(limiter ratelimit.Backend, overrides *ratelimit.Overri
 				seconds = 1
 			}
 			w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+			w.Header().Set("X-RateLimit-Limit", strconv.Itoa(rpm))
+			w.Header().Set("X-RateLimit-Remaining", "0")
 			writeError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "rate limit exceeded, retry later")
 			return
 		}
@@ -320,15 +332,27 @@ func metricPath(path string) string {
 // map or Redis key. This preserves per-client isolation without retaining raw
 // bearer tokens in process memory or external storage.
 func clientRateLimitKey(r *http.Request) string {
-	identity := r.Header.Get("X-Tenant-ID")
+	// The authenticated tenant is authoritative. Without auth the gateway is
+	// running in open/dev mode, so X-Tenant-ID is attacker-controlled and must
+	// not be allowed to mint a fresh bucket per request.
+	identity := auth.TenantFromContext(r.Context())
 	if identity == "" {
 		identity = r.Header.Get("Authorization")
 	}
 	if identity == "" {
-		identity = r.RemoteAddr
+		identity = remoteHost(r.RemoteAddr)
 	}
 	sum := sha256.Sum256([]byte(identity))
 	return "client:" + hex.EncodeToString(sum[:])
+}
+
+// remoteHost strips the ephemeral port so reconnecting clients keep the same
+// rate-limit bucket.
+func remoteHost(remoteAddr string) string {
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
 }
 
 func generateRequestID() string {

@@ -3,6 +3,7 @@ package ratelimit
 import (
 	"context"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,7 +29,8 @@ var luaScript = redis.NewScript(`
 local key = KEYS[1]
 local rate = tonumber(ARGV[1])
 local burst = tonumber(ARGV[2])
-local now = tonumber(ARGV[3])
+local t = redis.call("TIME")
+local now = tonumber(t[1]) + tonumber(t[2]) / 1000000
 local ttl = tonumber(ARGV[4])
 local requested = tonumber(ARGV[5]) or 1
 
@@ -87,8 +89,8 @@ func (r *RedisLimiter) Allow(key string) bool {
 
 func (r *RedisLimiter) AllowN(key string, n int) bool {
 	r.mu.RLock()
-	rpm := int(r.rate * 60)
-	burst := int(r.burst)
+	rpm := int(math.Round(r.rate * 60))
+	burst := int(math.Round(r.burst))
 	r.mu.RUnlock()
 	return r.AllowWithLimits(key, n, rpm, burst)
 }
@@ -112,7 +114,7 @@ func (r *RedisLimiter) AllowWithLimits(key string, n, requestsPerMinute, burst i
 	} else {
 		err = r.store.WithClient(func(client *redis.Client) error {
 			var err error
-			res, err = r.script.Run(ctx, client, []string{"ratelimit:" + key}, rate, float64(burst), float64(time.Now().UnixNano())/1e9, 600, n).Result()
+			res, err = r.script.Run(ctx, client, []string{"ratelimit:" + limitKey(key, requestsPerMinute, burst)}, rate, float64(burst), float64(time.Now().UnixNano())/1e9, 600, n).Result()
 			return err
 		})
 	}
@@ -148,8 +150,8 @@ func NewRedisWithStore(store redisstore.Store, requestsPerMinute, burst int) *Re
 // RetryAfter approximates; Redis Lua returns tokens, but we estimate 1/rate.
 func (r *RedisLimiter) RetryAfter(key string) time.Duration {
 	r.mu.RLock()
-	rpm := int(r.rate * 60)
-	burst := int(r.burst)
+	rpm := int(math.Round(r.rate * 60))
+	burst := int(math.Round(r.burst))
 	r.mu.RUnlock()
 	return r.RetryAfterWithLimits(key, rpm, burst)
 }
