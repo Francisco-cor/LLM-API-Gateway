@@ -4,6 +4,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/fcordero/llm-api-gateway/internal/budget"
 )
@@ -78,5 +79,38 @@ func TestBudget_Disabled(t *testing.T) {
 	mgr.Record("tenant-x", 1000000, 1000000)
 	if err := mgr.Check("tenant-x"); err != nil {
 		t.Fatalf("disabled budget should never block, got %v", err)
+	}
+}
+
+// TestBudget_FallbackUsesPerTokenUnits guards cost_per_token_usd against being
+// interpreted as USD per million tokens.
+func TestBudget_FallbackUsesPerTokenUnits(t *testing.T) {
+	mgr := budget.NewWithCost(0, 0, 0.00001, nil)
+	estimate, err := mgr.EstimateChat("unknown-model", 1_000_000, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if estimate.USD != 10 {
+		t.Fatalf("1M fallback tokens = %v USD, want 10", estimate.USD)
+	}
+}
+
+// TestBudget_AbandonedReservationLease ensures a lost Commit cannot burn the
+// monthly quota: the lease expires and the capacity is reusable.
+func TestBudget_AbandonedReservationLease(t *testing.T) {
+	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	mgr := budget.NewConfiguredWithStoreOptions(true, 100, 0, 0, nil, budget.Options{
+		ReservationTTL: time.Minute,
+		Now:            func() time.Time { return now },
+	})
+	if _, err := mgr.Reserve("tenant", 100, 0); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(2 * time.Minute)
+	if _, err := mgr.Reserve("tenant", 100, 0); err != nil {
+		t.Fatalf("expired reservation must release quota: %v", err)
+	}
+	if metrics := mgr.MetricsSnapshot(); metrics.ExpiredReservations == 0 {
+		t.Fatal("expired reservation should be observable")
 	}
 }
