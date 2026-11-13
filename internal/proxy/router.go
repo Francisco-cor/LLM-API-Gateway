@@ -26,15 +26,26 @@ type Registry struct {
 	aliases map[string][]string
 
 	// extended routing
-	weighted map[string][]weightedEntry
-	patterns []patternEntry
-	randMu   sync.Mutex
-	rnd      *rand.Rand
+	weighted        map[string][]weightedEntry
+	weightedPattern []weightedPatternEntry
+	patterns        []patternEntry
+	randMu          sync.Mutex
+	rnd             *rand.Rand
 }
 
 type weightedEntry struct {
 	provider provider.Provider
 	weight   int
+}
+
+// weightedPatternEntry is a precompiled weighted key that is a glob or regex.
+// Compiling it once at construction keeps Resolve out of regexp.Compile on the
+// hot path (previously every request recompiled every weighted pattern key).
+type weightedPatternEntry struct {
+	key     string
+	regex   *regexp.Regexp
+	isRegex bool
+	entries []weightedEntry
 }
 
 type patternEntry struct {
@@ -98,6 +109,7 @@ func NewRegistryWithWeighted(providers []provider.Provider, aliases map[string][
 			r.weighted[model] = we
 		}
 	}
+	r.weightedPattern = compileWeightedPatterns(r.weighted)
 	return r
 }
 
@@ -114,6 +126,27 @@ func (w WeightedConfig) ProviderName() string {
 		return w.Provider
 	}
 	return w.Name
+}
+
+// compileWeightedPatterns precompiles weighted keys that are globs or regexes
+// and orders them so the most specific pattern is tried first. Ties use lexical
+// order to stay deterministic across map iteration.
+func compileWeightedPatterns(weighted map[string][]weightedEntry) []weightedPatternEntry {
+	var out []weightedPatternEntry
+	for key, entries := range weighted {
+		if !isPattern(key) {
+			continue
+		}
+		re, isRegex := compilePattern(key)
+		out = append(out, weightedPatternEntry{key: key, regex: re, isRegex: isRegex, entries: entries})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if len(out[i].key) != len(out[j].key) {
+			return len(out[i].key) > len(out[j].key)
+		}
+		return out[i].key < out[j].key
+	})
+	return out
 }
 
 // SetRandSeed allows main.go to seed the registry's RNG with time.Now for production.
@@ -180,28 +213,14 @@ func (r *Registry) Resolve(model string) (provider.Provider, error) {
 		return p, nil
 	}
 	// 3. weighted pattern keys: check if any weighted key is a pattern matching model
-	weightedKeys := make([]string, 0, len(r.weighted))
-	for key := range r.weighted {
-		if isPattern(key) {
-			weightedKeys = append(weightedKeys, key)
+	for _, wp := range r.weightedPattern {
+		if wp.regex != nil && wp.regex.MatchString(model) {
+			return r.pickWeighted(wp.entries), nil
 		}
-	}
-	sort.Slice(weightedKeys, func(i, j int) bool {
-		// More specific patterns win before broad catch-alls; lexical order
-		// makes ties deterministic across map iterations.
-		if len(weightedKeys[i]) != len(weightedKeys[j]) {
-			return len(weightedKeys[i]) > len(weightedKeys[j])
-		}
-		return weightedKeys[i] < weightedKeys[j]
-	})
-	for _, key := range weightedKeys {
-		we := r.weighted[key]
-		re, _ := compilePattern(key)
-		if re != nil && re.MatchString(model) {
-			return r.pickWeighted(we), nil
-		}
-		if matched, _ := path.Match(key, model); matched {
-			return r.pickWeighted(we), nil
+		if !wp.isRegex {
+			if matched, _ := path.Match(wp.key, model); matched {
+				return r.pickWeighted(wp.entries), nil
+			}
 		}
 	}
 	// 4. pattern match
@@ -284,6 +303,7 @@ func (r *Registry) Reload(providers []provider.Provider, aliases map[string][]st
 	r.order = newR.order
 	r.aliases = newR.aliases
 	r.weighted = newR.weighted
+	r.weightedPattern = newR.weightedPattern
 	r.patterns = newR.patterns
 }
 
