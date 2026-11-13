@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,5 +108,65 @@ func TestAnthropicStreamPreservesToolCallDeltas(t *testing.T) {
 	}
 	if got[1].Choices[0].Delta.ToolCalls[0].Function.Arguments != `{"q":` || got[2].Choices[0].Delta.ToolCalls[0].Function.Arguments != `x"}` {
 		t.Fatalf("tool argument deltas = %+v, %+v", got[1], got[2])
+	}
+}
+
+func TestStreamTruncationIsReportedForAllProviders(t *testing.T) {
+	cases := []struct {
+		name  string
+		body  string
+		build func(baseURL string) provider.Provider
+	}{
+		{
+			name: "openai",
+			body: "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+			build: func(baseURL string) provider.Provider {
+				return provider.NewOpenAI("test-key", baseURL, time.Second, []string{"gpt-test"})
+			},
+		},
+		{
+			name: "anthropic",
+			body: "event: content_block_delta\ndata: {\"delta\":{\"text\":\"hi\"}}\n\n",
+			build: func(baseURL string) provider.Provider {
+				return provider.NewAnthropic("test-key", baseURL, time.Second, []string{"claude-test"})
+			},
+		},
+		{
+			name: "gemini",
+			body: "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}}]}\n\n",
+			build: func(baseURL string) provider.Provider {
+				return provider.NewGemini("test-key", baseURL, time.Second, []string{"gemini-test"})
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			model := tc.name + "-test"
+			p := tc.build(srv.URL)
+			chunks, errs := p.SendStream(context.Background(), provider.ChatRequest{
+				Model:    model,
+				Messages: []provider.ChatMessage{{Role: "user", Content: "hi"}},
+			})
+			for range chunks {
+			}
+			var got error
+			for err := range errs {
+				if err != nil {
+					got = err
+				}
+			}
+			if got == nil || !strings.Contains(got.Error(), "upstream stream truncated") {
+				t.Fatalf("error = %v, want upstream stream truncated", got)
+			}
+			if provider.IsRetryable(got) {
+				t.Fatal("truncated stream must not be retryable")
+			}
+		})
 	}
 }

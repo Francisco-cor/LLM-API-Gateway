@@ -1,10 +1,10 @@
 package provider
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,18 +16,23 @@ import (
 // gateway's unified format is already OpenAI-compatible, no translation is
 // required for this provider.
 type OpenAI struct {
-	apiKey  string
-	baseURL string
-	models  []string
-	client  *http.Client
+	apiKey       string
+	baseURL      string
+	baseErr      error
+	models       []string
+	client       *http.Client
+	streamClient *http.Client
 }
 
 func NewOpenAI(apiKey, baseURL string, timeout time.Duration, models []string) *OpenAI {
+	base, baseErr := normalizeBaseURL(baseURL)
 	return &OpenAI{
-		apiKey:  apiKey,
-		baseURL: baseURL,
-		models:  models,
-		client:  newHTTPClient(timeout),
+		apiKey:       apiKey,
+		baseURL:      base,
+		baseErr:      baseErr,
+		models:       models,
+		client:       newHTTPClient(timeout),
+		streamClient: newStreamHTTPClient(),
 	}
 }
 
@@ -38,6 +43,9 @@ func (o *OpenAI) Models() []string { return o.models }
 func (o *OpenAI) SetModels(models []string) { o.models = models }
 
 func (o *OpenAI) Send(ctx context.Context, req ChatRequest) (ChatResponse, error) {
+	if o.baseErr != nil {
+		return ChatResponse{}, o.baseErr
+	}
 	body, err := marshalJSON(req)
 	if err != nil {
 		return ChatResponse{}, fmt.Errorf("marshal request: %w", err)
@@ -90,6 +98,10 @@ func (o *OpenAI) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 		defer close(ch)
 		defer close(errCh)
 
+		if o.baseErr != nil {
+			errCh <- o.baseErr
+			return
+		}
 		req.Stream = true
 		body, err := marshalJSON(req)
 		if err != nil {
@@ -105,7 +117,7 @@ func (o *OpenAI) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 		httpReq.Header.Set("Content-Type", "application/json")
 		httpReq.Header.Set("Accept", "text/event-stream")
 
-		resp, err := o.client.Do(httpReq)
+		resp, err := o.streamClient.Do(httpReq)
 		if err != nil {
 			errCh <- &ProviderError{ProviderName: o.Name(), Message: err.Error(), Retryable: true}
 			return
@@ -124,26 +136,48 @@ func (o *OpenAI) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 			return
 		}
 
-		scanner := bufio.NewScanner(resp.Body)
-		// increase buffer for large chunks
-		buf := make([]byte, 0, 4096)
-		scanner.Buffer(buf, 1<<20)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
+		reader := newSSEReader(resp.Body)
+		sawDone := false
+		for {
+			event, err := reader.Next()
+			if err != nil {
+				if ctx.Err() != nil {
+					errCh <- ctx.Err()
+					return
+				}
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				if errors.Is(err, errSSEEventTooLarge) {
+					errCh <- sseEventTooLargeError(o.Name())
+					return
+				}
+				errCh <- &ProviderError{ProviderName: o.Name(), Message: err.Error(), Retryable: false}
+				return
+			}
+			payload := strings.TrimSpace(event.Data)
+			if payload == "" {
 				continue
 			}
-			if !strings.HasPrefix(line, "data:") {
-				continue
-			}
-			payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 			if payload == "[DONE]" {
+				sawDone = true
+				break
+			}
+			if providerErr := providerStreamError(o.Name(), []byte(payload)); providerErr != nil {
+				errCh <- providerErr
 				return
 			}
 			var chunk StreamChunk
 			if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-				// skip malformed chunk, log via errCh but continue
-				continue
+				errCh <- &ProviderError{
+					ProviderName: o.Name(),
+					Message:      "invalid upstream stream chunk: " + err.Error(),
+					Retryable:    false,
+				}
+				return
+			}
+			if chunk.Choices == nil {
+				chunk.Choices = []StreamChoice{}
 			}
 			select {
 			case ch <- chunk:
@@ -152,8 +186,8 @@ func (o *OpenAI) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 				return
 			}
 		}
-		if err := scanner.Err(); err != nil && err != io.EOF {
-			errCh <- err
+		if !sawDone {
+			errCh <- streamTruncatedError(o.Name())
 		}
 	}()
 
@@ -161,6 +195,9 @@ func (o *OpenAI) SendStream(ctx context.Context, req ChatRequest) (<-chan Stream
 }
 
 func (o *OpenAI) HealthCheck(ctx context.Context) error {
+	if o.baseErr != nil {
+		return o.baseErr
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, o.baseURL+"/models", nil)
 	if err != nil {
 		return err
@@ -180,6 +217,9 @@ func (o *OpenAI) HealthCheck(ctx context.Context) error {
 }
 
 func (o *OpenAI) Embed(ctx context.Context, req EmbeddingRequest) (EmbeddingResponse, error) {
+	if o.baseErr != nil {
+		return EmbeddingResponse{}, o.baseErr
+	}
 	body, err := marshalJSON(req)
 	if err != nil {
 		return EmbeddingResponse{}, fmt.Errorf("marshal request: %w", err)
@@ -217,6 +257,9 @@ func (o *OpenAI) Embed(ctx context.Context, req EmbeddingRequest) (EmbeddingResp
 
 // DiscoverModels fetches available models from OpenAI /v1/models.
 func (o *OpenAI) DiscoverModels(ctx context.Context) ([]string, error) {
+	if o.baseErr != nil {
+		return nil, o.baseErr
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, o.baseURL+"/models", nil)
 	if err != nil {
 		return nil, err

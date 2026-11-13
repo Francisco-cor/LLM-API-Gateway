@@ -29,8 +29,15 @@ var sharedTransport = &http.Transport{
 	ForceAttemptHTTP2:     true,
 }
 
-// newHTTPClient returns an *http.Client that reuses sharedTransport but respects
-// per-provider timeout (config.providers.<name>.timeout).
+// sharedStreamTransport has no overall client timeout: http.Client.Timeout
+// includes body reads, which would cut long generations mid-stream. Header
+// timeouts still fail fast, and the per-request context carries cancellation.
+var sharedStreamTransport = func() *http.Transport {
+	transport := sharedTransport.Clone()
+	transport.ResponseHeaderTimeout = 15 * time.Second
+	return transport
+}()
+
 func newHTTPClient(timeout time.Duration) *http.Client {
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -38,6 +45,13 @@ func newHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout:   timeout,
 		Transport: sharedTransport,
+	}
+}
+
+func newStreamHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout:   0,
+		Transport: sharedStreamTransport,
 	}
 }
 
