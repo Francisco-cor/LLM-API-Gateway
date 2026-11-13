@@ -88,17 +88,25 @@ rate_limit:
     monthly_tokens: 1000000
     monthly_usd: 100.0
     cost_per_token_usd: 0.00001
+    # Fail closed when Redis is configured but unreachable instead of using
+    # per-process accounting (3 replicas would otherwise get 3x the quota).
+    require_shared_store: false
+    # Uncommitted reservations release their quota after this lease.
+    reservation_ttl: 10m
     pricing:
       currency: USD
       version: "2026-09"
       unknown_model_policy: fallback
       catalog:
         # Rates are USD per 1M tokens. Keep this list versioned with the
-        # provider price snapshot used by finance/operations.
+        # provider price snapshot used by finance/operations. Optional
+        # cache_read/cache_write rates price prompt-cache hits and writes.
         - provider: openai
           model: gpt-4o
           input_per_million_tokens_usd: 5.0
           output_per_million_tokens_usd: 15.0
+          # cache_read_per_million_tokens_usd: 2.5
+          # cache_write_per_million_tokens_usd: 3.75
         - provider: openai
           model: text-embedding-3-small
           embedding_per_million_tokens_usd: 0.02
@@ -124,6 +132,11 @@ cache:
   enabled: false
   ttl: 5m
   max_size: 1000
+  # Byte budget for in-memory entries (0 uses the 64 MiB default). An
+  # individual response larger than this is not cached.
+  max_bytes: 67108864
+  # Upper bound for X-Cache-TTL (0 disables the cap).
+  max_ttl: 1h
   semantic_enabled: false
   semantic_threshold: 0.97
   # Semantic mode requires an embedding-capable configured provider.
