@@ -80,4 +80,7 @@ data:
       format: json
     admin:
       port: 8081
+      bind_address: 0.0.0.0
       api_key: ${ADMIN_API_KEY}
+      allow_insecure: false
+      pprof_enabled: false

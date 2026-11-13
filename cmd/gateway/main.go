@@ -267,37 +267,27 @@ func main() {
 		return nil
 	}
 
-	// admin server (Fase 9) on :8081
-	adminAddr := fmt.Sprintf(":%d", cfg.Admin.Port)
+	// admin server (Fase 9) on the configured admin bind address (loopback by default)
 	adminAPIKey := cfg.Admin.APIKey
 	if adminAPIKey == "" {
 		adminAPIKey = os.Getenv("ADMIN_API_KEY")
 	}
+	if cfg.Admin.AllowInsecure {
+		log.Warn("admin API running without authentication (admin.allow_insecure=true); bind is restricted to localhost", "addr", cfg.Admin.BindAddress)
+	}
 	adminSrv = admin.New(log, adminAPIKey, *configPath, currentCfg, registry, applyConfig, nil)
+	adminSrv.SetPprofEnabled(cfg.Admin.PprofEnabled)
+	adminSrv.SetRequireAuth(!cfg.Admin.AllowInsecure)
 	adminHTTP = &http.Server{
-		Addr:              adminAddr,
+		Addr:              fmt.Sprintf("%s:%d", cfg.Admin.BindAddress, cfg.Admin.Port),
 		Handler:           adminSrv.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
 	go func() {
-		log.Info("admin listening", "addr", adminHTTP.Addr)
+		log.Info("admin listening", "addr", adminHTTP.Addr, "pprof", cfg.Admin.PprofEnabled)
 		if err := adminHTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("admin server error", "error", err)
-		}
-	}()
-
-	// Fase 10: pprof server on :6060 behind same admin auth (exposed via admin Handler pprof routes)
-	pprofHTTP := &http.Server{
-		Addr:              ":6060",
-		Handler:           adminSrv.Handler(),
-		ReadHeaderTimeout: 5 * time.Second,
-		IdleTimeout:       60 * time.Second,
-	}
-	go func() {
-		log.Info("pprof listening", "addr", pprofHTTP.Addr)
-		if err := pprofHTTP.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Error("pprof server error", "error", err)
 		}
 	}()
 
@@ -360,7 +350,6 @@ func main() {
 		// shutdown admin and pprof first
 		ctxA, cancelA := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = adminHTTP.Shutdown(ctxA)
-		_ = pprofHTTP.Shutdown(ctxA)
 		cancelA()
 		watchCancel()
 		signal.Stop(hupCh)

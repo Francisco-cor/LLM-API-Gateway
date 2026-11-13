@@ -28,9 +28,11 @@ type Server struct {
 	apiKey     string
 	log        *slog.Logger
 
-	mu       sync.RWMutex
-	cfg      *config.Config
-	registry *proxy.Registry
+	mu           sync.RWMutex
+	cfg          *config.Config
+	registry     *proxy.Registry
+	pprofEnabled bool
+	requireAuth  bool
 
 	// apply is called after cfg has been validated and swapped under lock.
 	// It should apply live state (registry reload, limiter, breaker, etc.)
@@ -67,6 +69,23 @@ func New(log *slog.Logger, apiKey, configPath string, cfg *config.Config, regist
 	}
 }
 
+// SetPprofEnabled controls whether /debug/pprof routes are registered. They
+// are off by default: heap dumps contain provider API keys and prompt data.
+func (s *Server) SetPprofEnabled(enabled bool) {
+	s.mu.Lock()
+	s.pprofEnabled = enabled
+	s.mu.Unlock()
+}
+
+// SetRequireAuth forces authentication even when apiKey is empty. Production
+// wiring sets it so a missing key fails closed instead of exposing the
+// control plane. It is a no-op when an API key is configured.
+func (s *Server) SetRequireAuth(required bool) {
+	s.mu.Lock()
+	s.requireAuth = required
+	s.mu.Unlock()
+}
+
 // Handler returns the mux with auth middleware.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -79,22 +98,37 @@ func (s *Server) Handler() http.Handler {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	})
-	// Fase 10: pprof endpoints behind admin auth (on :8081 and :6060)
-	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
-	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
-	mux.Handle("GET /debug/pprof/heap", pprof.Handler("heap"))
-	mux.Handle("GET /debug/pprof/goroutine", pprof.Handler("goroutine"))
-	mux.Handle("GET /debug/pprof/threadcreate", pprof.Handler("threadcreate"))
-	mux.Handle("GET /debug/pprof/block", pprof.Handler("block"))
-	mux.Handle("GET /debug/pprof/mutex", pprof.Handler("mutex"))
+	s.mu.RLock()
+	pprofEnabled := s.pprofEnabled
+	requireAuth := s.requireAuth
+	s.mu.RUnlock()
+	if pprofEnabled {
+		mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+		mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+		mux.Handle("GET /debug/pprof/heap", pprof.Handler("heap"))
+		mux.Handle("GET /debug/pprof/goroutine", pprof.Handler("goroutine"))
+		mux.Handle("GET /debug/pprof/threadcreate", pprof.Handler("threadcreate"))
+		mux.Handle("GET /debug/pprof/block", pprof.Handler("block"))
+		mux.Handle("GET /debug/pprof/mutex", pprof.Handler("mutex"))
+	}
 	var h http.Handler = mux
-	if s.apiKey != "" && s.apiKey != "${ADMIN_API_KEY}" {
+	if s.apiKey != "" && !isUnresolvedPlaceholder(s.apiKey) {
 		h = s.authMiddleware(h)
+	} else if requireAuth {
+		h = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "admin api key is not configured"})
+		})
 	}
 	return h
+}
+
+func isUnresolvedPlaceholder(v string) bool {
+	return len(v) > 3 && v[:2] == "${" && v[len(v)-1] == '}'
 }
 
 func (s *Server) authMiddleware(next http.Handler) http.Handler {

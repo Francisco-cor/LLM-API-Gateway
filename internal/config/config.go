@@ -28,8 +28,11 @@ type Config struct {
 }
 
 type AdminConfig struct {
-	Port   int    `yaml:"port"`
-	APIKey string `yaml:"api_key"`
+	Port          int    `yaml:"port"`
+	BindAddress   string `yaml:"bind_address"`
+	APIKey        string `yaml:"api_key"`
+	AllowInsecure bool   `yaml:"allow_insecure"`
+	PprofEnabled  bool   `yaml:"pprof_enabled"`
 }
 
 type RoutingConfig struct {
@@ -373,7 +376,24 @@ func (c *Config) Validate() error {
 	if c.Admin.Port != 0 && (c.Admin.Port < 1 || c.Admin.Port > 65535) {
 		return fmt.Errorf("admin.port must be between 1 and 65535, got %d", c.Admin.Port)
 	}
+	if c.Admin.Port != 0 && c.Admin.Port == c.Server.Port {
+		return fmt.Errorf("admin.port must differ from server.port (both %d)", c.Admin.Port)
+	}
+	// The control plane can rewrite configuration and expose pprof. It must be
+	// fail-closed unless the operator explicitly opted into local development
+	// mode. Unexpanded ${VAR} placeholders count as missing secrets.
+	if !c.Admin.AllowInsecure {
+		if c.Admin.APIKey == "" || isUnresolvedPlaceholder(c.Admin.APIKey) {
+			return fmt.Errorf("admin.api_key is required unless admin.allow_insecure is true: set ADMIN_API_KEY or enable insecure local mode")
+		}
+	}
 	return nil
+}
+
+// isUnresolvedPlaceholder reports whether os.Expand left a ${VAR} reference,
+// which happens when the environment variable is not set.
+func isUnresolvedPlaceholder(v string) bool {
+	return len(v) > 3 && v[:2] == "${" && v[len(v)-1] == '}'
 }
 
 func setDefaults(cfg *Config) {
@@ -451,6 +471,10 @@ func setDefaults(cfg *Config) {
 	}
 	if cfg.Admin.Port == 0 {
 		cfg.Admin.Port = 8081
+	}
+	if cfg.Admin.BindAddress == "" {
+		// The admin surface must not be reachable from other hosts by default.
+		cfg.Admin.BindAddress = "127.0.0.1"
 	}
 	if cfg.Admin.APIKey == "" {
 		// allow env var ADMIN_API_KEY as fallback
