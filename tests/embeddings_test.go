@@ -229,3 +229,75 @@ func TestEmbeddings_GeminiTranslation(t *testing.T) {
 		t.Errorf("got %d embeddings want 2 for array input", len(got.Data))
 	}
 }
+
+// Embeddings share the chat error contract: caller errors stay 4xx, auth
+// failures become 502, and 429 carries a usable Retry-After.
+func TestEmbeddings_ErrorStatusMapping(t *testing.T) {
+	cases := []struct {
+		name      string
+		err       *provider.ProviderError
+		wantCode  int
+		wantRetry string
+	}{
+		{
+			name:     "413",
+			err:      &provider.ProviderError{ProviderName: "openai", StatusCode: http.StatusRequestEntityTooLarge, Message: "too big"},
+			wantCode: http.StatusRequestEntityTooLarge,
+		},
+		{
+			name:      "429 with Retry-After",
+			err:       &provider.ProviderError{ProviderName: "openai", StatusCode: http.StatusTooManyRequests, Message: "slow down", RetryAfter: 1500 * time.Millisecond},
+			wantCode:  http.StatusTooManyRequests,
+			wantRetry: "2",
+		},
+		{
+			name:     "401 becomes 502",
+			err:      &provider.ProviderError{ProviderName: "openai", StatusCode: http.StatusUnauthorized, Message: "bad key"},
+			wantCode: http.StatusBadGateway,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &mockProvider{name: "openai", models: []string{"text-embedding-3-small"}, embedErr: tc.err}
+			handler := proxy.NewEmbeddingsHandler(proxy.NewRegistry([]provider.Provider{p}), []string{"openai"}, discardLogger())
+			body := []byte(`{"model":"text-embedding-3-small","input":"hi"}`)
+			req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", bytes.NewReader(body))
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+
+			if w.Code != tc.wantCode {
+				t.Fatalf("status = %d, want %d body %s", w.Code, tc.wantCode, w.Body.String())
+			}
+			if tc.wantRetry != "" {
+				if got := w.Header().Get("Retry-After"); got != tc.wantRetry {
+					t.Fatalf("Retry-After = %q, want %q", got, tc.wantRetry)
+				}
+			}
+		})
+	}
+}
+
+// A degraded provider must not stop the request from being accounted for.
+func TestEmbeddings_UsageRecordedWithoutBudget(t *testing.T) {
+	resp := provider.EmbeddingResponse{
+		Object: "list",
+		Data:   []provider.EmbeddingData{{Object: "embedding", Index: 0, Embedding: []float32{0.1}}},
+		Model:  "text-embedding-3-small",
+		Usage:  provider.EmbeddingUsage{PromptTokens: 7, TotalTokens: 7},
+	}
+	p := &mockProvider{name: "openai", models: []string{"text-embedding-3-small"}, embedResp: resp}
+	handler := proxy.NewEmbeddingsHandler(proxy.NewRegistry([]provider.Provider{p}), []string{"openai"}, discardLogger())
+
+	body := []byte(`{"model":"text-embedding-3-small","input":"hi"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body %s", w.Code, w.Body.String())
+	}
+	if p.embedCount != 1 {
+		t.Fatalf("provider called %d times, want 1", p.embedCount)
+	}
+}

@@ -3,6 +3,7 @@ package tests
 import (
 	"context"
 	"errors"
+	"net/http"
 	"testing"
 	"time"
 
@@ -162,5 +163,116 @@ func TestHedge_FallbackErrorDoesNotMaskPrimary(t *testing.T) {
 	)
 	if err != nil || val != "primary" {
 		t.Fatalf("got value=%v err=%v, want primary success", val, err)
+	}
+}
+
+// Retry-After from the provider is a floor for the backoff delay.
+func TestRetry_HonorsRetryAfter(t *testing.T) {
+	cfg := resilience.RetryConfig{MaxAttempts: 2, BaseDelay: time.Millisecond, MaxDelay: time.Millisecond, Jitter: false}
+	attempts := 0
+	start := time.Now()
+	err := resilience.Do(context.Background(), cfg, provider.IsRetryable, func() error {
+		attempts++
+		return &provider.ProviderError{
+			ProviderName: "test",
+			StatusCode:   http.StatusTooManyRequests,
+			Message:      "slow down",
+			Retryable:    true,
+			RetryAfter:   120 * time.Millisecond,
+		}
+	})
+	elapsed := time.Since(start)
+	if err == nil || attempts != 2 {
+		t.Fatalf("attempts = %d err = %v, want 2 attempts and an error", attempts, err)
+	}
+	if elapsed < 120*time.Millisecond {
+		t.Fatalf("backoff %v ignored Retry-After (>=120ms required)", elapsed)
+	}
+}
+
+// A half-open permission that ends in cancellation or a client error must be
+// returned, not leaked; otherwise the breaker wedges in half-open forever.
+func TestCircuit_ReleaseReturnsHalfOpenPermission(t *testing.T) {
+	cfg := resilience.CircuitConfig{FailureThreshold: 1, OpenTimeout: 10 * time.Millisecond, HalfOpenMax: 1}
+	b := resilience.NewBreaker(cfg)
+	b.RecordFailure()
+	time.Sleep(15 * time.Millisecond)
+
+	if !b.Allow() {
+		t.Fatal("expected half-open probe permission")
+	}
+	b.RecordCancel()
+	if !b.Allow() {
+		t.Fatal("cancelled probe did not return its permission: breaker stuck half-open")
+	}
+	b.Release()
+	if !b.Allow() {
+		t.Fatal("released probe did not return its permission")
+	}
+	if b.StateReadOnly() != resilience.StateHalfOpen {
+		t.Fatalf("state = %s, want half-open", b.StateReadOnly())
+	}
+}
+
+// A grant that is never settled (abandoned request) must not wedge the breaker.
+func TestCircuit_HalfOpenPermissionExpires(t *testing.T) {
+	cfg := resilience.CircuitConfig{FailureThreshold: 1, OpenTimeout: 10 * time.Millisecond, HalfOpenMax: 1}
+	b := resilience.NewBreaker(cfg)
+	b.RecordFailure()
+	time.Sleep(15 * time.Millisecond)
+	if !b.Allow() {
+		t.Fatal("expected first half-open probe")
+	}
+	if b.Allow() {
+		t.Fatal("second concurrent probe must be rejected")
+	}
+	// The leaked permission expires with the open timeout.
+	time.Sleep(15 * time.Millisecond)
+	if !b.Allow() {
+		t.Fatal("abandoned half-open permission never expired")
+	}
+}
+
+// State scraping must not consume or open half-open probes.
+func TestCircuit_StateIsReadOnly(t *testing.T) {
+	cfg := resilience.CircuitConfig{FailureThreshold: 1, OpenTimeout: 20 * time.Millisecond, HalfOpenMax: 1}
+	b := resilience.NewBreaker(cfg)
+	b.RecordFailure()
+	time.Sleep(25 * time.Millisecond)
+
+	for i := 0; i < 3; i++ {
+		if got := b.StateReadOnly(); got != resilience.StateHalfOpen {
+			t.Fatalf("state = %s, want half-open", got)
+		}
+	}
+	if !b.Allow() {
+		t.Fatal("StateReadOnly consumed the half-open probe permission")
+	}
+	if b.Allow() {
+		t.Fatal("half-open max was not enforced after read-only scrapes")
+	}
+}
+
+// The winner must cancel the loser's branch context so a hedged provider call
+// stops doing billable work.
+func TestHedge_CancelsLoserContext(t *testing.T) {
+	loserCanceled := make(chan struct{})
+	val, err := resilience.DoHedgeContext(context.Background(), 5*time.Millisecond,
+		func(ctx context.Context) (any, error) {
+			<-ctx.Done()
+			close(loserCanceled)
+			return nil, ctx.Err()
+		},
+		func(ctx context.Context) (any, error) {
+			return "winner", nil
+		},
+	)
+	if err != nil || val != "winner" {
+		t.Fatalf("got value=%v err=%v, want winner", val, err)
+	}
+	select {
+	case <-loserCanceled:
+	case <-time.After(time.Second):
+		t.Fatal("losing hedge branch was not cancelled")
 	}
 }
