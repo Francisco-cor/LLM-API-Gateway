@@ -1,7 +1,7 @@
 # Architecture — LLM API Gateway
 
-> **Version:** 1.0 · **Date:** 2026-09-01 · **Stack:** Go 1.24 · `net/http` · `prometheus/client_golang` · `go-redis/v9` · `otel`  
-> This doc follows C4 model: Context → Container → Component → Code.
+> **Version:** 1.1 · **Date:** 2026-11-13 · **Stack:** Go 1.24, `net/http`, `prometheus/client_golang`, `go-redis/v9`, OpenTelemetry, `yaml.v3`
+> This doc follows C4: Context → Container → Component. It describes what the code does today, including its limits.
 
 ---
 
@@ -11,25 +11,29 @@
 C4Context
     title LLM API Gateway — System Context
 
-    Person(dev, "Developer / App", "Uses OpenAI SDK (python/node/langchain/curl)")
-    System(gw, "LLM API Gateway", "Single OpenAI-compatible endpoint, fallback, cache, rate-limit, observability")
+    Person(dev, "Developer / App", "Uses an OpenAI SDK or curl")
+    System(gw, "LLM API Gateway", "OpenAI-compatible endpoint, routing, fallback, limits, cache, observability")
     System_Ext(openai, "OpenAI API", "chat/completions, embeddings, models")
-    System_Ext(anthropic, "Anthropic API", "Messages API v2023-06-01")
+    System_Ext(anthropic, "Anthropic API", "Messages API")
     System_Ext(gemini, "Gemini API", "generateContent, embedContent")
-    System_Ext(redis, "Redis", "optional: distributed rate-limit, cache, budget")
-    System_Ext(otel, "OTEL Collector", "Jaeger + Prometheus + Grafana")
+    System_Ext(redis, "Redis", "optional: distributed rate limit, budget, cache")
+    System_Ext(otel, "OTEL / Prometheus", "traces, metrics")
 
-    Rel(dev, gw, "POST /v1/chat/completions<br>Bearer <tenant-key>", "HTTPS/JSON, SSE")
-    Rel(gw, openai, "OpenAI Chat", "HTTPS")
-    Rel(gw, anthropic, "Anthropic Messages", "HTTPS")
-    Rel(gw, gemini, "Gemini generateContent", "HTTPS")
-    Rel(gw, redis, "INCR+EXPIRE / GET/SET", "TCP")
-    Rel(gw, otel, "trace context; Prometheus scrape", "HTTP; optional OTLP/gRPC")
+    Rel(dev, gw, "POST /v1/chat/completions, /v1/embeddings, GET /v1/models", "HTTPS/JSON, SSE")
+    Rel(gw, openai, "HTTPS", "provider API key")
+    Rel(gw, anthropic, "HTTPS", "provider API key")
+    Rel(gw, gemini, "HTTPS", "provider API key")
+    Rel(gw, redis, "Lua / GET/SET", "TCP")
+    Rel(gw, otel, "OTLP/gRPC, /metrics scrape", "HTTP/gRPC")
 ```
 
-**External actors:**
-- **Clients** speak *only* OpenAI schema; gateway is drop-in replacement (`base_url=http://gateway:8080/v1`, `api_key=<tenant>`).
-- **Upstreams** are isolated behind `Provider` interface; adding Bedrock/Azure is 1 PR (see `internal/provider/`).
+**External actors**
+
+- **Clients** speak the OpenAI schema; the gateway is a drop-in `base_url` replacement.
+- **Upstreams** are isolated behind `Provider`; a new provider is an adapter, not a change to the HTTP contract (today the adapter list is still hardcoded in `buildProviders`).
+- **Operators** use the admin API (separate listener, separate key) and the config file/watcher.
+
+**There is no database.** The control plane is the YAML file plus process memory. This is the main architectural gap for multi-tenant product use; see `ADR-004`.
 
 ---
 
@@ -37,37 +41,44 @@ C4Context
 
 ```mermaid
 flowchart TB
-    Client -->|OpenAI SDK| Edge[Edge: TLS + CORS + RequestID + BodyLimit 1MiB]
-    Edge --> Auth[Auth & Tenant Middleware<br>API Keys + Scopes + Expiry]
-    Auth --> RL[RateLimit v2<br>per-key/per-model/per-token<br>sharded 16x TTL 10m<br>Redis Lua or memory]
-    RL --> Budget{Budget?}
-    Budget -- exceed --> R429[429 insufficient_quota]
-    Budget -- ok --> Cache{Cache? exact/semantic}
-    Cache -- hit --> Resp[Response + X-Cache:HIT]
-    Cache -- miss --> Router[Semantic Router<br>model→provider alias+weight+regex]
-    Router --> CB[Circuit Breaker + Retry + Hedge]
-    CB -->|primary| P1[OpenAI]
-    CB -->|fallback| P2[Anthropic]
-    CB -->|fallback| P3[Gemini]
-    P1 & P2 & P3 --> Translate[Translate Layer<br>OpenAI pivot ↔ native]
-    Translate --> Stream[SSE Stream Merger<br>data: {...} + [DONE]]
-    Stream --> Usage[Usage & Cost Metering<br>tokens + USD]
-    Usage --> Resp
-    Usage --> OTEL[OTEL: Metrics/Tracing/Logs<br>/metrics, traceparent]
-    OTEL --> Prometheus & Jaeger
-    Admin[Admin API :8081<br>/admin/* + pprof :6060] -.-> Config[Dynamic Config<br>file+SIGHUP+Watch 1s]
-    Config -.-> Router & RL & CB & Cache
+    Client["Client SDK / curl"] -->|"OpenAI JSON + Bearer"| Edge["Edge middleware<br/>RequestID · Logging · SecurityHeaders · CORS · Tracing · Metrics"]
+    Edge --> Auth["Auth<br/>tenant keys · scopes · expiry"]
+    Auth --> RL["Rate limit middleware<br/>request bucket · per-tenant/model overrides"]
+    RL --> Chat["Chat/embeddings handler"]
+    Chat --> Tok["Token-aware bucket<br/>(estimated prompt tokens)"]
+    Tok --> Budget{"Budget?"}
+    Budget -->|"exceeded"| R429["429 insufficient_quota"]
+    Budget -->|"ok"| Cache{"Exact cache?"}
+    Cache -->|"hit"| Resp["200 + X-Cache: HIT"]
+    Cache -->|"miss"| Router["Registry<br/>exact · weighted · glob/regex · alias"]
+    Router --> CB["Retry + circuit breaker (+ hedge, non-stream)"]
+    CB -->|"primary"| P1["OpenAI"]
+    CB -->|"fallback"| P2["Anthropic"]
+    CB -->|"fallback"| P3["Gemini"]
+    P1 --> Translate["Translate layer<br/>OpenAI pivot ↔ native"]
+    P2 --> Translate
+    P3 --> Translate
+    Translate --> Stream["SSE writer or JSON"]
+    Stream --> Resp
+    Resp --> Metrics["/metrics + OTLP + slog"]
+    Admin["Admin :8081<br/>/admin/* · pprof opt-in"] -.-> Router
+    Admin -.-> RL
+    Admin -.-> CB
+    Admin -.-> Cache
+    Config["config.yaml<br/>SIGHUP · watcher 1s · admin reload"] -.-> Router
 ```
 
-**Containers (processes):**
-| Container | Port | Handler | Notes |
-|-----------|------|---------|-------|
-| `gateway` | `8080` | `cmd/gateway/main.go` `http.Server{ReadHeaderTimeout 5s, IdleTimeout 120s}` | All `POST /v1/*` + `/health*` + `/metrics` |
-| `admin`   | `8081` | `internal/admin/server.go` + pprof | `Bearer ADMIN_API_KEY`, `GET /admin/config` redacted `***`, `POST /admin/reload` 400 rollback |
-| `pprof`   | `6060` | same `admin.Handler()` | `GET /debug/pprof/*` behind same auth |
-| `redis`   | `6379` | `go-redis/v9` | optional `REDIS_URL`; 100ms timeout → fallback memory |
-| `jaeger`  | `4317/16686` | OTEL collector | `OTEL_EXPORTER_OTLP_ENDPOINT` |
-| `prometheus`/`grafana` | `9090/3000` | `deploy/prometheus.yml` | `ServiceMonitor` in K8s |
+**Processes / listeners**
+
+| Listener | Port | Handler | Notes |
+|---|---|---|---|
+| Gateway | `8080` | `cmd/gateway/main.go`; `http.Server` with `ReadHeaderTimeout 5s`, `IdleTimeout 120s` | `/v1/*`, `/health*`, `/livez`, `/readyz`, `/metrics` |
+| Admin | `8081`, bind `127.0.0.1` by default | `internal/admin/server.go` | `/admin/*`; pprof routes only when `admin.pprof_enabled: true` |
+| pprof | **same admin listener** | `net/http/pprof` handlers mounted in the admin mux | No separate `:6060`; off by default; admin auth applies |
+| Redis | `6379` | `go-redis/v9` behind `internal/redisstore` | Optional; rate limit falls back local, budget fails closed, cache misses |
+| Postgres | — | **not implemented** | Roadmap phase 2 |
+
+The Dockerfile still `EXPOSE`s `6060` for historical reasons; nothing listens there in this version.
 
 ---
 
@@ -76,158 +87,203 @@ flowchart TB
 ```mermaid
 flowchart LR
     subgraph cmd/gateway
-        Main[main.go<br>buildProviders, discoverModels, weighted, applyConfig]
+        Main["main.go<br/>buildProviders · discoverModels · weighted<br/>applyConfig · servers"]
     end
     subgraph proxy
-        Handler[handler.go<br>Send + dispatch fallback+alias<br>retry/circuit/hedge<br>cache HIT/MISS]
-        Router[router.go<br>Registry weighted+wildcard+regex]
-        Embed[embeddings.go]
-        Models[models.go]
-        Health[health.go<br>configurable fan-out/cache + SetReady]
-        MW[middleware.go<br>RequestID/Logging/Security/CORS/Metrics/Tracing/RateLimit]
+        Handler["handler.go<br/>chat · dispatch · stream · cache · budget"]
+        Embed["embeddings.go"]
+        Models["models.go"]
+        Health["health.go<br/>fan-out · cache · drain"]
+        Router["router.go<br/>Registry"]
+        MW["middleware.go<br/>RequestID · Logging · Security · CORS · Metrics · Tracing · Limit"]
     end
     subgraph provider
-        POpenAI[openai.go<br>Send/SendStream/Embed/DiscoverModels]
-        PAnthropic[anthropic.go<br>translate via translate]
-        PGemini[gemini.go<br>embedContent]
-        PHTTP[http.go<br>sharedTransport + bufPool]
+        POpenAI["openai.go"]
+        PAnthropic["anthropic.go"]
+        PGemini["gemini.go"]
+        PHTTP["http.go<br/>shared transport · bounded responses"]
     end
     subgraph translate
-        Topen[openai.go]
-        Tanth[anthropic.go<br>ToAnthropic/FromAnthropic<br>system extraction]
-        Tgem[gemini.go<br>ToGemini/FromGemini]
+        TAnth["anthropic.go"]
+        TGem["gemini.go"]
+        TOpen["openai.go"]
     end
     subgraph resilience
-        Retry[retry.go<br>Do exponential jitter 200ms]
-        Circuit[circuit.go<br>5→open 30s half-open 1]
-        Hedge[hedge.go<br>delay 300ms race]
+        Retry["retry.go"]
+        Circuit["circuit.go"]
+        Hedge["hedge.go"]
     end
     subgraph ratelimit
-        Bucket[token_bucket.go<br>sharded 16 fnv + TTL 10m + AllowN]
-        Override[override.go]
-        Redis[redis.go<br>Lua INCR+EXPIRE]
+        Bucket["token_bucket.go<br/>16 shards · TTL 10m"]
+        Override["override.go"]
+        Redis["redis.go<br/>Lua · local fallback"]
     end
     subgraph cache
-        Mem[memory.go<br>LRU 1000 TTL 5m]
-        RCache[redis.go]
-        Sem[semantic.go<br>provider embeddings<br>threshold/top-k/limit]
-        Key[key.go<br>sha256 canonicalJSON]
+        Mem["memory.go<br/>LRU"]
+        RCache["redis.go"]
+        Sem["semantic.go<br/>opt-in"]
+        Key["key.go<br/>sha256 canonical JSON"]
     end
-    subgraph auth/budget/metrics/tracing/config/admin
-        Auth[auth/store.go<br>Reload hot]
-        Budget[budget/manager.go]
-        Metrics[metrics/metrics.go<br>RequestsTotal/Tokens/CacheHits]
-        Tracing[tracing/tracing.go]
-        Config[config/config.go<br>Validate+Watch+Clone]
-        Admin[admin/server.go<br>PATCH runtime knobs]
+    subgraph platform
+        Auth["auth/store.go · middleware.go"]
+        Budget["budget/budget.go<br/>reserve/commit"]
+        Pricing["pricing/catalog.go"]
+        Metrics["metrics/metrics.go"]
+        Tracing["tracing/tracing.go"]
+        Config["config/config.go<br/>Validate · Watch · Clone"]
+        Admin["admin/server.go<br/>reload · patch · redact"]
+        RedisStore["redisstore/<br/>replaceable manager"]
     end
 
-    Main --> Router & Handler & MW
-    Handler --> Router & Retry & Circuit & Hedge
+    Main --> Handler & Embed & MW & Config & Admin & Health
+    Handler --> Router & Retry & Circuit & Hedge & Budget & Pricing
     Handler --> POpenAI & PAnthropic & PGemini
-    POpenAI --> PHTTP & Topen
-    PAnthropic --> Tanth
-    PGemini --> Tgem
-    Handler --> Mem & Key & Sem
+    Handler --> Mem & RCache & Sem & Key
+    POpenAI --> PHTTP & TOpen
+    PAnthropic --> PHTTP & TAnth
+    PGemini --> PHTTP & TGem
     MW --> Bucket & Metrics & Tracing
-    Main --> Config & Admin & Health
+    Redis --> RedisStore
+    Budget --> RedisStore
+    RCache --> RedisStore
 ```
 
 ### Key contracts
 
-**`Provider` interface** (`internal/provider/provider.go:33`):
+**`Provider`** (`internal/provider/provider.go`):
+
 ```go
 type Provider interface {
-  Name() string
-  Send(ctx context.Context, req ChatRequest) (ChatResponse, error)
-  SendStream(ctx context.Context, req ChatRequest) (<-chan StreamChunk, <-chan error)
-  Models() []string
-  HealthCheck(ctx context.Context) error
+    Name() string
+    Send(ctx context.Context, req ChatRequest) (ChatResponse, error)
+    SendStream(ctx context.Context, req ChatRequest) (<-chan StreamChunk, <-chan error)
+    Models() []string
+    HealthCheck(ctx context.Context) error
 }
-type Embedder interface { Embed(ctx, EmbeddingRequest) (EmbeddingResponse, error) }
+type Embedder interface {
+    Embed(ctx context.Context, req EmbeddingRequest) (EmbeddingResponse, error)
+}
 ```
-- `Name()` is registry key, also `fallback_chain` entry.
-- `Send` is sync; `SendStream` is async channels + `data: [DONE]` (see `proxy/handler.go:390 handleStream`).
-- `Models()` may contain wildcards `gpt-4*` or be `[]` for auto-discovery (`DiscoverModels` via `GET /models`).
-- Errors are `*ProviderError{Retryable, RetryAfter}` → `IsRetryable` determines fallback; `Retry-After` propagated as header (`handler.go:380 propagateRetryAfter`).
 
-**`Registry`** (`proxy/router.go:20`):
-- Resolution order:  weighted exact → exact → weighted pattern → pattern (glob→regex) → `ErrNoProvider` 404.
-- `Reload(providers, aliases, weighted)` atomic swap `RWMutex` (Fase 9) — no pointer replacement so handlers see update.
-- `RemapForFallback(req, fallback)` uses `model_aliases` → first alias target owned by fallback, else first model of fallback.
+- `Name()` is the registry key and the `fallback_chain` entry.
+- `Send` is synchronous; `SendStream` returns channels. The handler waits for the first stream event before committing HTTP 200, so an early failure can still fall back.
+- `Models()` may contain exact names, globs (`gpt-4*`), regex-like patterns, or be empty for auto-discovery.
+- Errors are `*ProviderError{Retryable, RetryAfter, StatusCode}`; `provider.IsRetryable` decides fallback. `Retry-After` is propagated to the client.
 
-**`Translate` pivot** (`internal/translate/`):
-- Canonical = OpenAI `ChatRequest`. `ToAnthropic`: `system` extracted → `system` field, `assistant→model`? actually `messages` with `role:assistant→model`. `ToGemini`: `messages→contents` with `role:model` for assistant.
-- The canonical contract preserves multimodal content, tool calls, audio fields, logprobs, and modern completion controls for OpenAI-compatible clients; Anthropic/Gemini tools and tool results are translated to their native function-call blocks, while unsupported multimodal details use the safe text projection.
-- Keeps `Provider` pure; translation is unit-tested isolated (`tests/translate_test.go`).
+**`Registry`** (`internal/proxy/router.go`) resolution order:
+
+1. weighted exact model (`routing.weighted`);
+2. exact model;
+3. weighted pattern keys matching the model (longer patterns first, lexical tie-break);
+4. provider pattern (`glob` → regex, `path.Match` fallback), random among multiple candidates;
+5. `ErrNoProvider` → HTTP `404 model_not_found`.
+
+`Reload(providers, aliases, weighted)` swaps state under an `RWMutex`; handlers keep their pointers. `RemapForFallback` uses `model_aliases`, then the fallback provider's first model.
+
+**Translate** (`internal/translate/`):
+
+- Canonical shape is OpenAI. `ToAnthropic` extracts `system`, maps `assistant → assistant` messages, maps tools to `tool_use`/`tool_result`, and defaults `max_tokens` to **4096** when absent. Anthropic version is `2023-06-01`.
+- `ToGemini` maps messages to `contents` (`assistant → model`), tools to `functionDeclarations`, and tool results to `functionResponse`.
+- Unsupported multimodal details use a safe text projection; the OpenAI adapter keeps the full content parts.
+- Gemini authenticates with `x-goog-api-key`; the key is not placed in the URL.
 
 ---
 
-## 4. Sequence — fallback with retry + circuit
+## 4. Sequence — non-streaming fallback
 
 ```mermaid
 sequenceDiagram
-    participant C as Client SDK
-    participant G as Handler dispatch
+    participant C as Client
+    participant H as Handler
+    participant Cache as Cache
     participant R as Registry
     participant B as Breaker[openai]
     participant O as OpenAI
-    participant A as Anthropic (fallback)
-    participant X as Cache
+    participant A as Anthropic
 
-    C->>G: POST /v1/chat/completions {model:gpt-4o}
-    G->>X: BuildKey → Get
-    X-->>G: MISS
-    G->>R: Resolve(gpt-4o) → openai
-    G->>B: Allow() ?
-    B-->>G: true (closed)
-    G->>O: Send(ctx) + retry.Do 3× 200ms jitter
-    O-->>G: 429 Retry-After:1
-    G->>B: RecordFailure (1/5)
-    G->>R: RemapForFallback(gpt-4o→claude-sonnet-4-6)
-    G->>A: Send(claude-sonnet-4-6) + retry
-    A-->>G: 200 {choices...}
-    G->>B: RecordSuccess? actually A breaker
-    G->>X: Set(key, 200, 5m)
-    G-->>C: 200 JSON + X-Gateway-Provider:anthropic + X-Cache:MISS
-
-    Note over B: after 5 failures B→open 30s,<br>half-open probe 1
+    C->>H: POST /v1/chat/completions {model:gpt-4o}
+    H->>H: request rate limit + token bucket + budget reserve
+    H->>Cache: BuildKey(identity, request) → Get
+    Cache-->>H: MISS
+    H->>R: Resolve(gpt-4o)
+    R-->>H: openai
+    H->>B: Allow()
+    B-->>H: true (closed)
+    H->>O: Send + retry.Do (3 attempts, jitter)
+    O-->>H: 429 Retry-After: 1
+    H->>B: RecordFailure(1/5)
+    H->>R: RemapForFallback(gpt-4o)
+    H->>A: Send + retry
+    A-->>H: 200
+    H->>B: (Anthropic breaker) RecordSuccess
+    H->>H: budget Commit(actual usage)
+    H->>Cache: Set(key, response, TTL)
+    H-->>C: 200 + X-Gateway-Provider: anthropic + X-Cache: MISS
 ```
 
-Streaming variant: `handler.go:390 handleStream` branches `req.Stream` → `Content-Type:text/event-stream`, `http.Flusher`, translates `event:content_block_delta` → `ChatCompletionChunk`, preserves optional terminal usage from provider stream metadata, no cache, same fallback notification (warn, not yet implemented hedge for streams).
+Details that matter:
+
+- **Retry** applies to non-streaming `Send` (default 3 attempts with jitter) and to embeddings. Streaming does **not** retry a provider; it tries the next provider only if the failure happens before the first chunk.
+- **Hedge** is non-streaming only. It races the primary against up to two fallbacks after `resilience.hedge.delay` (300 ms default). It is off by default.
+- **Circuit breaker** is per provider, in-process, 5 failures → open 30 s → half-open with 1 probe. There is no shared breaker state across replicas and no reset endpoint.
+- **Budget** reserves an estimate before dispatch and commits actual usage after; a failed request cancels the reservation. When a Redis budget is configured and unavailable, the request fails with `503 budget_unavailable` (fail-closed). Without Redis, budget state is per process.
+- **Cache** stores only 200 non-streaming responses. Streaming sets `Cache-Control: no-cache`; the gateway does **not** read or honor upstream `Cache-Control`.
+
+**Streaming path**
+
+1. Resolve model; check breaker; call `SendStream`.
+2. Wait for the first chunk or error. On retryable error, try the next provider with a remapped model.
+3. If a provider succeeds: set `Content-Type: text/event-stream`, `Cache-Control: no-cache`, `Connection: keep-alive`, `X-Gateway-Provider`; clear the server write deadline; write chunks as `data: {...}` with `Flush`.
+4. On normal close: `data: [DONE]`.
+5. On mid-stream provider error: `event: error` + OpenAI error JSON + `data: [DONE]`.
+6. On client disconnect: stop via request context; no resume support.
+
+Streams have no retry, no hedge, no cache and no usage reconciliation beyond the provider's final usage chunk. A mid-stream cut cannot be transparently moved to another provider.
 
 ---
 
-## 5. Data flow — rate-limit / budget / cache knobs
+## 5. Data flow — limits, budget, cache
 
-- **RateLimit:** `RateLimit(limiter)` middleware uses `Authorization` header as key; `handler.go:234 overrideStore.Resolve(tenant, model)` → per-tenant/model RPM; `tokenAware` → `EstimateTokens(chars/4)` → `AllowN(key+"_tokens", n)`; `Retry-After` seconds.
-- **Budget:** `budget.Manager.Reserve` atomically reserves an estimated prompt/max-token amount before dispatch; `Commit` adjusts to actual usage and `Cancel` releases failed requests. Redis uses Lua and hashed tenant keys. `rate_limit.budget.pricing` selects exact or wildcard provider/model rates for chat input/output and embeddings, while `cost_per_token_usd` remains the fallback for unknown prices. Limits and the immutable pricing catalog swap atomically during reload. Quota exhaustion returns `429 insufficient_quota`; unavailable Redis fails closed with `503`.
-- **Cache:** `cache.BuildKey` includes response-shaping fields (`model`, messages, sampling, tools, tool choice, response format, stop, n, stream options) and the handler salts it by client identity; embedding keys include model/input/format/dimensions/user. Respect `X-Cache-Skip:true` and `X-Cache-TTL:100ms`; only `200` non-stream; `memory LRU` → `redis` if `REDIS_URL`. Opt-in semantic lookup embeds the query, searches a local namespace-scoped top-k vector index, and retrieves the exact cached response; response-shape options remain part of the semantic namespace.
+- **Request rate limit** (`proxy/middleware.go`): applies only to `/v1/*`; health, readiness and metrics stay probeable. The key is a SHA-256 of the authenticated tenant, else the `Authorization` value, else the remote host. Per-tenant/model overrides use a model-scoped bucket suffix so a high-limit model cannot refill the shared bucket. On 429 it sets `Retry-After` and `X-RateLimit-Limit`/`Remaining`. Redis uses a Lua token bucket; on Redis error it logs/marks degraded and uses the local bucket.
+- **Token limit** (`proxy/handler.go`, `internal/ratelimit`): independent bucket in tokens. The estimate is `chars/4` over message text plus the JSON of tools; it is **not** a tokenizer. A prompt can still exceed the real provider token count. The bucket size is `rate_limit.token_burst`, not the request burst.
+- **Override store** (`ratelimit/override.go`): `tenant` + `model_pattern` → RPM/burst. `""`/`*` match as wildcards; the most specific match wins.
+- **Budget** (`budget/budget.go`): monthly token/USD usage keyed by tenant and month. Redis: Lua `HINCRBY`/`HINCRBYFLOAT` with quota check in one script; local: mutex + map. Reservation, then commit actual or cancel. `pricing.Catalog` resolves provider/model (exact or wildcard) and can fall back or reject unknown prices. Limits and pricing swap atomically on reload; existing usage is preserved.
+- **Cache** (`cache/`): exact key is `sha256(canonical JSON)` over response-shaping fields (model, messages, sampling, tools, tool choice, response format, stop, n, stream options, user), then salted with the client identity. Embedding keys include model/input/format/dimensions/user. Backend is **either** in-memory LRU **or** Redis, chosen when the cache is built; there is no layered fallback. Semantic mode embeds the query, searches a namespace-scoped in-process top-k index and retrieves the exact cached response; namespaces include identity and shape. It is opt-in and local to a process.
 
 ---
 
 ## 6. Operational concerns
 
-- **Hot reload:** `config.Watch(ctx, path, 1s, onChange)` polls `ModTime` + 100ms debounce; `SIGHUP` handler; `applyConfig(newCfg)` → `Validate` → `buildProviders` → `redisStore.ReplaceURL` (ping/swap/close active connection) → `registry.Reload` → `limiter.UpdateLimits` → `overrideStore.Reload` → `budget.Manager.UpdateConfig` → `authStore.Reload` → `health.SetOptions` → `handlerOpts.SetCache/Circuit/Retry/Hedge/Fallback` → `embeddings.SetCache` → `adminSrv.SetConfig(Clone)`; a failed Redis replacement preserves the previous backend and rejects the reload.
-- **Graceful drain:** `HealthHandler.SetReady(false)` → `/readyz` 503 draining → 5s sleep for K8s endpoint removal → `admin/pprof Shutdown 5s` → `srv.Shutdown 30s` with `IdleTimeout 120s` (`main.go:326`).
-- **Performance:** `sharedTransport MaxIdleConns100/PerHost20/IdleConnTimeout90s/KeepAlive30s/ForceAttemptHTTP2` (`provider/http.go:10`), `bufPool` for `marshalJSON`, `sharded 16× fnv` limiter (56ns/op), `BuildKey 1.8µs`, `Cache hit 75ns` (`BENCH.md`).
-- **Observability:** `metrics.RequestsTotal{method,path,status,provider}` `RequestDuration` `TokensTotal` `CacheHits` `ProviderErrors` `CircuitState`; paths are bounded to known routes; `Tracing` injects OTEL trace context and optionally batches spans to OTLP/gRPC; `Logging` uses `request_id/tenant/provider/latency_ms`.
-- **Security:** `auth` static YAML+env stores SHA-256 key digests, enforces endpoint scopes/expiry, `SecurityHeaders` `nosniff DENY no-referrer`, CORS allowlist, `Authorization` redacted in logs (`logger/logger.go`), `Admin` Bearer/X-Admin-API-Key `***` redacted (`admin/server.go:380 redactConfig`).
+- **Hot reload:** `config.Watch(ctx, path, 1s, onChange)` polls mtime with a 100 ms debounce; `SIGHUP` and `POST /admin/reload` share `applyConfig`. Order: `Validate` → build providers → auto-discover → build weighted → build pricing → `redisStore.ReplaceURL` (ping/swap/close, keep old on failure) → `registry.Reload` → limiter/overrides → budget → auth → health options → rebuild cache → resilience → fallback chains → admin config snapshot. A failed reload keeps the previous state.
+- **Not hot-reloadable:** `server.*`, `admin.port`, `admin.bind_address`, `admin.api_key`, `admin.pprof_enabled`. The admin server and pprof routes are built once at startup; rotating the admin key requires a restart.
+- **Admin config JSON:** config structs have YAML tags only, so `GET /admin/config` uses Go field names (`Admin.APIKey`) and `time.Duration` values as integer nanoseconds. `PATCH /admin/config` accepts duration strings. Secrets are redacted to `***`.
+- **Graceful drain:** `SIGTERM`/`SIGINT` → `health.SetReady(false)` → `/readyz` 503 → 5 s wait for endpoint removal → admin shutdown (5 s) → gateway `Shutdown` (30 s). The K8s grace period is 35 s; long streams may be cut after 30 s.
+- **Observability:** metrics are `gateway_requests_total`, `gateway_request_duration_seconds`, `gateway_tokens_total`, `gateway_cost_usd_total`, `gateway_provider_errors_total`, `gateway_circuit_state`, `gateway_cache_hits_total`, `gateway_cache_size`. Path labels are bounded to known routes. `/metrics` is not authenticated. There is no queue depth, Redis health, budget remaining or gateway-overhead metric yet.
+- **Security:** tenant auth is a static key store with SHA-256 digests (constant-time compare), scopes and expiry. The admin uses a separate key with constant-time compare and is fail-closed unless `allow_insecure` is explicitly set. pprof is opt-in and contains secrets. `base_url` is operator-controlled but not SSRF-validated. See `SECURITY.md`.
 
 ---
 
-## 7. Deployment — K8s
+## 7. Deployment
 
-- `deploy/k8s/deployment.yaml`: 3 replicas RollingUpdate, `terminationGracePeriodSeconds:35`, probes `liveness /livez 10s` `readiness /readyz 5s` `startup /health 5s`, `resources 500m/256Mi→1000m/512Mi`, `securityContext readOnlyRootFilesystem:true runAsNonRoot:65532`.
-- `hpa.yaml`: `3→10` cpu70 mem80, `ServiceMonitor` scrapes `8080/metrics` 15s, `PDB minAvailable:2`, `Service` http 80→8080 admin 8081 pprof 6060.
+`deploy/k8s/` contains raw manifests, not a chart:
+
+- `deployment.yaml`: 3 replicas, RollingUpdate, `terminationGracePeriodSeconds: 35`, probes `/livez` (10 s), `/readyz` (5 s), `/health` (startup), requests `500m/256Mi`, limits `1000m/512Mi`, `readOnlyRootFilesystem`, `runAsNonRoot: 65532`, dropped capabilities.
+- `hpa.yaml`: 3 → 10 replicas, CPU 70 %, memory 80 %.
+- `pdb.yaml`: `minAvailable: 2`.
+- `service.yaml`: HTTP 80 → 8080; separate admin Service 8081.
+- `servicemonitor.yaml`: scrapes `/metrics` on 8080 every 15 s.
+- `configmap.yaml`: production profile with auth and budget; `admin.bind_address: 0.0.0.0`, pprof off.
+
+No Helm, no Terraform, no migration job, no NetworkPolicy. The Dockerfile `EXPOSE 6060` is stale; pprof is on the admin listener.
 
 ---
 
-## 8. Trade-offs & future
+## 8. Trade-offs and known gaps
 
-- No `sony/gobreaker` dep — own 188 LOC circuit simplifies hot-reload `UpdateConfig`.
-- No framework — `ServeMux` Go 1.22 path patterns enough; avoids Gin/Echo.
-- Single dep `yaml.v3` + 5 justified: `prometheus`, `redis`, `otel`, `sync`. See ADR-002/003.
-- Backlog (post 1.0): Azure/Bedrock, Ollama, PII guardrails, Stripe billing, WASM plugins, distributed semantic-index sharing, and external price-catalog synchronization.
+- **Own limiter/circuit instead of libraries:** small surface, hot-reloadable config, but fewer edge cases covered than `golang.org/x/time/rate` or a mature breaker library. Benchmarks are microbenchmarks, not capacity evidence.
+- **`ServeMux` instead of a framework:** Go 1.22 patterns are enough; no Gin/Echo dependency.
+- **In-process state + Redis:** simple and fast, but per-replica semantics for local fallbacks, semantic cache and budget without Redis.
+- **YAML control plane:** excellent for a demo and single-node ops; insufficient for tenant CRUD, audit, multi-replica consistency and billing.
+- **Known gaps:** Postgres/migrations, tenant/key CRUD, usage ledger, quotas per tenant, capability registry, generic OpenAI-compatible provider, Azure/Bedrock/Vertex, idempotency, SSRF guard, secret manager, PII, SLOs/backpressure, Helm/Terraform, UI. Full plan and acceptance criteria: `docs/ROADMAP.md`.
 
-Refs: `BENCH.md`, `config.yaml`, `deploy/k8s/`, `examples/`.
+Refs: `BENCH.md`, `config.yaml`, `config.dev.yaml`, `config.prod.yaml`, `deploy/`, `examples/`, `docs/adr/`.

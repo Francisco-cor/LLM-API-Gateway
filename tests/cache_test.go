@@ -183,6 +183,35 @@ func TestCache_SemanticWrapper(t *testing.T) {
 	}
 }
 
+func TestCache_MemoryByteBudget(t *testing.T) {
+	m := cache.NewMemoryWithBytes(100, 100)
+	m.Set("a", make([]byte, 59), time.Minute) // key+value = 60 bytes
+	m.Set("b", make([]byte, 59), time.Minute)
+	stats := m.Stats()
+	if stats.Size != 1 || stats.Bytes != 60 || stats.Evictions != 1 {
+		t.Fatalf("stats = %+v, want byte-bounded eviction", stats)
+	}
+	m.Set("huge", make([]byte, 4096), time.Minute)
+	if _, ok := m.Get("huge"); ok {
+		t.Fatal("oversized value must be rejected")
+	}
+	if m.Stats().Rejected != 1 {
+		t.Fatal("rejection must be observable")
+	}
+}
+
+func TestCache_ClampTTL(t *testing.T) {
+	if got := cache.ClampTTL(24*time.Hour, time.Hour); got != time.Hour {
+		t.Fatalf("ClampTTL = %v, want 1h", got)
+	}
+	if got := cache.ClampTTL(0, time.Hour); got != time.Hour {
+		t.Fatalf("ClampTTL zero = %v, want max", got)
+	}
+	if got := cache.ClampTTL(time.Minute, 0); got != time.Minute {
+		t.Fatalf("ClampTTL no cap = %v, want requested", got)
+	}
+}
+
 func TestCache_EmbeddingBackedSemanticLookup(t *testing.T) {
 	embedding := func(_ context.Context, text string) ([]float32, error) {
 		if text == "weather forecast" || text == "what is the weather" {
@@ -208,10 +237,10 @@ func TestCache_BenchHash(t *testing.T) {
 	}
 	elapsed := time.Since(start)
 	// The OpenAI-compatible message marshaler intentionally preserves both
-	// string and multimodal content; allow race-instrumented CI headroom while
-	// retaining a useful regression guard for the hot path.
-	if elapsed > 500*time.Millisecond {
-		t.Errorf("10k BuildKey took %v, want <500ms", elapsed)
+	// string and multimodal content; race-instrumented CI is several times
+	// slower than a release build, so keep a generous regression guard.
+	if elapsed > 2*time.Second {
+		t.Errorf("10k BuildKey took %v, want <2s", elapsed)
 	}
 }
 

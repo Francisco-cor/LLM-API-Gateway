@@ -6,21 +6,23 @@
 Same prompt pays 2×. Need exact-hit cache with low overhead; semantic optional.
 
 ## Decision
-- **Interface** `cache.Cache{Get,Set,Delete,Stats}` (`cache/cache.go:17`) with `memory` LRU (`container/list` + `map`) 1000 TTL 5m (`cache/memory.go`), `redis` backend (`cache/redis.go`), `semantic` wrapper (`cache/semantic.go` cosine 0.97).
-- **Key** `BuildKey(model,messages,temperature,max_tokens,tools)` → `sha256(canonicalJSON)` (`cache/key.go` 1.8µs, 400B).
-- **Policy:** only `200` non-streaming; `X-Cache:HIT/MISS` + `X-Gateway-Provider:cache`; respect `X-Cache-Skip:true` + `X-Cache-TTL:100ms` + `Cache-Control` upstream.
-- **Wiring** `cache.NewMemory` → if `redisClient` wrap `NewRedis` → if `semantic_enabled` wrap `NewSemantic` (`cmd/gateway/main.go:95`).
-- **Hot reload** `SetCache(cache, ttl)` (`proxy/handler.go:132`).
+- **Interface** `cache.Cache{Get,Set,Delete,Stats}` (`cache/cache.go`) with `memory` LRU (`container/list` + `map`) 1000 TTL 5m (`cache/memory.go`), `redis` backend (`cache/redis.go`) and a `semantic` wrapper (`cache/semantic.go`, cosine 0.97 default).
+- **Key** `BuildKey(req)` → `sha256(canonical JSON)` over response-shaping fields (`cache/key.go`), salted with the client identity by `BuildKeyForIdentity`. Embedding keys are separate (`cache/embedding_key.go`). See `BENCH.md` for the microbenchmark; no fixed nanosecond claim is made here.
+- **Policy:** only `200` non-streaming; `X-Cache:HIT/MISS` + `X-Gateway-Provider:cache`; respect `X-Cache-Skip:true` + `X-Cache-TTL:100ms`. The gateway does **not** read upstream `Cache-Control`; it only sets `Cache-Control: no-cache` on SSE responses.
+- **Wiring** `buildCache` (`cmd/gateway/main.go`): memory → Redis if the shared store is active → semantic wrapper if enabled. The backend is chosen when the cache is built; a Redis outage at runtime produces misses, not an automatic memory fallback.
+- **Hot reload** `SetCache(cache, ttl)` on the chat/embeddings handlers.
 
 ## Alternatives
-- Always Redis — adds latency for miss (100ms timeout) vs 75ns memory hit.
-- Semantic first — cost of embeddings, threshold tuning 0.97 default disabled.
+- Always Redis — adds a network hop and a hard dependency for a cache that is optional.
+- Semantic first — embeddings cost money and need threshold tuning; it is opt-in and off by default.
+- Layered memory + Redis — would need coherence/invalidation; not implemented.
 
 ## Consequences
-+ Second identical prompt <5ms `HIT` (`tests/cache_test.go`).
-+ `BENCH.md` `Cache_Get_Hit 75ns`, `BuildKey 1.8µs`.
-- Memory bound 1000 needs tuning for prod; `CACHE_MAX_SIZE` hot-reloadable via `PATCH /admin/config`.
-- Semantic requires embeddings model; disabled by default (`cache.semantic_enabled:false`).
++ A second identical prompt can be served without an upstream call.
++ `BENCH.md` records the build-key/cache microbenchmarks with their caveats.
+- Memory is bounded (1000 entries by default) and must be tuned for production; `cache` knobs are hot-reloadable via `PATCH /admin/config`.
+- Semantic mode requires an embedding provider and is local to a process; a shared index is roadmap work.
+- Cache entries contain response bodies (potentially sensitive) in memory or Redis, unencrypted.
 
 ## Verification
-`tests/cache_test.go` hit/miss/TTL/eviction LRU 2, `TestHandler_CacheHITMISS` headers, `semantic` similarity 0.99 identical.
+`tests/cache_test.go` covers hit/miss/TTL/LRU eviction and identity isolation; `TestHandler_CacheHITMISS` covers headers; semantic tests cover identical/similar queries and namespace isolation.

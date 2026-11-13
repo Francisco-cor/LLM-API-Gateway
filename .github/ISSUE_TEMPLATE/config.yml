@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Francisco-cor/LLM-API-Gateway/security/advisories/new
+    about: Report security issues privately. Do not open a public issue.
+  - name: Roadmap and known gaps
+    url: https://github.com/Francisco-cor/LLM-API-Gateway/blob/main/docs/ROADMAP.md
+    about: Check the maturity matrix and backlog before proposing work.
+  - name: Operations runbook
+    url: https://github.com/Francisco-cor/LLM-API-Gateway/blob/main/docs/RUNBOOK.md
+    about: Startup, reload, Redis/provider incidents, SLOs and alerts.

@@ -39,6 +39,10 @@ data:
         monthly_tokens: 1000000
         monthly_usd: 100.0
         cost_per_token_usd: 0.00001
+        # Multiple replicas: deny instead of using per-process quota when
+        # Redis is unreachable.
+        require_shared_store: true
+        reservation_ttl: 10m
         pricing:
           currency: USD
           version: "2026-09"
@@ -61,6 +65,8 @@ data:
       enabled: false
       ttl: 5m
       max_size: 1000
+      max_bytes: 67108864
+      max_ttl: 1h
     health:
       readiness_cache_ttl: 30s
       check_timeout: 10s
