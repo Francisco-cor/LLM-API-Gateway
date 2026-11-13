@@ -7,62 +7,202 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Pending integration (other workstreams)
+
+The following areas are being worked on in parallel branches. They are **not**
+claimed as part of `v1.1.0` until their commits are merged and verified; this
+section will be replaced by concrete entries when that happens.
+
+- **Streaming** — further SSE and usage-accounting work beyond the v1.1.0 fixes.
+- **Pricing** — additional price catalog and reconciliation work; the ledger
+  does not exist yet, so no billing claim is made.
+- **Cache** — shared/distributed semantic index and invalidation work.
+- **CI** — coverage gate, OpenAPI validation and load/conformance jobs. The
+  current workflow uploads coverage but does not enforce a threshold.
+
+## [v1.1.0] - 2026-11-13
+
+### Added
+
+- `api/openapi.yaml`: OpenAPI 3.1 contract for chat, embeddings, models, health,
+  readiness, metrics and the admin API, including SSE, tools and
+  `response_format.type`.
+- `docs/ROADMAP.md`: maturity matrix, phases with measurable acceptance
+  criteria, a 30-item backlog and the minimum Postgres schema for a persistent
+  control plane and usage ledger.
+- `docs/RUNBOOK.md`: startup, health semantics, reload/rollback, Redis outage,
+  provider 429/5xx, circuit breaker, exhausted budget, cut streams, key
+  rotation, opt-in pprof, proposed SLOs and alert rules.
+- `SECURITY.md`: private advisory reporting, scope, threat model and the
+  current-versus-pending control matrix.
+- `docs/adr/ADR-004-professionalization.md`: Postgres control plane, DB-less
+  data plane, asynchronous ledger, capability registry and fail-closed policy.
+- Provider/model pricing catalogs with input, output and embedding rates, a
+  versioned currency/policy and an unknown-price policy (`fallback`/`reject`).
+- Exact embedding-response caching and an opt-in embedding-backed semantic
+  cache with identity and response-shape namespaces.
+- Configurable readiness/provider health cache and timeouts, hot-reloadable,
+  with an explicit `skipped` state for credit-bearing Anthropic checks.
+- Shared, replaceable Redis connection manager across rate limit, budget and
+  cache; reload pings and swaps safely and keeps the previous backend on
+  failure.
+- Admin config fields for `bind_address`, `allow_insecure` and
+  `pprof_enabled`; pprof routes are registered inside the admin mux only when
+  opted in.
+- Idempotent budget reservations with Redis Lua or in-process mutex semantics,
+  actual-token cost adjustment and retry/circuit/budget integration for
+  embeddings.
+- `CostsUSDTotal`, pricing provenance (`known`/`fallback`) and bounded
+  Prometheus path cardinality.
+
+### Changed
+
+- Admin control plane is fail-closed: with `admin.allow_insecure: false`, an
+  empty or unresolved `${ADMIN_API_KEY}` stops startup. Admin binds to
+  `127.0.0.1` by default. The comparison uses constant time.
+- Token-aware limiting uses a bucket measured in **tokens**, independent from
+  the request bucket measured in requests. `token_burst` has a floor of 1024
+  when token-aware limiting is enabled.
+- Streaming preserves provider usage metadata in the final SSE chunk when
+  `stream_options.include_usage` is requested, including Anthropic message
+  events and Gemini usage-only terminal events.
+- OpenAI tools, tool choices, tool results and tool-call responses/deltas are
+  translated to Anthropic `tool_use/tool_result` and Gemini
+  `functionCall/functionResponse`.
+- The OpenAI-compatible chat contract covers multimodal content, tools, audio,
+  logprobs, parallel tool calls and modern completion controls; those fields
+  are preserved in cache namespaces, with a safe text projection for narrower
+  providers.
+- Rate-limit enablement is hot-reloadable; overlapping weighted patterns are
+  deterministic; Redis URL updates go through the shared reconnect manager
+  instead of an ineffective runtime patch.
+- Provider error messages are bounded; API-key scopes and expiry are enforced;
+  cache keys are isolated by client identity; trailing JSON and unknown YAML
+  fields are rejected.
+- Gemini API keys are sent in `x-goog-api-key`, not in the query string.
+- pprof no longer has a `:6060` listener. It is opt-in under `/debug/pprof/*`
+  in the admin mux, with the same admin authentication.
+
 ### Fixed
 
-- Translate OpenAI tools, tool choices, tool results, and tool-call responses/deltas to Anthropic `tool_use/tool_result` and Gemini `functionCall/functionResponse` contracts.
-- Preserve provider usage metadata in the final SSE chunk when `stream_options.include_usage` is requested, including Anthropic message events and Gemini usage-only terminal events.
-- Pin `govulncheck` in CI and Release workflows for reproducible security scans with the Go 1.24 toolchain.
-- Share one replaceable Redis connection manager across rate-limit, budget, and cache; hot reload now pings/swaps/closes Redis safely and preserves the previous backend if the replacement is unavailable.
-- Expand the OpenAI-compatible chat contract for multimodal content, tool calls, audio, logprobs, parallel tool calls, and modern completion controls; preserve those fields in cache namespaces and use safe text projections for narrower translated providers.
-- Make readiness/provider health cache and timeouts configurable, support hot reload, and allow credit-bearing Anthropic checks to be explicitly skipped and reported as `skipped`.
-- Add provider/model pricing catalogs with input/output/embedding rates, unknown-price policy, cost metrics, atomic budget hot reload, embedding response cache, and opt-in embedding-backed semantic cache with identity/shape namespaces.
-- Wire the OTLP/gRPC exporter, bound Prometheus path cardinality, cache readiness provider checks for 15s, clear SSE write deadlines for active streams, and close limiter cleanup goroutines during shutdown.
-- Make rate-limit enablement hot-reloadable, make overlapping weighted patterns deterministic, use constant-time admin-key comparison, remove the ineffective runtime Redis URL patch, and bound provider error messages.
-- Add atomic tenant budget reservations with Redis Lua/local mutex semantics, configurable `cost_per_token_usd`, and retry/circuit/budget integration for embeddings.
-- Wire the configured Redis rate-limit backend into the gateway; make token-aware Redis consumption atomic and apply tenant/model overrides.
-- Preserve streaming capabilities through response-recording middleware and add retryable fallback before the first SSE chunk.
-- Enforce API-key scopes, isolate cache keys by client identity, validate complete cache semantics, reject trailing JSON and unknown YAML fields.
-- Bound upstream response bodies, keep provider `Retry-After` errors intact, fix error codes such as `model_not_found`, and move Gemini API keys out of URLs.
-- Harden container/Kubernetes deployment metadata and move the K8s ConfigMap into its own manifest.
+- Rate-limit token budgets no longer share the request burst capacity; a
+  normal prompt can no longer be rejected forever by an undersized bucket.
+- Streams no longer hang after the first chunk due to the server write
+  deadline; the deadline is cleared once the stream is active.
+- Readiness collapses concurrent Kubernetes probes into one provider fan-out
+  and clears stale snapshots when health options change.
+- Limiter cleanup goroutines are closed on shutdown.
+- Provider `Retry-After` is preserved and propagated; error codes such as
+  `model_not_found` are correct.
+
+### Security
+
+- Fail-closed admin control plane, constant-time admin-key comparison,
+  loopback-by-default bind and opt-in pprof reduce the exposure of a process
+  that can rewrite configuration and hold provider keys.
+- Request bodies are capped at 1 MiB, upstream responses at 8 MiB, and admin
+  patches at 1 MiB. Unknown JSON/YAML fields are rejected.
+- `Authorization`, provider keys, admin keys and Redis URLs are redacted from
+  logs and from `GET /admin/config`.
+- CI runs `golangci-lint` (including `gosec`) and `govulncheck` pinned to a
+  reproducible tool version. The workflows do not assert a zero-issue count;
+  results depend on the linters and advisory database at build time.
+
+### Documentation
+
+- README rewritten around the real quickstart, a verified feature table, real
+  metric and flag names, honest limitations, benchmarks with caveats and an
+  explicit comparison with LiteLLM/Portkey-class gateways.
+- `BENCH.md` no longer lists benchmarks that do not exist
+  (`BenchmarkLimiter_Concurrent`, `BenchmarkMarshalJSON_Pooled`,
+  `BenchmarkHandler_Dispatch_Mock`) and labels unverified figures as local
+  reference.
+- `docs/ARCHITECTURE.md` corrected: `budget/budget.go`, current admin/pprof
+  topology, no upstream `Cache-Control` claim, streaming/retry/hedge limits.
+- `examples/curl/*.sh` are executable and use the real admin JSON field
+  (`Admin.APIKey`); the contract test command is `-run TestContract`.
+- Added `CONTRIBUTING.md`, Dependabot, CODEOWNERS, issue templates and a PR
+  template.
+
+### Corrected claims from earlier documentation
+
+- **Anthropic health check:** it is not free. It sends a 1-token Messages
+  request and may incur a minimal charge. Set
+  `health.skip_expensive_checks: true` to skip it; `skipped` counts as healthy
+  for `/readyz` but makes `/health/providers` report `overall: degraded`.
+- **Lint/vulnerability counts:** previous text claimed “0 issues” and “0 vulns”
+  as permanent facts. CI runs the tools; it does not guarantee zero findings.
+- **Coverage:** the 85% badge was unverified. The README no longer claims a
+  coverage number or gate. A prior `-coverpkg` measurement was around 53% and
+  has not been re-run for this release.
+- **Mock mode:** there is no mock provider mode. Tests use `httptest`; the
+  `k6` script requires a real upstream.
+- **Image size/dependency count:** no `<20MB` or “5 deps” claim is made. See
+  `go.mod` (8 direct modules).
+- **Metrics:** only the metric names in `internal/metrics/metrics.go` are
+  documented; `cache_hits` without the `_total` suffix does not exist.
 
 ## [v1.0.0] - 2026-09-01
 
 ### Added
-- **Unified OpenAI-compatible API** — `POST /v1/chat/completions` + `POST /v1/embeddings` + `GET /v1/models` behind `Provider` interface (`Name/Send/SendStream/Embed/Models/HealthCheck/DiscoverModels`).
-- **Providers** — OpenAI (`openai.go`), Anthropic (`anthropic.go` + `anthropic-version:2023-06-01`), Gemini (`gemini.go` `generateContent`/`streamGenerateContent`/`embedContent`).
-- **Translate layer** — `internal/translate/` pivot OpenAI ↔ Anthropic/Gemini (Fase 8, ADR-001).
-- **Streaming SSE** — `stream:true` `text/event-stream` with `data: {...}` + `data: [DONE]`, flush per chunk, Anthropic/Gemini → OpenAI translation (Fase 3).
-- **Intelligent routing** — `providers.<name>.models` wildcards `gpt-4*`/`claude-*`/`gemini-*` and regex, `routing.weighted` canary `90/10 ±5%` in 1k reqs, auto-discovery `models: []` → `GET /v1/models` (Fase 8).
-- **Resilience** — retry exponential jitter 3× `200ms` (`internal/resilience/retry.go`), circuit breaker 5 → open 30s half-open 1 (`circuit.go`), hedge race 300ms (`hedge.go`), `model_aliases` remap, `Retry-After` propagation, `X-Gateway-Provider` header (Fase 4).
-- **Observability** — Prometheus `/metrics` (`gateway_requests_total`, `gateway_request_duration_seconds`, `gateway_tokens_total`, `gateway_cache_hits_total`, `gateway_provider_errors_total`, `gateway_circuit_state`), OTEL `traceparent` span per provider, `slog` with `request_id/tenant/provider/latency_ms`, Jaeger/Prometheus/Grafana via `docker-compose` (Fase 5).
-- **Health** — `GET /health` (uptime), `/health/providers` fan-out parallel 3s `degraded`, `/livez`/`/readyz` K8s with `SetReady(false)` draining (Fase 1 & 5).
-- **Traffic control** — sharded 16× `fnv` + TTL 10m limiter (56ns `Allow`), token-aware `AllowN`, per-tenant/model `overrides`, monthly `budget` `insufficient_quota`, Redis Lua `INCR+EXPIRE` with memory fallback (Fase 6).
-- **Cache** — `X-Cache:HIT/MISS` LRU 1000 TTL 5m + Redis + semantic 0.97, `X-Cache-TTL`/`X-Cache-Skip`, only 200 non-stream, `sha256` key 1.8µs, hit 75ns (Fase 7, ADR-003).
-- **Security** — Bearer multi-tenant `auth` with `scopes`/`expires_at`, CORS allowlist, `X-Content-Type-Options nosniff` etc, secrets redacted `***` (logger + admin) (Fase 2).
-- **Control plane** — Admin `:8081` `GET /admin/config` redacted, `POST /admin/reload` 400 rollback, `GET /admin/providers`, `PATCH /admin/config` hot knobs (`rate_limit/cache/circuit/hedge/routing/logging`), file watcher 1s poll + `SIGHUP` with `Validate` rollback (Fase 9).
-- **Perf & Ops** — `ReadHeaderTimeout 5s` anti-Slowloris, `IdleTimeout 120s`, shared `Transport MaxIdleConns100/PerHost20/KeepAlive30s/ForceAttemptHTTP2`, `sync.Pool` JSON buffers, `BENCH.md` + `k6` 1k RPS p95<30ms, K8s `Deployment/HPA 3→10/PDB minAvailable:2/ServiceMonitor`, `pprof :6060` behind admin auth, `readOnlyRootFilesystem` + `runAsNonRoot` (Fase 10).
-- **DX & Release** — `examples/` (curl/python/node/langchain/postman), `docs/ARCHITECTURE.md` C4 + ADR-001..003, `CONTRIBUTING.md` (<10 min), `BENCH.md`, `VERSION` SemVer, `make dev` air live-reload, contract suite `tests/contract/openai_compat_test.go` (Fase 11).
-- **CI/CD** — `ci.yaml` (test, lint, vulncheck, docker), `release.yaml` on tag `v*` (Fase 11).
+
+- **Unified OpenAI-compatible API** — `POST /v1/chat/completions` +
+  `POST /v1/embeddings` + `GET /v1/models` behind the `Provider` interface
+  (`Name/Send/SendStream/Embed/Models/HealthCheck/DiscoverModels`).
+- **Providers** — OpenAI, Anthropic (`anthropic-version: 2023-06-01`) and Gemini
+  (`generateContent`/`streamGenerateContent`/`embedContent`).
+- **Translate layer** — OpenAI pivot ↔ Anthropic/Gemini (ADR-001).
+- **Streaming SSE** — `stream:true` with `data: {...}` + `data: [DONE]`, flush
+  per chunk, Anthropic/Gemini → OpenAI translation.
+- **Intelligent routing** — exact models, glob/regex patterns, weighted canary,
+  auto-discovery via `GET /models` and `model_aliases` on fallback.
+- **Resilience** — retry with exponential jitter, circuit breaker with half-open
+  probe, hedge race and `Retry-After` propagation; `X-Gateway-Provider` header.
+- **Observability** — Prometheus metrics, OTEL trace context, `slog` with
+  request/tenant/provider/latency fields, optional Jaeger/Prometheus/Grafana
+  compose services.
+- **Health** — `/health`, `/health/providers`, `/livez`, `/readyz` with drain
+  semantics.
+- **Traffic control** — sharded token bucket with TTL cleanup, token-aware
+  limiting, per-tenant/model overrides, monthly budget and Redis Lua buckets
+  with an in-process limiter fallback.
+- **Cache** — exact LRU or Redis cache, `X-Cache`/`X-Cache-TTL`/`X-Cache-Skip`,
+  cache only for 200 non-streaming responses (ADR-003).
+- **Security** — Bearer tenant keys with scopes/expiry, CORS allowlist, baseline
+  security headers, secret redaction.
+- **Control plane** — admin API with redacted config, validated reload,
+  provider list and hot knobs; 1 s file watcher and `SIGHUP`.
+- **Perf & ops** — hardened HTTP server timeouts, shared transport, JSON buffer
+  pool, K8s Deployment/HPA/PDB/ServiceMonitor, non-root/read-only container
+  posture.
+- **DX & release** — examples for curl/Python/Node/LangChain/Postman, C4
+  architecture and ADR-001..003, `BENCH.md`, `VERSION`, contract tests and CI.
 
 ### Changed
-- Go bump `1.22 → 1.24`, `alpine:3.19 → 3.21`, `golang:1.24-alpine` builder.
-- `config.Load` strict validation: `port∈[1024,65535]`, `fallback_chain` subset, `models` non-empty, `burst>=1` etc.
-- `proxy/handler.go` adds `MaxBytesReader 1MiB` + `DisallowUnknownFields` + per-handler timeout.
-- Error mapping: `ErrNoProvider` → `404 model_not_found`, validation → `400`, retryable → `502 fallback`.
-- `HealthProvidersHandler` now parallel fan-out with per-provider 3s timeout.
+
+- Go `1.22 → 1.24`; Alpine `3.19 → 3.21` builder/runtime.
+- Strict config validation (ports, fallback references, model lists, bursts).
+- Handler body limit, unknown-field rejection and per-handler timeouts.
+- Error mapping: no provider → `404 model_not_found`; validation → `400`;
+  retryable failures → `502 provider_error`.
+- Provider health fan-out runs in parallel with per-provider timeouts.
 
 ### Fixed
-- `Stream=true` no longer hangs (was accepted but never proxied, G1).
-- `Gemini API key` not logged; `Anthropic` healthcheck no longer spends credits.
-- `Limiter buckets` leak fixed via TTL 10m cleanup + sharded 16× mutex (G6).
-- Auth no longer uses raw `Authorization` header as rate-limit key.
+
+- `stream:true` is actually proxied instead of being accepted and ignored.
+- Gemini API key is not logged or placed in URLs.
+- Limiter buckets expire instead of leaking.
+- Auth no longer uses the raw `Authorization` header as the rate-limit key.
 
 ### Security
-- `govulncheck` 0 vulns, `golangci-lint` 0 issues, `docker scout` clean, `go vet` clean.
+
+- CI runs `govulncheck`, `golangci-lint` and `go vet`; see “Corrected claims”
+  above for the limits of those statements.
 
 ## [v0.9.0] - 2026-08-31 (pre-release, Fases 5-10)
 
-- Fase 5 Observability, Fase 6 RateLimit v2, Fase 7 Cache, Fase 8 Routing, Fase 9 Control Plane, Fase 10 Perf/Hardening.
+- Fase 5 Observability, Fase 6 RateLimit v2, Fase 7 Cache, Fase 8 Routing,
+  Fase 9 Control Plane, Fase 10 Perf/Hardening.
 
 ## [v0.3.0] - 2026-08-15 (Fases 1-4)
 
@@ -70,6 +210,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [v0.1.0] - 2026-08-01 (scaffold)
 
-- Initial scaffold: `Provider` interface, 3 providers, naive fallback, in-memory limiter, `slog`, Docker multi-stage.
+- Initial scaffold: `Provider` interface, 3 providers, naive fallback,
+  in-memory limiter, `slog`, Docker multi-stage.
 
+[Unreleased]: https://github.com/Francisco-cor/LLM-API-Gateway/compare/v1.1.0...HEAD
+[v1.1.0]: https://github.com/Francisco-cor/LLM-API-Gateway/releases/tag/v1.1.0
 [v1.0.0]: https://github.com/Francisco-cor/LLM-API-Gateway/releases/tag/v1.0.0

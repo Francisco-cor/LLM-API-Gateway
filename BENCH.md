@@ -1,84 +1,145 @@
-# Benchmarks — Fase 10
+# Benchmarks
 
-Generated with `go test ./... -bench=. -benchmem -count=1` on:
-- Go 1.24 (shared http.Transport, pooled JSON buffers, sharded Limiter 16×, TTL cleanup)
-- Windows AMD64 (local), similar expected on linux/amd64 in CI.
+> **These are microbenchmarks, not a capacity claim.**
+> The last recorded reference was captured on **2026-09-01 on Windows AMD64 with
+> Go 1.24** using the command below. It has **not** been re-measured for
+> `v1.1.0`, and the repository does not commit an end-to-end load test result.
+> Treat the numbers as a local reference, not a guarantee. CPU model, governor,
+> background load and Go version change them.
+
+## What is actually benchmarked
+
+Only these benchmarks exist (`tests/bench_test.go`):
+
+| Benchmark | What it measures |
+|---|---|
+| `BenchmarkLimiter_Allow` | Token bucket `Allow` on the sharded limiter |
+| `BenchmarkLimiter_Allow_Sharded` | Parallel `Allow` (`b.RunParallel`), exercising shard contention |
+| `BenchmarkLimiter_AllowN_Token` | `AllowN` for a token count |
+| `BenchmarkBuildKey` | SHA-256 canonical JSON cache key |
+| `BenchmarkCache_Get_Hit` | In-memory LRU hit |
+| `BenchmarkCache_Get_Miss` | In-memory LRU miss |
+
+Historical documentation listed `BenchmarkLimiter_Concurrent`,
+`BenchmarkMarshalJSON_Pooled` and `BenchmarkHandler_Dispatch_Mock`. **Those do
+not exist** and have been removed. Do not cite them.
 
 ## How to run
 
 ```bash
-go test ./... -bench=. -benchmem -count=1
-go test ./tests -run=^$ -bench=Bench -benchmem -count=3 | tee bench.txt
-# k6 (requires mock upstream or real keys)
-k6 run tests/load/k6.js --env GATEWAY_URL=http://localhost:8080
-# or vegeta
-echo "POST http://localhost:8080/v1/chat/completions" | vegeta attack -duration=30s -rate=1000 -body=tests/load/payload.json | vegeta report
+# from the repository root
+go test ./tests -run '^$' -bench=. -benchmem -count=3
+
+# a single family, with a stable machine and no other load
+go test ./tests -run '^$' -bench='Benchmark(Limiter|Cache|BuildKey)' \
+  -benchmem -count=5 -benchtime=2s
+
+# capture CPU and memory profiles for one benchmark
+go test ./tests -run '^$' -bench='BenchmarkBuildKey' \
+  -benchmem -cpuprofile=/tmp/cpu.prof -memprofile=/tmp/mem.prof
+go tool pprof -http=:9091 /tmp/cpu.prof
 ```
 
-## Micro benchmarks (local, 2026-09-01)
+Report the result with **hardware, OS, Go version, commit and command**:
 
-```
-BenchmarkLimiter_Allow-8           5000000    210 ns/op    0 allocs/op
-BenchmarkLimiter_Allow_Sharded-8   8000000    145 ns/op    0 allocs/op  # 16 shards, fnv hash
-BenchmarkLimiter_AllowN_Token-8    4000000    220 ns/op    0 allocs/op
-BenchmarkLimiter_Concurrent-8      2000000    680 ns/op   12 allocs/op  # 200 goroutines contending
-BenchmarkBuildKey-8               1000000   1150 ns/op  512 allocs/op  # sha256(canonicalJSON)
-BenchmarkCache_Get_Hit-8          5000000    180 ns/op    0 allocs/op
-BenchmarkCache_Get_Miss-8         5000000    150 ns/op    0 allocs/op
-BenchmarkMarshalJSON_Pooled-8     2000000    890 ns/op  256 allocs/op  # vs json.Marshal 1200 ns/op
-BenchmarkHandler_Dispatch_Mock-8   50000   25000 ns/op 1800 allocs/op  # mock provider, no net
+```text
+CPU:        <model>, <cores>, <RAM>
+OS:         <linux/amd64 | darwin/arm64 | ...>
+Go:         go version
+Commit:     git rev-parse --short HEAD
+Command:    go test ./tests -run '^$' -bench=. -benchmem -count=3
 ```
 
-Notes:
+## Last recorded reference (not re-measured)
 
-- Limiter p99 < 5ms at 1k rps sustained with 16 shards (mu per-shard, not global).
-  TTL cleanup (2m) keeps memory bounded vs leak in original single-mutex map.
-- `BuildKey` SHA256 dominates cache path but stays <1.2µs; cache `Get` hit <200ns due to LRU+RW? actually Mutex but cheap.
-- `marshalJSON` pooled buffer saves ~25% allocs vs `json.Marshal` at 10k rps.
-- `http.Transport` tuning: `MaxIdleConns=100`, `MaxIdleConnsPerHost=20`, `IdleConnTimeout=90s`, `ForceAttemptHTTP2=true`
-  reduces TLS handshake overhead from ~15ms to ~1ms on keep-alive.
-- `http.Server` tuning: `ReadHeaderTimeout=5s` mitigates Slowloris, `IdleTimeout=120s` keeps keep-alive friendly,
-  `ReadTimeout=30s`/`WriteTimeout=60s` from config.
+Source: the previous `BENCH.md`, dated 2026-09-01, Windows AMD64, Go 1.24,
+`go test ./... -bench=. -benchmem -count=1`. Formatting normalized; values are
+shown as recorded, not re-validated:
 
-## k6 load (mock providers, Fase 10 DoD)
+```text
+BenchmarkLimiter_Allow-8            210 ns/op      0 allocs/op
+BenchmarkLimiter_Allow_Sharded-8    145 ns/op      0 allocs/op   # sharded path
+BenchmarkLimiter_AllowN_Token-8     220 ns/op      0 allocs/op
+BenchmarkBuildKey-8                1150 ns/op    512 allocs/op   # sha256(canonical JSON)
+BenchmarkCache_Get_Hit-8            180 ns/op      0 allocs/op
+BenchmarkCache_Get_Miss-8           150 ns/op      0 allocs/op
+```
 
-Command:
+Earlier README/BENCH text also quoted `56 ns`, `75 ns` and `1.8 µs` for the same
+paths. Those values conflict with the recorded table above and with each other;
+they have been removed rather than presented as fact. If you need a number,
+run the command on your hardware and publish the metadata.
+
+## Load testing: what is missing
+
+`tests/load/k6.js` exists and targets `/v1/chat/completions`, but:
+
+- the gateway has **no mock provider mode**; the script requires a real
+  upstream or a separately deployed fake upstream;
+- its thresholds (`p95 < 30 ms`, `p99 < 50 ms`) assume a fake upstream with
+  near-zero latency; against a real LLM they measure the provider, not the
+  gateway;
+- no result from this script is committed, so there is no reproducible
+  end-to-end throughput number in this repository;
+- the old “1 instance ~3.2k RPS at 80% CPU” claim has been removed: there is no
+  committed evidence for it.
+
+To run a meaningful load test, deploy a local OpenAI-compatible stub with a
+fixed 200 response, point a provider `base_url` at it, disable auth or use a
+test key, then:
 
 ```bash
-docker-compose up -d gateway redis
-k6 run tests/load/k6.js --env GATEWAY_URL=http://localhost:8080 --env GATEWAY_API_KEY=test-key
+k6 run tests/load/k6.js \
+  --env GATEWAY_URL=http://localhost:8080 \
+  --env GATEWAY_API_KEY=test-key
 ```
 
-Expectation (mock providers returning static JSON, no external net):
+Publish the stub implementation, its latency, the hardware and the commit
+alongside the result. Without those, a p95 is not comparable.
 
-- 1k RPS sustained 30s, 1% error budget → `http_req_failed <1%`
-- p95 overhead <30ms (gateway logic only, without upstream latency)
-- p99 <50ms
-- No OOM, hpa stable at 3 replicas, pdb allows voluntary disruption.
-
-Observed locally (mock `tests/mocks_test.go` style httptest providers, 4 cores):
-
-- p50 ~2ms, p95 ~8ms, p99 ~18ms (with metrics+cache enabled)
-- Throughput 1 instance ~3.2k rps before CPU ~80% (4 core)
-- With Redis cache enabled, second-hit path p95 ~4ms
+The roadmap tracks a versioned fake-upstream harness and a capacity test:
+see [`docs/ROADMAP.md`](docs/ROADMAP.md) (R-29, Fase 7).
 
 ## Profiling
 
-pprof is on `:6060` (and `:8081`) behind `ADMIN_API_KEY` auth:
+pprof is **opt-in** and is served by the admin mux, not on `:6060`:
 
-```bash
-# fetch heap
-curl -H "Authorization: Bearer $ADMIN_API_KEY" http://localhost:6060/debug/pprof/heap > heap.prof
-go tool pprof heap.prof
-# hot reload via admin
-curl -H "Authorization: Bearer $ADMIN_API_KEY" -X POST http://localhost:8081/admin/reload
-curl -H "Authorization: Bearer $ADMIN_API_KEY" http://localhost:6060/debug/pprof/goroutine?debug=1
+```yaml
+admin:
+  pprof_enabled: true
+  api_key: ${ADMIN_API_KEY}
+  bind_address: 127.0.0.1
 ```
 
-Images run with `readOnlyRootFilesystem: true`, `runAsNonRoot: true` (see `deploy/k8s/deployment.yaml`).
+Restart the process (pprof routes are registered when the admin handler is
+built), then:
 
-## Next
+```bash
+curl -sS -H "Authorization: Bearer $ADMIN_API_KEY" \
+  http://127.0.0.1:8081/debug/pprof/heap -o /tmp/heap.prof
+go tool pprof -http=:9091 /tmp/heap.prof
+```
 
-- Tune `GOMAXPROCS` via `automaxprocs` in K8s if needed.
-- Consider `sync.Map` or `atomic` for Limiter if bench shows contention beyond 5k rps.
-- Add `fasthttp` evaluation if p95 overhead exceeds budget after OTEL sampling.
+Heap dumps can contain provider keys and prompt data. Treat them as secrets,
+do not attach them to tickets, and disable pprof afterwards.
+
+## Notes that are still true
+
+- `http.Transport` is shared with `MaxIdleConns=100`,
+  `MaxIdleConnsPerHost=20`, `MaxConnsPerHost=100`, `IdleConnTimeout=90s`,
+  `TLSHandshakeTimeout=5s` and `ForceAttemptHTTP2=true`.
+- The server sets `ReadHeaderTimeout=5s`, `IdleTimeout=120s`, and clears the
+  write deadline for active SSE streams.
+- The limiter uses 16 shards, a 10-minute bucket TTL and a 2-minute cleanup
+  tick. Those are implementation facts, not throughput claims.
+- The cache is either in-memory LRU or Redis, not a layered cache. If Redis is
+  configured and dies at runtime, gets return miss and sets fail silently; the
+  request still succeeds. See the runbook.
+
+## Next (roadmap)
+
+- Add a committed fake upstream and a repeatable load test.
+- Publish p50/p95/p99 with hardware, date and commit.
+- Add a gateway-overhead timer separate from upstream latency.
+- Only optimize after the measurement exists; do not tune nanoseconds against
+  an unmeasured bottleneck.

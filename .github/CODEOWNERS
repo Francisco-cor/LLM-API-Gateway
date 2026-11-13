@@ -1,0 +1,12 @@
+# Default owner for everything in the repository.
+# Replace with a team handle if the project moves to an organization.
+* @Francisco-cor
+
+# Keep control-plane and security-sensitive paths under explicit review.
+/.github/ @Francisco-cor
+/internal/auth/ @Francisco-cor
+/internal/admin/ @Francisco-cor
+/internal/config/ @Francisco-cor
+/api/ @Francisco-cor
+/SECURITY.md @Francisco-cor
+/docs/ROADMAP.md @Francisco-cor

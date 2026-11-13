@@ -92,6 +92,13 @@ type BudgetConfig struct {
 	MonthlyUSD      float64       `yaml:"monthly_usd"`
 	CostPerTokenUSD float64       `yaml:"cost_per_token_usd"`
 	Pricing         PricingConfig `yaml:"pricing"`
+	// RequireSharedStore fails closed when Redis is configured but unreachable,
+	// instead of falling back to per-process accounting (which multiplies the
+	// quota by the replica count).
+	RequireSharedStore bool `yaml:"require_shared_store"`
+	// ReservationTTL bounds how long an uncommitted budget reservation holds
+	// quota. Zero uses the 10 minute default.
+	ReservationTTL time.Duration `yaml:"reservation_ttl"`
 }
 
 type PricingConfig struct {
@@ -102,11 +109,13 @@ type PricingConfig struct {
 }
 
 type PricingRule struct {
-	Provider                     string  `yaml:"provider"`
-	Model                        string  `yaml:"model"`
-	InputPerMillionTokensUSD     float64 `yaml:"input_per_million_tokens_usd"`
-	OutputPerMillionTokensUSD    float64 `yaml:"output_per_million_tokens_usd"`
-	EmbeddingPerMillionTokensUSD float64 `yaml:"embedding_per_million_tokens_usd"`
+	Provider                      string  `yaml:"provider"`
+	Model                         string  `yaml:"model"`
+	InputPerMillionTokensUSD      float64 `yaml:"input_per_million_tokens_usd"`
+	OutputPerMillionTokensUSD     float64 `yaml:"output_per_million_tokens_usd"`
+	EmbeddingPerMillionTokensUSD  float64 `yaml:"embedding_per_million_tokens_usd"`
+	CacheReadPerMillionTokensUSD  float64 `yaml:"cache_read_per_million_tokens_usd"`
+	CacheWritePerMillionTokensUSD float64 `yaml:"cache_write_per_million_tokens_usd"`
 }
 
 type LoggingConfig struct {
@@ -156,6 +165,8 @@ type CacheConfig struct {
 	Enabled                bool          `yaml:"enabled"`
 	TTL                    time.Duration `yaml:"ttl"`
 	MaxSize                int           `yaml:"max_size"`
+	MaxBytes               int64         `yaml:"max_bytes"`
+	MaxTTL                 time.Duration `yaml:"max_ttl"`
 	SemanticEnabled        bool          `yaml:"semantic_enabled"`
 	SemanticThreshold      float64       `yaml:"semantic_threshold"`
 	SemanticEmbeddingModel string        `yaml:"semantic_embedding_model"`
@@ -257,6 +268,9 @@ func (c *Config) Validate() error {
 		}
 	}
 	if c.RateLimit.Budget != nil {
+		if c.RateLimit.Budget.ReservationTTL < 0 {
+			return fmt.Errorf("rate_limit.budget.reservation_ttl must be >=0")
+		}
 		p := c.RateLimit.Budget.Pricing
 		if p.Currency != "" && p.Currency != "USD" {
 			return fmt.Errorf("rate_limit.budget.pricing.currency must be USD, got %q", p.Currency)
@@ -268,10 +282,14 @@ func (c *Config) Validate() error {
 			if rule.Provider == "" || rule.Model == "" {
 				return fmt.Errorf("rate_limit.budget.pricing.catalog[%d] provider and model are required", i)
 			}
-			if rule.InputPerMillionTokensUSD < 0 || rule.OutputPerMillionTokensUSD < 0 || rule.EmbeddingPerMillionTokensUSD < 0 {
+			if rule.InputPerMillionTokensUSD < 0 || rule.OutputPerMillionTokensUSD < 0 ||
+				rule.EmbeddingPerMillionTokensUSD < 0 || rule.CacheReadPerMillionTokensUSD < 0 ||
+				rule.CacheWritePerMillionTokensUSD < 0 {
 				return fmt.Errorf("rate_limit.budget.pricing.catalog[%d] rates must be >=0", i)
 			}
-			if rule.InputPerMillionTokensUSD == 0 && rule.OutputPerMillionTokensUSD == 0 && rule.EmbeddingPerMillionTokensUSD == 0 {
+			if rule.InputPerMillionTokensUSD == 0 && rule.OutputPerMillionTokensUSD == 0 &&
+				rule.EmbeddingPerMillionTokensUSD == 0 && rule.CacheReadPerMillionTokensUSD == 0 &&
+				rule.CacheWritePerMillionTokensUSD == 0 {
 				return fmt.Errorf("rate_limit.budget.pricing.catalog[%d] needs at least one positive rate", i)
 			}
 		}
@@ -344,6 +362,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Cache.MaxSize < 0 {
 		return fmt.Errorf("cache.max_size must be >=0")
+	}
+	if c.Cache.MaxBytes < 0 {
+		return fmt.Errorf("cache.max_bytes must be >=0")
+	}
+	if c.Cache.MaxTTL < 0 {
+		return fmt.Errorf("cache.max_ttl must be >=0")
 	}
 	if c.Cache.SemanticThreshold < 0 || c.Cache.SemanticThreshold > 1 {
 		return fmt.Errorf("cache.semantic_threshold must be between 0 and 1")
