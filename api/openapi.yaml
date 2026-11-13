@@ -1,0 +1,1262 @@
+openapi: 3.1.0
+info:
+  title: LLM API Gateway
+  version: 1.1.0
+  summary: OpenAI-compatible gateway for OpenAI, Anthropic and Gemini.
+  description: |
+    Contract for the gateway's public HTTP surface and its admin API.
+
+    **Base URLs.** The data plane listens on `:8080`; the admin API listens on
+    `:8081` and defaults to `127.0.0.1`. Every admin operation overrides the
+    server to the admin listener.
+
+    **Authentication.** Tenant endpoints require `Authorization: Bearer <key>`
+    only when `auth.enabled` is true. The admin API accepts either a Bearer
+    token or `X-Admin-API-Key`. Config validation refuses to start when
+    `admin.allow_insecure` is false and no admin key is configured; if the
+    admin handler is somehow wired without a key, it returns `503` instead of
+    serving the control plane.
+
+    **Limits.** Chat and embeddings bodies are capped at 1 MiB. Unknown JSON
+    fields are rejected with `400`. Exactly one JSON value per request body is
+    accepted. Upstream responses are capped at 8 MiB.
+
+    **Validation scope.** The gateway itself validates the JSON shape, required
+    `model`/`messages`, non-empty embedding `input`, and body size. Numeric
+    ranges, enums and provider-specific combinations in this schema describe
+    the expected OpenAI shape; they are forwarded to the provider and may be
+    rejected upstream with `502` rather than by the gateway with `400`.
+
+    **Durations in the admin config.** `GET /admin/config` serializes the Go
+    config structs with their default JSON encoding: field names are
+    capitalized (`Admin.APIKey`, `Server.Port`) and `time.Duration` values are
+    integer nanoseconds. `PATCH /admin/config` accepts duration strings such as
+    `"30s"` or `"5m"`. This asymmetry is real and is documented here on purpose.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: http://localhost:8080
+    description: Data plane (chat, embeddings, models, health, metrics)
+  - url: http://localhost:8081
+    description: Admin API (loopback by default)
+tags:
+  - name: OpenAI compatibility
+  - name: Health
+  - name: Admin
+  - name: Observability
+
+paths:
+  /v1/chat/completions:
+    post:
+      tags: [OpenAI compatibility]
+      operationId: createChatCompletion
+      summary: Create a chat completion (JSON or SSE)
+      description: |
+        Resolves the model to a provider, applies rate limit / budget / cache,
+        then calls the provider with retry, circuit breaker and fallback.
+
+        With `stream: true`, responds `200` with `text/event-stream`. Each event
+        is `data: <StreamChunk>`; the stream ends with `data: [DONE]`. A
+        mid-stream provider failure emits `event: error` followed by
+        `data: [DONE]`. Streams are never cached and cannot be resumed.
+
+        If all providers fail before a stream starts, the gateway responds
+        `502` (never starts SSE). A provider `429` may surface as `502` after
+        fallbacks are exhausted; `Retry-After` is propagated.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatCompletionRequest'
+      responses:
+        '200':
+          description: Completion (JSON) or SSE stream.
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+            X-Gateway-Provider:
+              $ref: '#/components/headers/X-Gateway-Provider'
+            X-Cache:
+              $ref: '#/components/headers/X-Cache'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatCompletionResponse'
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  SSE stream. Lines are `data: {json}` separated by a blank
+                  line. Terminal frames: `data: [DONE]`; on provider failure
+                  after headers, `event: error` with an OpenAI error body then
+                  `data: [DONE]`.
+              example: |
+                data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1760000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},"finish_reason":null}]}
+
+                data: [DONE]
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/ModelNotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '502':
+          $ref: '#/components/responses/ProviderError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/GatewayTimeout'
+  /v1/embeddings:
+    post:
+      tags: [OpenAI compatibility]
+      operationId: createEmbeddings
+      summary: Create embeddings
+      description: |
+        Accepts a string or an array of strings. The gateway routes to an
+        `Embedder` provider (OpenAI or Gemini in this version). Exact-response
+        caching applies when enabled; embeddings are not streamed.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmbeddingRequest'
+      responses:
+        '200':
+          description: Embedding vector(s).
+          headers:
+            X-Request-ID:
+              $ref: '#/components/headers/X-Request-ID'
+            X-Gateway-Provider:
+              $ref: '#/components/headers/X-Gateway-Provider'
+            X-Cache:
+              $ref: '#/components/headers/X-Cache'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmbeddingResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/ModelNotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '502':
+          $ref: '#/components/responses/ProviderError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/models:
+    get:
+      tags: [OpenAI compatibility]
+      operationId: listModels
+      summary: List models declared by configured providers
+      description: |
+        Returns the union of `providers.<name>.models` after wildcard and
+        auto-discovery handling. It is a configured registry, not a live
+        upstream catalogue.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Model list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: Liveness and uptime (always 200 while the process is alive)
+      description: |
+        Returns gateway metadata. `ready` flips to false during graceful drain,
+        but this endpoint (and `/livez`) still returns 200.
+      responses:
+        '200':
+          description: Gateway status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /health/providers:
+    get:
+      tags: [Health]
+      operationId: getProviderHealth
+      summary: Per-provider health fan-out
+      description: |
+        Checks providers in parallel with `health.provider_timeout` and an
+        overall `health.check_timeout`. Returns 200 even when `overall` is
+        `degraded`. With `health.skip_expensive_checks`, Anthropic is reported
+        as `skipped`; this still degrades the aggregate because the aggregate
+        requires every status to be `healthy`.
+      responses:
+        '200':
+          description: Map of provider name to status, plus optional `overall`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderHealthMap'
+  /livez:
+    get:
+      tags: [Health]
+      operationId: getLivez
+      summary: Kubernetes liveness probe
+      description: Alias of `/health`; returns 200 while the process is alive.
+      responses:
+        '200':
+          description: Alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /readyz:
+    get:
+      tags: [Health]
+      operationId: getReadyz
+      summary: Kubernetes readiness probe
+      description: |
+        Returns 503 while draining, or when zero providers are healthy.
+        Provider results are cached for `health.readiness_cache_ttl`
+        (15s default, 30s in the production profile). `skipped` counts as
+        healthy here.
+      responses:
+        '200':
+          description: Ready.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+        '503':
+          description: Draining or no healthy provider.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+  /metrics:
+    get:
+      tags: [Observability]
+      operationId: getMetrics
+      summary: Prometheus metrics
+      description: |
+        Prometheus text exposition. This endpoint is intentionally not covered
+        by tenant auth; restrict it at the network layer. Metric names include
+        `gateway_requests_total`, `gateway_request_duration_seconds`,
+        `gateway_tokens_total`, `gateway_cost_usd_total`,
+        `gateway_provider_errors_total`, `gateway_circuit_state`,
+        `gateway_cache_hits_total` and `gateway_cache_size`.
+      security: []
+      responses:
+        '200':
+          description: Prometheus exposition format.
+          content:
+            text/plain:
+              schema:
+                type: string
+  /admin/config:
+    get:
+      tags: [Admin]
+      operationId: getAdminConfig
+      summary: Read the current configuration (secrets redacted)
+      description: |
+        Returns a YAML-round-tripped copy of the in-memory config as JSON.
+        Provider keys, the admin key, auth keys and the Redis URL are replaced
+        with `***`. Because the Go structs have no JSON tags, keys are the Go
+        field names (for example `Admin.APIKey`) and durations are integer
+        nanoseconds.
+      servers:
+        - url: http://localhost:8081
+          description: Admin API
+      security:
+        - adminBearer: []
+        - adminHeader: []
+      responses:
+        '200':
+          description: Redacted config.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminConfig'
+        '401':
+          $ref: '#/components/responses/AdminUnauthorized'
+        '503':
+          $ref: '#/components/responses/AdminDisabled'
+    patch:
+      tags: [Admin]
+      operationId: patchAdminConfig
+      summary: Apply hot-reloadable knobs
+      description: |
+        Applies a partial patch to the current in-memory configuration,
+        validates it, then swaps live state (registry, limiter, budget, cache,
+        auth, health, resilience). On any validation or apply error the old
+        configuration stays active and the response is `400`.
+
+        Not hot-reloadable: `admin.port`, `admin.bind_address`, `admin.api_key`,
+        `admin.pprof_enabled`, `server.*`. Those require a restart.
+      servers:
+        - url: http://localhost:8081
+          description: Admin API
+      security:
+        - adminBearer: []
+        - adminHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminPatch'
+      responses:
+        '200':
+          description: Patch applied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminActionStatus'
+        '400':
+          $ref: '#/components/responses/AdminBadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthorized'
+        '503':
+          $ref: '#/components/responses/AdminDisabled'
+  /admin/reload:
+    post:
+      tags: [Admin]
+      operationId: postAdminReload
+      summary: Reload the config file
+      description: |
+        Re-reads the process's `-config` file, validates it, rebuilds providers,
+        pricing, Redis and live state. On failure returns `400` and keeps the
+        previous configuration. `SIGHUP` and the 1s file watcher use the same
+        apply path.
+      servers:
+        - url: http://localhost:8081
+          description: Admin API
+      security:
+        - adminBearer: []
+        - adminHeader: []
+      responses:
+        '200':
+          description: Reloaded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminActionStatus'
+        '400':
+          $ref: '#/components/responses/AdminBadRequest'
+        '401':
+          $ref: '#/components/responses/AdminUnauthorized'
+        '503':
+          $ref: '#/components/responses/AdminDisabled'
+  /admin/providers:
+    get:
+      tags: [Admin]
+      operationId: getAdminProviders
+      summary: List configured providers and their models
+      servers:
+        - url: http://localhost:8081
+          description: Admin API
+      security:
+        - adminBearer: []
+        - adminHeader: []
+      responses:
+        '200':
+          description: Providers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProviders'
+        '401':
+          $ref: '#/components/responses/AdminUnauthorized'
+        '503':
+          $ref: '#/components/responses/AdminDisabled'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Tenant API key. Required when `auth.enabled` is true.
+    adminBearer:
+      type: http
+      scheme: bearer
+      description: Admin API key. The server also accepts the raw key in this header.
+    adminHeader:
+      type: apiKey
+      in: header
+      name: X-Admin-API-Key
+      description: Alternative to the Bearer header for the admin API.
+
+  headers:
+    X-Request-ID:
+      description: Request identifier (echoed or generated).
+      schema:
+        type: string
+    X-Gateway-Provider:
+      description: Provider that produced the response, or `cache` / `cache-semantic` on a hit.
+      schema:
+        type: string
+    X-Cache:
+      description: Cache result. Omitted when caching is disabled or for streams.
+      schema:
+        type: string
+        enum: [HIT, MISS]
+    Retry-After:
+      description: Seconds to wait before retrying.
+      schema:
+        type: integer
+        minimum: 1
+    X-RateLimit-Limit:
+      description: Request-per-minute limit for this bucket (only present on 429 from the request limiter).
+      schema:
+        type: integer
+    X-RateLimit-Remaining:
+      description: Remaining requests (always `0` on this 429 path).
+      schema:
+        type: integer
+
+  responses:
+    BadRequest:
+      description: Invalid JSON, unknown field, missing `model`/`messages`, or invalid input.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: 'invalid JSON body: json: unknown field "foo"'
+              type: invalid_request_error
+              code: invalid_request_error
+    Unauthorized:
+      description: Missing/invalid/expired API key.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: invalid or expired API key
+              type: invalid_request_error
+              code: invalid_api_key
+    Forbidden:
+      description: The key lacks the required scope.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+          description: '`Bearer error="insufficient_scope", scope="..."`'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: 'API key is missing required scope: chat:write'
+              type: insufficient_scope
+              code: insufficient_scope
+    ModelNotFound:
+      description: No configured provider serves the model.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: 'no provider configured: model "unknown"'
+              type: model_not_found
+              code: model_not_found
+    PayloadTooLarge:
+      description: Body exceeds 1 MiB.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: request body too large (max 1MiB)
+              type: invalid_request_error
+              code: invalid_request_error
+    RateLimited:
+      description: |
+        `rate_limit_exceeded` (local token bucket) or `insufficient_quota`
+        (monthly budget). Both are 429. `Retry-After` is set for the limiter
+        path; `X-RateLimit-*` headers are set only by the request limiter.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/Retry-After'
+        X-RateLimit-Limit:
+          $ref: '#/components/headers/X-RateLimit-Limit'
+        X-RateLimit-Remaining:
+          $ref: '#/components/headers/X-RateLimit-Remaining'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            rateLimit:
+              value:
+                error:
+                  message: rate limit exceeded, retry later
+                  type: rate_limit_exceeded
+                  code: rate_limit_exceeded
+            quota:
+              value:
+                error:
+                  message: 'insufficient_quota: monthly budget reservation denied'
+                  type: insufficient_quota
+                  code: insufficient_quota
+    ProviderError:
+      description: All providers failed, or the primary and fallbacks returned retryable errors.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/Retry-After'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: '[openai] upstream overloaded (HTTP 503)'
+              type: provider_error
+              code: provider_error
+    ServiceUnavailable:
+      description: |
+        Budget backend unavailable (`budget_unavailable`), price missing under
+        `reject` policy (`pricing_unavailable`), or admin key not configured on
+        the admin listener.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            budget:
+              value:
+                error:
+                  message: budget service temporarily unavailable
+                  type: budget_unavailable
+                  code: budget_unavailable
+            pricing:
+              value:
+                error:
+                  message: provider/model price is not configured
+                  type: pricing_unavailable
+                  code: pricing_unavailable
+    GatewayTimeout:
+      description: The request context or provider call timed out.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: request timed out
+              type: provider_error
+              code: provider_error
+    AdminUnauthorized:
+      description: Missing or invalid admin key.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AdminError'
+          example:
+            error: invalid admin api key
+    AdminDisabled:
+      description: Admin key is not configured and insecure mode is off (fail-closed).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AdminError'
+          example:
+            error: admin api key is not configured
+    AdminBadRequest:
+      description: Invalid patch, validation failure, or reload failure. Previous config remains active.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/AdminError'
+          example:
+            error: 'validation failed: rate_limit.burst must be > 0 when enabled'
+
+  schemas:
+    ChatCompletionRequest:
+      type: object
+      required: [model, messages]
+      additionalProperties: false
+      properties:
+        model:
+          type: string
+          description: Model name as declared by a provider (exact, glob or alias).
+        messages:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+        temperature:
+          type: number
+          description: Forwarded to the provider; not range-validated by the gateway.
+        max_tokens:
+          type: integer
+          description: Forwarded to the provider.
+        max_completion_tokens:
+          type: integer
+          description: Takes precedence over `max_tokens` when both are set.
+        top_p:
+          type: number
+        presence_penalty:
+          type: number
+        frequency_penalty:
+          type: number
+        logprobs:
+          type: boolean
+        top_logprobs:
+          type: integer
+        seed:
+          type: integer
+        stream:
+          type: boolean
+          default: false
+        stream_options:
+          $ref: '#/components/schemas/StreamOptions'
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tool'
+        tool_choice:
+          $ref: '#/components/schemas/ToolChoice'
+        parallel_tool_calls:
+          type: boolean
+        response_format:
+          $ref: '#/components/schemas/ResponseFormat'
+        stop:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                type: string
+        n:
+          type: integer
+          description: Forwarded to the provider; not validated by the gateway.
+        user:
+          type: string
+        service_tier:
+          type: string
+        reasoning_effort:
+          type: string
+        modalities:
+          type: array
+          items:
+            type: string
+        audio:
+          $ref: '#/components/schemas/AudioRequest'
+    ChatMessage:
+      type: object
+      required: [role]
+      additionalProperties: false
+      description: |
+        OpenAI message shape. Unknown fields are rejected. `content` may be a
+        string, an array of content parts, or null (for assistant tool calls).
+      properties:
+        role:
+          type: string
+          description: '`system`, `user`, `assistant`, `tool` or `developer`; forwarded, provider support varies.'
+        content:
+          oneOf:
+            - type: string
+            - type: array
+              items:
+                $ref: '#/components/schemas/ContentPart'
+            - type: 'null'
+        name:
+          type: string
+        tool_call_id:
+          type: string
+        tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolCall'
+        function_call:
+          $ref: '#/components/schemas/FunctionCall'
+        audio:
+          $ref: '#/components/schemas/Audio'
+        refusal:
+          type: string
+    ContentPart:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          description: '`text`, `image_url` or `input_audio` in OpenAI; forwarded.'
+        text:
+          type: string
+        image_url:
+          $ref: '#/components/schemas/ImageURL'
+        input_audio:
+          $ref: '#/components/schemas/InputAudio'
+    ImageURL:
+      type: object
+      required: [url]
+      additionalProperties: false
+      properties:
+        url:
+          type: string
+        detail:
+          type: string
+          description: '`auto`, `low` or `high`; forwarded.'
+    InputAudio:
+      type: object
+      required: [data, format]
+      additionalProperties: false
+      properties:
+        data:
+          type: string
+          description: Base64-encoded audio.
+        format:
+          type: string
+    Tool:
+      type: object
+      required: [type, function]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          description: Only `function` is meaningful in this version.
+        function:
+          type: object
+          required: [name]
+          additionalProperties: false
+          properties:
+            name:
+              type: string
+            description:
+              type: string
+            parameters:
+              type: object
+              additionalProperties: true
+              description: JSON Schema for the function arguments.
+    ToolChoice:
+      oneOf:
+        - type: string
+          description: '`none`, `auto` or `required`; forwarded, not validated.'
+        - type: object
+          required: [type, function]
+          additionalProperties: false
+          properties:
+            type:
+              type: string
+            function:
+              type: object
+              required: [name]
+              additionalProperties: false
+              properties:
+                name:
+                  type: string
+    ResponseFormat:
+      type: object
+      required: [type]
+      additionalProperties: false
+      description: |
+        The gateway models only `type` and forwards the string. The OpenAI
+        `json_schema` payload (`{type:"json_schema", json_schema:{...}}`) is not
+        modeled and its extra field is rejected as unknown. Values are not
+        validated against an enum.
+      properties:
+        type:
+          type: string
+    StreamOptions:
+      type: object
+      additionalProperties: false
+      properties:
+        include_usage:
+          type: boolean
+          description: Emit provider usage in the final SSE chunk when available.
+    ToolCall:
+      type: object
+      required: [id, type, function]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+        type:
+          type: string
+        function:
+          $ref: '#/components/schemas/FunctionCall'
+    FunctionCall:
+      type: object
+      required: [name, arguments]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+        arguments:
+          type: string
+          description: JSON-encoded arguments (string, as in OpenAI).
+    Audio:
+      type: object
+      properties:
+        id:
+          type: string
+        data:
+          type: string
+        transcript:
+          type: string
+        expires_at:
+          type: integer
+    AudioRequest:
+      type: object
+      required: [voice, format]
+      additionalProperties: false
+      properties:
+        voice:
+          type: string
+        format:
+          type: string
+    ChatCompletionResponse:
+      type: object
+      required: [id, object, created, model, choices, usage]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          const: chat.completion
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            $ref: '#/components/schemas/Choice'
+        usage:
+          $ref: '#/components/schemas/Usage'
+        system_fingerprint:
+          type: string
+        service_tier:
+          type: string
+    Choice:
+      type: object
+      required: [index, message, finish_reason]
+      properties:
+        index:
+          type: integer
+        message:
+          $ref: '#/components/schemas/ResponseMessage'
+        finish_reason:
+          oneOf:
+            - type: string
+            - type: 'null'
+        logprobs:
+          oneOf:
+            - type: object
+              additionalProperties: true
+            - type: 'null'
+    ResponseMessage:
+      type: object
+      required: [role]
+      properties:
+        role:
+          type: string
+        content:
+          oneOf:
+            - type: string
+            - type: 'null'
+        tool_calls:
+          type: array
+          items:
+            $ref: '#/components/schemas/ToolCall'
+        function_call:
+          $ref: '#/components/schemas/FunctionCall'
+        audio:
+          $ref: '#/components/schemas/Audio'
+        refusal:
+          type: string
+    Usage:
+      type: object
+      required: [prompt_tokens, completion_tokens, total_tokens]
+      properties:
+        prompt_tokens:
+          type: integer
+        completion_tokens:
+          type: integer
+        total_tokens:
+          type: integer
+    StreamChunk:
+      type: object
+      description: SSE `data:` payload.
+      required: [id, object, created, model, choices]
+      properties:
+        id:
+          type: string
+        object:
+          type: string
+          const: chat.completion.chunk
+        created:
+          type: integer
+        model:
+          type: string
+        choices:
+          type: array
+          items:
+            type: object
+            required: [index, delta]
+            properties:
+              index:
+                type: integer
+              delta:
+                type: object
+                properties:
+                  role:
+                    type: string
+                  content:
+                    type: string
+                  tool_calls:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ToolCall'
+              finish_reason:
+                oneOf:
+                  - type: string
+                  - type: 'null'
+        usage:
+          $ref: '#/components/schemas/Usage'
+        system_fingerprint:
+          type: string
+    EmbeddingRequest:
+      type: object
+      required: [model, input]
+      additionalProperties: false
+      properties:
+        model:
+          type: string
+        input:
+          oneOf:
+            - type: string
+              minLength: 1
+            - type: array
+              minItems: 1
+              items:
+                type: string
+        encoding_format:
+          type: string
+          description: Forwarded to the provider; not validated by the gateway.
+        dimensions:
+          type: integer
+          description: Forwarded to the provider; not validated by the gateway.
+        user:
+          type: string
+    EmbeddingResponse:
+      type: object
+      required: [object, data, model, usage]
+      properties:
+        object:
+          type: string
+          const: list
+        data:
+          type: array
+          items:
+            type: object
+            required: [object, index, embedding]
+            properties:
+              object:
+                type: string
+                const: embedding
+              index:
+                type: integer
+              embedding:
+                type: array
+                items:
+                  type: number
+                  format: float
+        model:
+          type: string
+        usage:
+          type: object
+          required: [prompt_tokens, total_tokens]
+          properties:
+            prompt_tokens:
+              type: integer
+            total_tokens:
+              type: integer
+    ModelList:
+      type: object
+      required: [object, data]
+      properties:
+        object:
+          type: string
+          const: list
+        data:
+          type: array
+          items:
+            type: object
+            required: [id, object, created, owned_by]
+            properties:
+              id:
+                type: string
+              object:
+                type: string
+                const: model
+              created:
+                type: integer
+              owned_by:
+                type: string
+    Health:
+      type: object
+      required: [status, uptime_seconds, start_time, ready]
+      properties:
+        status:
+          type: string
+          const: ok
+        uptime_seconds:
+          type: number
+        start_time:
+          type: string
+          format: date-time
+        ready:
+          type: boolean
+    Readiness:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready, draining]
+        ready:
+          type: boolean
+          description: Present only in the draining response.
+        healthy:
+          type: integer
+        total:
+          type: integer
+        providers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ProviderStatus'
+    ProviderStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [healthy, unhealthy, skipped]
+        error:
+          type: string
+    ProviderHealthMap:
+      type: object
+      description: |
+        Map of provider name to ProviderStatus, plus `overall` when degraded.
+        Because `overall` is a string and the other values are objects, this
+        schema is intentionally loose; the example is authoritative.
+      additionalProperties: true
+      example:
+        openai:
+          status: healthy
+        anthropic:
+          status: skipped
+        overall: degraded
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message, type, code]
+          properties:
+            message:
+              type: string
+            type:
+              type: string
+            code:
+              type: string
+    AdminError:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+    AdminActionStatus:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [reloaded, patched]
+    AdminConfig:
+      type: object
+      description: |
+        JSON encoding of the Go config structs. Field names are capitalized and
+        durations are integer nanoseconds. Secrets are replaced by `***`.
+      additionalProperties: true
+      example:
+        Server:
+          Port: 8080
+          ReadTimeout: 30000000000
+          WriteTimeout: 60000000000
+        Providers:
+          openai:
+            APIKey: '***'
+            BaseURL: https://api.openai.com/v1
+            Timeout: 30000000000
+            Models: [gpt-4o]
+        Admin:
+          Port: 8081
+          BindAddress: 127.0.0.1
+          APIKey: '***'
+          AllowInsecure: false
+          PprofEnabled: false
+        RateLimit:
+          RedisURL: '***'
+    AdminPatch:
+      type: object
+      additionalProperties: false
+      description: Partial update; only present fields are applied. Durations are strings (`30s`, `5m`).
+      properties:
+        rate_limit:
+          type: object
+          additionalProperties: false
+          properties:
+            requests_per_minute:
+              type: integer
+              minimum: 0
+            burst:
+              type: integer
+              minimum: 0
+            redis_url:
+              type: string
+        cache:
+          type: object
+          additionalProperties: false
+          properties:
+            ttl:
+              type: string
+            max_size:
+              type: integer
+              minimum: 0
+            semantic_enabled:
+              type: boolean
+            semantic_threshold:
+              type: number
+              minimum: 0
+              maximum: 1
+            semantic_embedding_model:
+              type: string
+            semantic_top_k:
+              type: integer
+              minimum: 0
+            semantic_max_entries:
+              type: integer
+              minimum: 0
+        health:
+          type: object
+          additionalProperties: false
+          properties:
+            readiness_cache_ttl:
+              type: string
+            check_timeout:
+              type: string
+            provider_timeout:
+              type: string
+            skip_expensive_checks:
+              type: boolean
+        resilience:
+          type: object
+          additionalProperties: false
+          properties:
+            retry:
+              type: object
+              additionalProperties: false
+              properties:
+                max_attempts:
+                  type: integer
+                  minimum: 0
+                base_delay:
+                  type: string
+                max_delay:
+                  type: string
+            circuit:
+              type: object
+              additionalProperties: false
+              properties:
+                failure_threshold:
+                  type: integer
+                  minimum: 0
+                open_timeout:
+                  type: string
+            hedge:
+              type: object
+              additionalProperties: false
+              properties:
+                enabled:
+                  type: boolean
+                delay:
+                  type: string
+        routing:
+          type: object
+          additionalProperties: false
+          properties:
+            weighted:
+              type: object
+              additionalProperties:
+                type: array
+                items:
+                  type: object
+                  required: [provider, weight]
+                  additionalProperties: false
+                  properties:
+                    provider:
+                      type: string
+                    name:
+                      type: string
+                      description: Alias for `provider`.
+                    weight:
+                      type: integer
+                      minimum: 1
+        logging:
+          type: object
+          additionalProperties: false
+          properties:
+            level:
+              type: string
+              enum: [debug, info, warn, error]
+            format:
+              type: string
+              enum: [json, text]
+    AdminProviders:
+      type: object
+      required: [providers]
+      properties:
+        providers:
+          type: array
+          items:
+            type: object
+            required: [name, models]
+            properties:
+              name:
+                type: string
+              base_url:
+                type: string
+                description: Present but empty in this version; the code populates only name and models.
+              models:
+                type: array
+                items:
+                  type: string

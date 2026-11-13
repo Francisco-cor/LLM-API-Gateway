@@ -1,0 +1,64 @@
+name: Feature request
+description: Propose a capability, provider or operational improvement.
+title: "feat: "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check `docs/ROADMAP.md` first: the item may already be planned. This form is for a concrete problem, not a wish list.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you unable to do today? Who is affected?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: Describe the API/config/behavior you expect, including compatibility impact.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds, other providers, or a simpler option.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - OpenAI contract
+        - Provider adapter
+        - Routing / resilience
+        - Rate limit / budget
+        - Cache
+        - Admin / control plane
+        - Observability
+        - Security
+        - Deployment
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Is this a roadmap item?
+      options:
+        - I checked and it is not in the roadmap
+        - It is in the roadmap; I want to implement it
+        - It is in the roadmap; I am asking for prioritization
+        - Not sure
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and the roadmap.
+          required: true
+        - label: This request does not require disclosing a security vulnerability.
+          required: true
