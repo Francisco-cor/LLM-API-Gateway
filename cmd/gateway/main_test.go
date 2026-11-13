@@ -111,7 +111,6 @@ func TestCacheConfigOfProjectsEveryRebuildField(t *testing.T) {
 		TTL:                    5 * time.Minute,
 		MaxSize:                100,
 		MaxBytes:               1 << 20,
-		MaxTTL:                 time.Hour,
 		SemanticEnabled:        true,
 		SemanticThreshold:      0.9,
 		SemanticEmbeddingModel: "text-embedding-3-small",
@@ -122,17 +121,23 @@ func TestCacheConfigOfProjectsEveryRebuildField(t *testing.T) {
 	if got != want {
 		t.Fatalf("cacheConfigOf = %+v, want %+v", got, want)
 	}
+
+	// max_ttl is enforced by the proxy handlers, so changing it alone must not
+	// invalidate a warm cache.
+	cfg.Cache.MaxTTL = 2 * time.Hour
+	if !cache.ConfigEquals(got, cacheConfigOf(cfg, true)) {
+		t.Fatal("changing cache.max_ttl alone triggered a cache rebuild")
+	}
 }
 
-func TestBuildCacheForConfigAppliesMaxTTL(t *testing.T) {
-	cc := cache.Config{Enabled: true, MaxSize: 10, MaxTTL: time.Hour}
-	built := buildCacheForConfig(cc, nil, proxy.NewRegistry(nil), discardLogger())
-	clamped, ok := built.(*maxTTLCache)
-	if !ok {
-		t.Fatalf("cache with max_ttl is %T, want *maxTTLCache", built)
+func TestBuildCacheForConfigHonorsEnabled(t *testing.T) {
+	disabled := buildCacheForConfig(cache.Config{MaxSize: 10}, nil, proxy.NewRegistry(nil), discardLogger())
+	if disabled != nil {
+		t.Fatalf("disabled cache = %T, want nil", disabled)
 	}
-	if clamped.max != time.Hour {
-		t.Fatalf("max TTL = %v, want 1h", clamped.max)
+	enabled := buildCacheForConfig(cache.Config{Enabled: true, MaxSize: 10, MaxBytes: 4096}, nil, proxy.NewRegistry(nil), discardLogger())
+	if enabled == nil {
+		t.Fatal("enabled cache is nil")
 	}
 }
 

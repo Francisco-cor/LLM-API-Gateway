@@ -147,7 +147,7 @@ cache:
   # Byte budget for in-memory entries (0 uses the 64 MiB default). An
   # individual response larger than this is not cached.
   max_bytes: 67108864
-  # Upper bound for X-Cache-TTL (0 disables the cap).
+  # Upper bound for X-Cache-TTL. 0 uses the built-in 24h cap.
   max_ttl: 1h
   semantic_enabled: false
   semantic_threshold: 0.97
