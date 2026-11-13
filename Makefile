@@ -1,37 +1,68 @@
-.PHONY: build run test test-race test-cover lint lint-fix bench vulncheck docker docker-run clean dev
+.PHONY: build run test test-race test-integration cover lint lint-fix bench vulncheck sbom docker-build docker docker-run clean dev
+
+GO ?= go
+LINT_VERSION ?= v2.15.0
 
 build:
-	go build -o bin/gateway ./cmd/gateway
+	$(GO) build -trimpath -o bin/gateway ./cmd/gateway
 
 run: build
 	./bin/gateway -config config.yaml
 
 test:
-	go test ./... -v -cover
+	$(GO) test ./... -count=1 -shuffle=on
 
 test-race:
-	go test ./... -race -coverprofile=coverage.out -v
+	$(GO) test ./... -count=1 -race
 
-test-cover: test-race
-	go tool cover -html=coverage.out
+# Integration tests opt in with a `//go:build integration` tag and expect a
+# Redis server at $REDIS_URL (defaults to the compose instance). With no tagged
+# files this is equivalent to `test` plus the integration tag.
+test-integration:
+	REDIS_URL=$${REDIS_URL:-redis://127.0.0.1:6379/0} $(GO) test -tags=integration ./... -count=1 -race
+
+cover:
+	$(GO) test ./... -count=1 -race -coverpkg=./... -coverprofile=coverage.out
+	$(GO) tool cover -func=coverage.out | tail -1
 
 lint:
-	golangci-lint run ./...
+	@command -v golangci-lint >/dev/null 2>&1 || { \
+		echo "golangci-lint not found: install $(LINT_VERSION) (https://golangci-lint.run/welcome/install/)"; \
+		exit 1; \
+	}
+	golangci-lint run --timeout 5m ./...
 
 lint-fix:
-	golangci-lint run --fix ./...
+	@command -v golangci-lint >/dev/null 2>&1 || { \
+		echo "golangci-lint not found: install $(LINT_VERSION) (https://golangci-lint.run/welcome/install/)"; \
+		exit 1; \
+	}
+	golangci-lint run --fix --timeout 5m ./...
 
 bench:
-	go test ./... -bench=. -benchmem
+	$(GO) test ./... -bench=. -benchmem
 
 vulncheck:
+	@command -v govulncheck >/dev/null 2>&1 || { \
+		echo "govulncheck not found: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4"; \
+		exit 1; \
+	}
 	govulncheck ./...
 
-docker:
-	docker build -t llm-api-gateway .
+sbom:
+	@command -v syft >/dev/null 2>&1 || { \
+		echo "syft not found: https://github.com/anchore/syft#installation"; \
+		exit 1; \
+	}
+	syft dir:. -o spdx-json=sbom.spdx.json
 
-docker-run: docker
-	docker-compose up -d
+docker-build:
+	docker build -t llm-api-gateway:local .
+
+docker: docker-build
+
+docker-run: docker-build
+	docker compose up -d
 
 dev:
 	@if command -v air >/dev/null 2>&1; then \
@@ -42,4 +73,4 @@ dev:
 	fi
 
 clean:
-	rm -rf bin/ coverage.out tmp/
+	rm -rf bin/ dist/ coverage.out coverage.html sbom.spdx.json tmp/

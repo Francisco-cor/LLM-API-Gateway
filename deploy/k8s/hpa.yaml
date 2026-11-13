@@ -9,6 +9,7 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: llm-api-gateway
+  # Keep minReplicas >= PDB minAvailable so evictions can always make progress.
   minReplicas: 3
   maxReplicas: 10
   metrics:
@@ -24,6 +25,8 @@ spec:
         target:
           type: Utilization
           averageUtilization: 80
+    # TODO(observability): add a Pods/RPS metric once prometheus-adapter is
+    # installed; there is no built-in RPS metric in autoscaling/v2.
   behavior:
     scaleDown:
       stabilizationWindowSeconds: 300

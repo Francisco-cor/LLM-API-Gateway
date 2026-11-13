@@ -1,11 +1,17 @@
 bin/
+dist/
 *.env
 .env
 .env.*
 !.env.example
 config.local.yaml
 coverage.out
+coverage.html
+*.test
+/gateway
+sbom*.json
 AUDITORIA_Y_PLAN.md
+deploy/k8s/secret.yaml
 
 # Local handoff/pending notes and Claude Code project files
 HANDOFF.md
