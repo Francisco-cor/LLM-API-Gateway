@@ -203,6 +203,61 @@ func TestGeminiTranslation(t *testing.T) {
 	}
 }
 
+// TestOpenAIResponseFormatJSONSchemaPassthrough verifies that a json_schema
+// response_format is forwarded verbatim instead of being dropped.
+func TestOpenAIResponseFormatJSONSchemaPassthrough(t *testing.T) {
+	var captured struct {
+		ResponseFormat struct {
+			Type       string          `json:"type"`
+			JSONSchema json.RawMessage `json:"json_schema"`
+		} `json:"response_format"`
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&captured)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl-1",
+			"object":  "chat.completion",
+			"created": 1700000000,
+			"model":   "gpt-4o",
+			"choices": []map[string]any{{
+				"index":         0,
+				"message":       map[string]string{"role": "assistant", "content": "{}"},
+				"finish_reason": "stop",
+			}},
+			"usage": map[string]int{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+		})
+	}))
+	defer srv.Close()
+
+	p := provider.NewOpenAI("test-key", srv.URL, 5*time.Second, []string{"gpt-4o"})
+	_, err := p.Send(context.Background(), provider.ChatRequest{
+		Model:    "gpt-4o",
+		Messages: []provider.ChatMessage{{Role: "user", Content: "hi"}},
+		ResponseFormat: &provider.ResponseFormat{
+			Type:       "json_schema",
+			JSONSchema: json.RawMessage(`{"name":"answer","strict":true,"schema":{"type":"object"}}`),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Send failed: %v", err)
+	}
+	if captured.ResponseFormat.Type != "json_schema" {
+		t.Errorf("response_format.type = %q", captured.ResponseFormat.Type)
+	}
+	var schema struct {
+		Name   string `json:"name"`
+		Strict bool   `json:"strict"`
+	}
+	if err := json.Unmarshal(captured.ResponseFormat.JSONSchema, &schema); err != nil {
+		t.Fatalf("json_schema = %s: %v", captured.ResponseFormat.JSONSchema, err)
+	}
+	if schema.Name != "answer" || !schema.Strict {
+		t.Errorf("json_schema = %+v", schema)
+	}
+}
+
 // TestProviderError_Retryable verifies that 429 and 5xx responses are marked
 // retryable so the handler can fall back to another provider.
 func TestProviderError_Retryable(t *testing.T) {

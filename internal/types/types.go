@@ -38,6 +38,7 @@ type InputAudio struct {
 }
 
 type ToolCall struct {
+	Index    int              `json:"index"`
 	ID       string           `json:"id"`
 	Type     string           `json:"type"`
 	Function ToolCallFunction `json:"function"`
@@ -132,6 +133,7 @@ type ChatRequest struct {
 	MaxTokens           *int            `json:"max_tokens,omitempty"`
 	MaxCompletionTokens *int            `json:"max_completion_tokens,omitempty"`
 	TopP                *float64        `json:"top_p,omitempty"`
+	TopK                *int            `json:"top_k,omitempty"`
 	PresencePenalty     *float64        `json:"presence_penalty,omitempty"`
 	FrequencyPenalty    *float64        `json:"frequency_penalty,omitempty"`
 	Logprobs            *bool           `json:"logprobs,omitempty"`
@@ -176,9 +178,12 @@ type ToolFunc struct {
 	Parameters  any    `json:"parameters,omitempty"`
 }
 
-// ResponseFormat controls output formatting.
+// ResponseFormat controls output formatting. JSONSchema is passed through
+// verbatim so json_schema responses keep the caller's name/strict/schema.
 type ResponseFormat struct {
-	Type string `json:"type"` // "text" | "json_object" | "json_schema"
+	Type       string          `json:"type"` // "text" | "json_object" | "json_schema"
+	JSONSchema json.RawMessage `json:"json_schema,omitempty"`
+	Strict     *bool           `json:"strict,omitempty"`
 }
 
 // StreamOptions mirrors OpenAI stream_options.
@@ -206,11 +211,25 @@ type Choice struct {
 	Logprobs     any         `json:"logprobs,omitempty"`
 }
 
-// Usage holds token consumption for a request.
+// Usage holds token consumption for a request. Detail objects stay nil when a
+// provider does not report them so the wire format is unchanged.
 type Usage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
+	PromptTokens            int                      `json:"prompt_tokens"`
+	CompletionTokens        int                      `json:"completion_tokens"`
+	TotalTokens             int                      `json:"total_tokens"`
+	PromptTokensDetails     *PromptTokensDetails     `json:"prompt_tokens_details,omitempty"`
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+}
+
+// PromptTokensDetails mirrors OpenAI's cached-token breakdown. Providers that
+// report cached prompt tokens (Anthropic) expose them here.
+type PromptTokensDetails struct {
+	CachedTokens int `json:"cached_tokens,omitempty"`
+}
+
+// CompletionTokensDetails mirrors OpenAI's reasoning-token breakdown.
+type CompletionTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens,omitempty"`
 }
 
 // StreamChunk is an OpenAI-compatible SSE chunk.
@@ -255,8 +274,9 @@ type EmbeddingData struct {
 }
 
 type EmbeddingUsage struct {
-	PromptTokens int `json:"prompt_tokens"`
-	TotalTokens  int `json:"total_tokens"`
+	PromptTokens int  `json:"prompt_tokens"`
+	TotalTokens  int  `json:"total_tokens"`
+	Estimated    bool `json:"estimated,omitempty"`
 }
 
 // Error is the OpenAI-compatible error body.
