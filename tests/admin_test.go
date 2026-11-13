@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -461,5 +462,272 @@ func TestAdmin_ReloadViaFileWatcherRollback(t *testing.T) {
 	time.Sleep(600 * time.Millisecond)
 	if called {
 		t.Error("watch should not call onChange for invalid yaml")
+	}
+}
+
+func TestAdmin_PatchIfMatchETag(t *testing.T) {
+	cfg, err := config.Load(writeTempConfig(t, minimalValidConfig()))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	registry := proxy.NewRegistry([]provider.Provider{&mockProvider{name: "openai", models: []string{"gpt-4o"}}})
+	srv := admin.New(slog.New(slog.NewTextHandler(io.Discard, nil)), "secret123", "", cfg, registry, nil, nil)
+	h := srv.Handler()
+
+	get := func() *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/admin/config", nil)
+		req.Header.Set("Authorization", "Bearer secret123")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w
+	}
+	patch := func(ifMatch string, burst int) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(map[string]any{"rate_limit": map[string]any{"burst": burst}})
+		req := httptest.NewRequest(http.MethodPatch, "/admin/config", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer secret123")
+		req.Header.Set("Content-Type", "application/json")
+		if ifMatch != "" {
+			req.Header.Set("If-Match", ifMatch)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w
+	}
+
+	first := get()
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("GET /admin/config did not return an ETag")
+	}
+
+	stale := patch(`"stale-version"`, 77)
+	if stale.Code != http.StatusConflict {
+		t.Fatalf("stale If-Match got %d, want 409 body %s", stale.Code, stale.Body.String())
+	}
+	if got := patch(etag, 88); got.Code != http.StatusOK {
+		t.Fatalf("current If-Match got %d, want 200 body %s", got.Code, got.Body.String())
+	}
+	updated := get()
+	if updated.Header().Get("ETag") == etag {
+		t.Fatal("ETag did not change after a successful patch")
+	}
+	if got := patch("*", 99); got.Code != http.StatusOK {
+		t.Fatalf("If-Match * got %d, want 200", got.Code)
+	}
+}
+
+func TestAdmin_RedactsProviderURLSecrets(t *testing.T) {
+	cfg, err := config.Load(writeTempConfig(t, minimalValidConfig()))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	p := cfg.Providers["openai"]
+	p.BaseURL = "https://user:password@api.example.com/v1?api-version=secret-value"
+	cfg.Providers["openai"] = p
+	cfg.Auth.KeyPepper = "super-secret-pepper"
+
+	registry := proxy.NewRegistry([]provider.Provider{&mockProvider{name: "openai", models: []string{"gpt-4o"}}})
+	srv := admin.New(slog.New(slog.NewTextHandler(io.Discard, nil)), "secret123", "", cfg, registry, nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "/admin/config", nil)
+	req.Header.Set("Authorization", "Bearer secret123")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /admin/config %d", w.Code)
+	}
+	body := w.Body.String()
+	for _, secret := range []string{"password", "secret-value", "super-secret-pepper"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("response leaked %q: %s", secret, body)
+		}
+	}
+	if !strings.Contains(body, "api.example.com") {
+		t.Fatalf("response lost the endpoint host: %s", body)
+	}
+}
+
+func TestAdmin_AuditRecordsAuthAndPatch(t *testing.T) {
+	cfg, err := config.Load(writeTempConfig(t, minimalValidConfig()))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	var logs bytes.Buffer
+	srv := admin.New(slog.New(slog.NewTextHandler(&logs, nil)), "secret123", "", cfg, nil, nil, nil)
+	h := srv.Handler()
+
+	// Failed auth.
+	req := httptest.NewRequest(http.MethodGet, "/admin/config", nil)
+	req.Header.Set("Authorization", "Bearer wrong-key")
+	req.Header.Set("X-Request-ID", "req-audit-1")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+
+	// Authenticated patch.
+	body, _ := json.Marshal(map[string]any{"rate_limit": map[string]any{"burst": 42}})
+	req = httptest.NewRequest(http.MethodPatch, "/admin/config", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer secret123")
+	req.Header.Set("X-Request-ID", "req-audit-2")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH got %d", rec.Code)
+	}
+
+	out := logs.String()
+	for _, want := range []string{
+		"admin_audit=true",
+		"action=auth_failure",
+		"action=patch",
+		"remote_ip=",
+		"request_id=req-audit-1",
+		"request_id=req-audit-2",
+		"detail=",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("audit log missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "wrong-key") || strings.Contains(out, "secret123") {
+		t.Fatalf("audit log leaked a credential:\n%s", out)
+	}
+}
+
+func TestAdmin_SetAPIKeyRotatesWithoutRestart(t *testing.T) {
+	cfg, err := config.Load(writeTempConfig(t, minimalValidConfig()))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	srv := admin.New(slog.New(slog.NewTextHandler(io.Discard, nil)), "old-admin-key", "", cfg, nil, nil, nil)
+	srv.SetRequireAuth(true)
+	h := srv.Handler()
+
+	do := func(key string) int {
+		req := httptest.NewRequest(http.MethodGet, "/admin/config", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w.Code
+	}
+	if got := do("old-admin-key"); got != http.StatusOK {
+		t.Fatalf("old key before rotation got %d", got)
+	}
+	srv.SetAPIKey("new-admin-key")
+	if got := do("old-admin-key"); got != http.StatusUnauthorized {
+		t.Fatalf("rotated-out key got %d, want 401", got)
+	}
+	if got := do("new-admin-key"); got != http.StatusOK {
+		t.Fatalf("rotated-in key got %d, want 200", got)
+	}
+}
+
+func TestAdmin_FailedAuthIsRateLimited(t *testing.T) {
+	cfg, err := config.Load(writeTempConfig(t, minimalValidConfig()))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	srv := admin.New(slog.New(slog.NewTextHandler(io.Discard, nil)), "secret123", "", cfg, nil, nil, nil)
+	h := srv.Handler()
+
+	do := func(remoteAddr, key string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/admin/config", nil)
+		req.RemoteAddr = remoteAddr
+		req.Header.Set("Authorization", "Bearer "+key)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w
+	}
+
+	var last *httptest.ResponseRecorder
+	for i := 0; i < 20; i++ {
+		last = do("203.0.113.50:1234", "bad")
+		if last.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d got %d, want 401", i, last.Code)
+		}
+	}
+	blocked := do("203.0.113.50:1235", "secret123")
+	if blocked.Code != http.StatusTooManyRequests {
+		t.Fatalf("blocked admin IP with valid key got %d, want 429", blocked.Code)
+	}
+	if blocked.Header().Get("Retry-After") == "" {
+		t.Fatal("429 response is missing Retry-After")
+	}
+	if got := do("198.51.100.60:9999", "secret123"); got.Code != http.StatusOK {
+		t.Fatalf("different IP got %d, want 200", got.Code)
+	}
+}
+
+func TestAdmin_PatchPersistsToConfigFile(t *testing.T) {
+	path := writeTempConfig(t, minimalValidConfig())
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	srv := admin.New(slog.New(slog.NewTextHandler(io.Discard, nil)), "secret123", path, cfg, nil, nil, nil)
+
+	body, _ := json.Marshal(map[string]any{"cache": map[string]any{"ttl": "7m", "max_bytes": 4096}})
+	req := httptest.NewRequest(http.MethodPatch, "/admin/config", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer secret123")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("PATCH got %d body %s", w.Code, w.Body.String())
+	}
+
+	persisted, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("persisted file is not loadable: %v", err)
+	}
+	if persisted.Cache.TTL != 7*time.Minute {
+		t.Errorf("persisted cache.ttl = %v, want 7m", persisted.Cache.TTL)
+	}
+	if persisted.Cache.MaxBytes != 4096 {
+		t.Errorf("persisted cache.max_bytes = %d, want 4096", persisted.Cache.MaxBytes)
+	}
+	if persisted.Admin.APIKey != "secret123" {
+		t.Errorf("persisted admin key = %q", persisted.Admin.APIKey)
+	}
+}
+
+func TestAdmin_PatchRejectsOutOfRangeLimits(t *testing.T) {
+	cfg, err := config.Load(writeTempConfig(t, minimalValidConfig()))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	srv := admin.New(slog.New(slog.NewTextHandler(io.Discard, nil)), "secret123", "", cfg, nil, nil, nil)
+	h := srv.Handler()
+
+	cases := []map[string]any{
+		{"cache": map[string]any{"max_bytes": int64(1) << 40}},
+		{"cache": map[string]any{"max_size": 2_000_000}},
+		{"cache": map[string]any{"ttl": "48h"}},
+		{"rate_limit": map[string]any{"requests_per_minute": 2_000_000}},
+		{"resilience": map[string]any{"retry": map[string]any{"max_attempts": 99}}},
+	}
+	for _, patch := range cases {
+		body, _ := json.Marshal(patch)
+		req := httptest.NewRequest(http.MethodPatch, "/admin/config", bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer secret123")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("patch %v got %d, want 400 body %s", patch, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestAdmin_PatchBodyLimit(t *testing.T) {
+	cfg, err := config.Load(writeTempConfig(t, minimalValidConfig()))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	srv := admin.New(slog.New(slog.NewTextHandler(io.Discard, nil)), "secret123", "", cfg, nil, nil, nil)
+
+	// One byte over the 1 MiB admin body limit.
+	body := bytes.Repeat([]byte("a"), (1<<20)+1)
+	req := httptest.NewRequest(http.MethodPatch, "/admin/config", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer secret123")
+	w := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("oversized admin body got %d, want 400", w.Code)
 	}
 }
