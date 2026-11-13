@@ -1,3 +1,15 @@
+# Gateway configuration.
+#
+# Zero means "use the built-in default" for every optional numeric duration or
+# limit below (retry attempts/delays, circuit threshold/timeout, cache sizes and
+# TTLs, rate limits, health timeouts, budget reservation_ttl). A YAML scalar
+# cannot express "absent", so an explicit 0 is the same as omitting the field.
+# Negative values are rejected at load time.
+#
+# Hot reload (SIGHUP, admin PATCH, file watcher) applies auth, CORS, logging
+# level, provider keys, rate limits, cache, resilience and the admin API key.
+# The HTTP bind address/port, admin bind/port, admin.pprof_enabled and
+# logging.format require a restart and are rejected with a clear error.
 server:
   port: 8080
   read_timeout: 30s
@@ -157,6 +169,14 @@ cors:
 
 auth:
   enabled: false
+  # Fail closed: when auth.enabled is true every key must declare at least one
+  # scope from the allowlist (chat:write, embeddings:write, models:read,
+  # admin:write, resource:<name>, *). Set require_scopes: false only for a key
+  # that is meant to be denied everything.
+  # require_scopes: true
+  # Optional HMAC-SHA256 pepper for the in-memory key hashes. Prefer
+  # AUTH_KEY_PEPPER in the environment over a literal value in this file.
+  # key_pepper: ${AUTH_KEY_PEPPER}
   keys:
     # Example: uncomment and set GATEWAY_API_KEY or add more tenants
     # - key: ${GATEWAY_API_KEY}
@@ -165,12 +185,18 @@ auth:
     #   expires_at: 2027-01-01T00:00:00Z
 
 logging:
+  # level is reloadable (SIGHUP/admin PATCH).
   level: info
+  # format requires a restart; a reload that changes it is rejected with a
+  # warning and the current handler keeps running.
   format: json
 
 admin:
   port: 8081
   bind_address: 127.0.0.1
+  # api_key rotates live on reload. In production set ADMIN_API_KEY (or this
+  # value) and allow_insecure: false; the admin API then fails closed.
   api_key: ${ADMIN_API_KEY} # set ADMIN_API_KEY env var to protect admin API
   allow_insecure: true # local dev only; set false in production
+  # port, bind_address and pprof_enabled require a restart.
   pprof_enabled: false

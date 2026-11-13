@@ -1,5 +1,7 @@
 # Production profile. Required secret environment variables deliberately fail
 # config validation when absent; do not replace them with literal credentials.
+# Run with --strict or GATEWAY_ENV=prod to enforce the same checks at startup
+# and on every hot reload.
 server:
   port: 8080
   read_timeout: 30s
