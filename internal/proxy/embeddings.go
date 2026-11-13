@@ -45,6 +45,7 @@ type EmbeddingsHandler struct {
 	budgetMgr     *budget.Manager
 	cache         cache.Cache
 	cacheTTL      time.Duration
+	cacheMaxTTL   time.Duration
 }
 
 func NewEmbeddingsHandler(registry *Registry, fallbackChain []string, log *slog.Logger) *EmbeddingsHandler {
@@ -77,6 +78,7 @@ func NewEmbeddingsHandlerWithCache(registry *Registry, fallbackChain []string, l
 		budgetMgr:     budgetMgr,
 		cache:         c,
 		cacheTTL:      ttl,
+		cacheMaxTTL:   defaultCacheMaxTTL,
 	}
 }
 
@@ -87,10 +89,22 @@ func (h *EmbeddingsHandler) SetCache(c cache.Cache, ttl time.Duration) {
 	h.mu.Unlock()
 }
 
-func (h *EmbeddingsHandler) getCache() (cache.Cache, time.Duration) {
+// SetCacheMaxTTL bounds caller-supplied X-Cache-TTL for embeddings. main should
+// wire it alongside Handler.SetCacheMaxTTL.
+func (h *EmbeddingsHandler) SetCacheMaxTTL(max time.Duration) {
+	h.mu.Lock()
+	h.cacheMaxTTL = max
+	h.mu.Unlock()
+}
+
+func (h *EmbeddingsHandler) getCache() (cache.Cache, time.Duration, time.Duration) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
-	return h.cache, h.cacheTTL
+	max := h.cacheMaxTTL
+	if max == 0 {
+		max = defaultCacheMaxTTL
+	}
+	return h.cache, h.cacheTTL, max
 }
 
 func (h *EmbeddingsHandler) SetFallbackChain(chain []string) {
@@ -184,8 +198,9 @@ func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBodySize)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		if err.Error() == "http: request body too large" {
-			writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large (max 1MiB)")
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body too large (max 8MiB)")
 			return
 		}
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "cannot read request body")
@@ -222,21 +237,18 @@ func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if !h.supportsEncodingFormat(req) {
+		writeErrorWithDetails(w, http.StatusBadRequest, "invalid_request_error", "unsupported_parameter",
+			fmt.Sprintf("encoding_format %q is not supported by this provider", req.EncodingFormat), "encoding_format")
+		return
+	}
+
 	var cacheKey string
 	var cacheTTL time.Duration
-	cached, ttl := h.getCache()
-	if cached != nil && r.Header.Get("X-Cache-Skip") != "true" {
-		if ttlHeader := r.Header.Get("X-Cache-TTL"); ttlHeader != "" {
-			if d, parseErr := time.ParseDuration(ttlHeader); parseErr == nil && d > 0 {
-				cacheTTL = d
-			}
-		}
-		if cacheTTL == 0 {
-			cacheTTL = ttl
-			if cacheTTL == 0 {
-				cacheTTL = 5 * time.Minute
-			}
-		}
+	cached, ttl, maxTTL := h.getCache()
+	useCache := cached != nil && r.Header.Get("X-Cache-Skip") != "true"
+	if useCache {
+		cacheTTL = h.resolveCacheTTL(r, ttl, maxTTL)
 		cacheKey = cache.BuildEmbeddingKeyForIdentity(req, r.Header.Get("Authorization"))
 		if data, ok := cached.Get(cacheKey); ok {
 			w.Header().Set("Content-Type", "application/json")
@@ -306,36 +318,44 @@ func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		span.SetStatus(codes.Error, err.Error())
 		span.RecordError(err)
-		if errors.Is(err, provider.ErrNoProvider) {
-			writeError(w, http.StatusNotFound, "model_not_found", err.Error())
-			return
+		if !errors.Is(err, provider.ErrNoProvider) {
+			h.log.Error("embeddings dispatch failed", "model", req.Model, "request_id", requestID, "error", err)
 		}
-		h.log.Error("embeddings dispatch failed", "model", req.Model, "request_id", requestID, "error", err)
-		propagateRetryAfter(w, err)
-		writeError(w, http.StatusBadGateway, "provider_error", err.Error())
+		writeDispatchError(w, err)
 		return
 	}
+	span.SetAttributes(attribute.String("provider", provName))
+
+	// Usage is prompt tokens by definition for embeddings; TotalTokens mirrors
+	// it in every provider implementation, but prefer the explicit field.
+	actualTokens := resp.Usage.PromptTokens
+	if actualTokens == 0 {
+		actualTokens = resp.Usage.TotalTokens
+	}
+	// Metrics are independent of budget configuration: a deployment without a
+	// budget manager still needs token accounting.
+	metrics.ObserveTokens(provName, actualTokens, 0)
+	metrics.CircuitState.WithLabelValues(provName).Set(float64(h.breakerFor(provName).StateReadOnly()))
+
 	if h.budgetMgr != nil {
-		estimate, estimateErr := h.budgetMgr.CostForEmbedding(provName, req.Model, resp.Usage.TotalTokens)
+		estimate, estimateErr := h.budgetMgr.CostForEmbedding(provName, req.Model, actualTokens)
 		if estimateErr != nil {
 			h.log.Warn("embedding price unavailable after dispatch; using fallback estimate", "provider", provName, "model", req.Model, "error", estimateErr)
-			estimate.USD = h.budgetMgr.CostForTokens(resp.Usage.TotalTokens)
+			estimate.USD = h.budgetMgr.CostForTokens(actualTokens)
 		}
-		metrics.ObserveTokens(provName, resp.Usage.TotalTokens, 0)
 		metrics.ObserveCost(provName, req.Model, estimate.USD, estimate.Known)
 		if budgetReservation != nil {
-			if err := budgetReservation.Commit(resp.Usage.TotalTokens, estimate.USD); err != nil {
+			if err := budgetReservation.CommitWithRetry(actualTokens, estimate.USD, 3); err != nil {
 				h.log.Warn("embedding budget adjustment exceeded estimate", "tenant", r.Header.Get("X-Tenant-ID"), "error", err)
 			}
 			budgetCommitted = true
 		}
 	}
-	span.SetAttributes(attribute.String("provider", provName))
 	h.log.Info("embeddings", "model", req.Model, "provider", provName, "request_id", requestID, "input_count", len(resp.Data))
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Gateway-Provider", provName)
-	if cached != nil && cacheKey != "" {
+	if useCache && cacheKey != "" {
 		data, marshalErr := json.Marshal(resp)
 		if marshalErr == nil {
 			cached.Set(cacheKey, data, cacheTTL)
@@ -346,6 +366,60 @@ func (h *EmbeddingsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// resolveCacheTTL mirrors Handler.resolveCacheTTL for embeddings.
+func (h *EmbeddingsHandler) resolveCacheTTL(r *http.Request, configured, max time.Duration) time.Duration {
+	ttl := configured
+	if ttlHeader := r.Header.Get("X-Cache-TTL"); ttlHeader != "" {
+		if d, parseErr := time.ParseDuration(ttlHeader); parseErr == nil && d > 0 {
+			ttl = d
+		}
+	}
+	if ttl <= 0 {
+		ttl = defaultCacheTTL
+	}
+	return cache.ClampTTL(ttl, max)
+}
+
+// supportsEncodingFormat reports whether the resolved provider can honour the
+// requested wire encoding. base64 is an OpenAI-compatible passthrough; Gemini
+// and Anthropic return float vectors, so promising base64 there would be a
+// silent contract break. Returning 400 lets the client choose float instead.
+func (h *EmbeddingsHandler) supportsEncodingFormat(req provider.EmbeddingRequest) bool {
+	switch req.EncodingFormat {
+	case "", "float":
+		return true
+	case "base64":
+		primary, err := h.registry.Resolve(req.Model)
+		if err != nil {
+			// Unknown model: let dispatch return 404 rather than masking it
+			// with an unsupported_parameter error.
+			return true
+		}
+		if isOpenAIPassthrough(primary) {
+			return true
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// isOpenAIPassthrough reports whether provider forwards the OpenAI embeddings
+// body verbatim and therefore understands encoding_format. Kept as a type
+// assertion so providers can opt in without a proxy change.
+func isOpenAIPassthrough(p provider.Provider) bool {
+	if _, ok := p.(*provider.OpenAI); ok {
+		return true
+	}
+	type encodingFormatProvider interface {
+		SupportsEncodingFormat(string) bool
+	}
+	if ep, ok := p.(encodingFormatProvider); ok {
+		return ep.SupportsEncodingFormat("base64")
+	}
+	return false
 }
 
 func embeddingInputChars(input any) int {
@@ -378,18 +452,23 @@ func (h *EmbeddingsHandler) dispatch(ctx context.Context, req provider.Embedding
 	if err != nil {
 		return provider.EmbeddingResponse{}, "", err
 	}
-	if embedder, ok := primary.(provider.Embedder); ok && h.breakerFor(primary.Name()).Allow() {
-		resp, err := h.embedWithRetry(ctx, embedder, req)
-		if err == nil {
-			h.breakerFor(primary.Name()).RecordSuccess()
-			return resp, primary.Name(), nil
+	attempted := map[string]bool{primary.Name(): true}
+	if embedder, ok := primary.(provider.Embedder); ok {
+		if !h.breakerFor(primary.Name()).Allow() {
+			h.log.Warn("embeddings circuit open, skipping primary", "provider", primary.Name(), "request_id", requestID)
+		} else {
+			resp, err := h.embedWithRetry(ctx, embedder, req)
+			if err == nil {
+				h.breakerFor(primary.Name()).RecordSuccess()
+				return resp, primary.Name(), nil
+			}
+			settleBreakerFailure(h.breakerFor(primary.Name()), err)
+			lastErr = err
+			if !provider.IsRetryable(err) {
+				return provider.EmbeddingResponse{}, "", err
+			}
+			h.log.Warn("embeddings primary failed, attempting fallback", "provider", primary.Name(), "model", req.Model, "request_id", requestID, "error", err)
 		}
-		h.breakerFor(primary.Name()).RecordFailure()
-		lastErr = err
-		if !provider.IsRetryable(err) {
-			return provider.EmbeddingResponse{}, "", err
-		}
-		h.log.Warn("embeddings primary failed, attempting fallback", "provider", primary.Name(), "model", req.Model, "request_id", requestID, "error", err)
 	} else {
 		// provider doesn't support embeddings, treat as retryable to try fallback
 		lastErr = fmt.Errorf("provider %s does not support embeddings", primary.Name())
@@ -398,6 +477,9 @@ func (h *EmbeddingsHandler) dispatch(ctx context.Context, req provider.Embedding
 
 	fallbackChain := h.getFallbackChain()
 	for _, name := range fallbackChain {
+		if attempted[name] {
+			continue
+		}
 		if name == primary.Name() {
 			continue
 		}
@@ -405,6 +487,7 @@ func (h *EmbeddingsHandler) dispatch(ctx context.Context, req provider.Embedding
 		if !ok {
 			continue
 		}
+		attempted[name] = true
 		embedder, ok := fb.(provider.Embedder)
 		if !ok {
 			continue
@@ -428,7 +511,7 @@ func (h *EmbeddingsHandler) dispatch(ctx context.Context, req provider.Embedding
 			h.log.Info("embeddings fallback succeeded", "provider", fb.Name(), "model", mappedReq.Model, "request_id", requestID)
 			return resp, fb.Name(), nil
 		}
-		breaker.RecordFailure()
+		settleBreakerFailure(breaker, err)
 		lastErr = err
 		h.log.Warn("embeddings fallback failed", "provider", fb.Name(), "request_id", requestID, "error", err)
 		if !provider.IsRetryable(err) {

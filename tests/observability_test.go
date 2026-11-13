@@ -1,10 +1,13 @@
 package tests
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/fcordero/llm-api-gateway/internal/provider"
@@ -119,5 +122,67 @@ func TestTracing_Middleware(t *testing.T) {
 	handler.ServeHTTP(w2, req2)
 	if w2.Header().Get("traceparent") == "" {
 		t.Error("traceparent not generated when missing")
+	}
+}
+
+// CORS preflights must advertise the headers the gateway actually reads and a
+// Max-Age so browsers stop re-preflighting every request.
+func TestCORS_PreflightHeadersAndMaxAge(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := proxy.CORS([]string{"https://app.example"})(inner)
+
+	req := httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil)
+	req.Header.Set("Origin", "https://app.example")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example" {
+		t.Fatalf("allow-origin = %q", got)
+	}
+	if got := w.Header().Get("Access-Control-Max-Age"); got != "600" {
+		t.Fatalf("max-age = %q, want 600", got)
+	}
+	allowed := w.Header().Get("Access-Control-Allow-Headers")
+	for _, header := range []string{"X-Tenant-ID", "X-Cache-TTL", "X-Cache-Skip"} {
+		if !strings.Contains(allowed, header) {
+			t.Fatalf("allow-headers %q missing %s", allowed, header)
+		}
+	}
+
+	denied := httptest.NewRequest(http.MethodOptions, "/v1/chat/completions", nil)
+	denied.Header.Set("Origin", "https://evil.example")
+	dw := httptest.NewRecorder()
+	handler.ServeHTTP(dw, denied)
+	if dw.Code != http.StatusForbidden {
+		t.Fatalf("disallowed origin status = %d, want 403", dw.Code)
+	}
+}
+
+// When Logging wraps Tracing, the span lives on an inner request copy. The
+// logger must still correlate via the injected traceparent header.
+func TestLogging_TraceIDFromResponseTraceparent(t *testing.T) {
+	if _, err := tracing.Init("test-service"); err != nil {
+		t.Fatalf("tracing init: %v", err)
+	}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := proxy.Logging(logger, proxy.Tracing("test-service")(inner))
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil)
+	const traceID = "4bf92f3577b34da6a3ce929d0e0e4736"
+	req.Header.Set("traceparent", "00-"+traceID+"-00f067aa0ba902b7-01")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if !strings.Contains(buf.String(), "trace_id="+traceID) {
+		t.Fatalf("log line missing trace_id: %s", buf.String())
 	}
 }

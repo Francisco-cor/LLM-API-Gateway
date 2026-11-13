@@ -52,6 +52,7 @@ type Breaker struct {
 	successes    int
 	lastOpenedAt time.Time
 	halfOpenPend int
+	halfOpenAt   time.Time
 }
 
 // NewBreaker creates a breaker with cfg.
@@ -68,31 +69,54 @@ func NewBreaker(cfg CircuitConfig) *Breaker {
 	return &Breaker{cfg: cfg, state: StateClosed}
 }
 
-// Allow reports whether a request should proceed.
+// Allow reports whether a request should proceed. Every true result consumes a
+// half-open permission that the caller must settle with RecordSuccess,
+// RecordFailure, Release or RecordCancel.
 func (b *Breaker) Allow() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	now := time.Now()
+	b.maybeHalfOpenLocked(now)
+
 	switch b.state {
-	case StateClosed:
-		return true
 	case StateOpen:
-		if time.Since(b.lastOpenedAt) >= b.cfg.OpenTimeout {
-			b.state = StateHalfOpen
-			b.halfOpenPend = 1
-			b.successes = 0
-			return true
-		}
 		return false
 	case StateHalfOpen:
 		if b.halfOpenPend >= b.cfg.HalfOpenMax {
-			return false
+			// A permission was granted but never recorded (caller crashed,
+			// request was abandoned, or a bug skipped the settle path). Without
+			// this deadline a single leaked probe would wedge the breaker in
+			// half-open forever and the provider would never recover.
+			if b.halfOpenAt.IsZero() || now.Sub(b.halfOpenAt) < b.cfg.OpenTimeout {
+				return false
+			}
+			b.halfOpenPend = 0
+			b.successes = 0
+			b.halfOpenAt = now
+		}
+		if b.halfOpenPend == 0 {
+			b.halfOpenAt = now
 		}
 		b.halfOpenPend++
 		return true
 	default:
 		return true
 	}
+}
+
+// maybeHalfOpenLocked transitions open -> half-open once the timeout elapsed.
+func (b *Breaker) maybeHalfOpenLocked(now time.Time) {
+	if b.state != StateOpen {
+		return
+	}
+	if now.Sub(b.lastOpenedAt) < b.cfg.OpenTimeout {
+		return
+	}
+	b.state = StateHalfOpen
+	b.halfOpenPend = 0
+	b.successes = 0
+	b.halfOpenAt = now
 }
 
 // RecordSuccess records a successful call.
@@ -105,13 +129,11 @@ func (b *Breaker) RecordSuccess() {
 		b.failures = 0
 	case StateHalfOpen:
 		b.successes++
+		b.releaseHalfOpenLocked()
 		if b.successes >= b.cfg.HalfOpenMax {
 			b.state = StateClosed
 			b.failures = 0
 			b.successes = 0
-		}
-		b.halfOpenPend--
-		if b.halfOpenPend < 0 {
 			b.halfOpenPend = 0
 		}
 	case StateOpen:
@@ -134,26 +156,47 @@ func (b *Breaker) RecordFailure() {
 	case StateHalfOpen:
 		b.state = StateOpen
 		b.lastOpenedAt = time.Now()
-		b.halfOpenPend--
-		if b.halfOpenPend < 0 {
-			b.halfOpenPend = 0
-		}
+		b.releaseHalfOpenLocked()
 		b.successes = 0
 	}
 }
 
-// State returns current state (for metrics/health).
+// Release settles a half-open permission without recording success or failure.
+// Callers use it when a request was cancelled or failed with a non-retryable
+// client error: neither says anything about provider health.
+func (b *Breaker) Release() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.state == StateHalfOpen {
+		b.releaseHalfOpenLocked()
+	}
+}
+
+// RecordCancel is the explicit cancellation flavour of Release.
+func (b *Breaker) RecordCancel() { b.Release() }
+
+func (b *Breaker) releaseHalfOpenLocked() {
+	b.halfOpenPend--
+	if b.halfOpenPend < 0 {
+		b.halfOpenPend = 0
+	}
+}
+
+// State returns current state (for metrics/health). It is a read-only snapshot:
+// it never opens half-open or mutates pending counters, so calling it in a
+// metrics scrape cannot consume a probe permission.
 func (b *Breaker) State() State {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	// transition open -> half-open lazily on State() as well
 	if b.state == StateOpen && time.Since(b.lastOpenedAt) >= b.cfg.OpenTimeout {
-		b.state = StateHalfOpen
-		b.halfOpenPend = 0
-		b.successes = 0
+		return StateHalfOpen
 	}
 	return b.state
 }
+
+// StateReadOnly is an alias of State kept so call sites read as pure
+// observability. State itself is already non-mutating.
+func (b *Breaker) StateReadOnly() State { return b.State() }
 
 // Reset forces closed (for tests).
 func (b *Breaker) Reset() {
@@ -162,6 +205,7 @@ func (b *Breaker) Reset() {
 	b.failures = 0
 	b.successes = 0
 	b.halfOpenPend = 0
+	b.halfOpenAt = time.Time{}
 	b.mu.Unlock()
 }
 

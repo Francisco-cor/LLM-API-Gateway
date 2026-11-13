@@ -172,14 +172,16 @@ func (h *ReadinessHandler) refreshSnapshot(parent context.Context) readinessSnap
 		return snapshot
 	}
 	options := h.getOptions()
-	ctx, cancel := context.WithTimeout(parent, options.CheckTimeout)
+	// A client disconnecting mid-probe must not abort the shared fan-out or
+	// cache an artificially unhealthy snapshot for every other probe.
+	probeCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), options.CheckTimeout)
 	defer cancel()
 
 	var mu sync.Mutex
 	healthy := 0
 	results := make(map[string]providerStatus)
 
-	g, ctx := errgroup.WithContext(ctx)
+	g, ctx := errgroup.WithContext(probeCtx)
 	for _, p := range h.registry.All() {
 		p := p
 		g.Go(func() error {
@@ -206,6 +208,13 @@ func (h *ReadinessHandler) refreshSnapshot(parent context.Context) readinessSnap
 	}
 	_ = g.Wait()
 	snapshot := readinessSnapshot{at: time.Now(), healthy: healthy, total: len(h.registry.All()), providers: results}
+	// errgroup cancels only its own derived context on Wait. Checking the
+	// parent probe context distinguishes "our fan-out deadline expired" from
+	// "the group finished", which matters because caching a partial snapshot
+	// would smear an outage across the cache TTL even after providers recover.
+	if probeCtx.Err() != nil {
+		return snapshot
+	}
 	h.cacheMu.Lock()
 	h.last = cloneReadinessSnapshot(snapshot)
 	h.cacheMu.Unlock()
@@ -277,7 +286,10 @@ func (h *HealthProvidersHandler) getOptions() HealthOptions {
 
 func (h *HealthProvidersHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	options := h.getOptions()
-	ctx, cancel := context.WithTimeout(r.Context(), options.CheckTimeout)
+	// The probe result is shared with the response, not with the client's
+	// connection: a disconnect must not cancel checks for other probes or
+	// produce a partial degraded snapshot.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), options.CheckTimeout)
 	defer cancel()
 
 	var mu sync.Mutex
@@ -308,25 +320,36 @@ func (h *HealthProvidersHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	}
 	_ = g.Wait()
 
-	// Determine overall status
 	overall := "healthy"
+	unhealthy := 0
+	notHealthy := 0
 	for _, v := range results {
-		if v.Status != "healthy" {
-			overall = "degraded"
-			break
+		if v.Status == "unhealthy" {
+			unhealthy++
 		}
+		if v.Status != "healthy" {
+			notHealthy++
+		}
+	}
+	if unhealthy > 0 {
+		overall = "degraded"
+	}
+
+	// Degraded means at least one configured provider cannot serve traffic, so
+	// the endpoint reports 503: an alerting system that only checks status
+	// codes would otherwise miss a half-broken provider set. ?strict=1 also
+	// treats intentionally skipped checks as not healthy.
+	status := http.StatusOK
+	if unhealthy > 0 || (r.URL.Query().Get("strict") == "1" && notHealthy > 0) {
+		status = http.StatusServiceUnavailable
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	// Backwards compat: top-level map with per-provider keys plus "overall" if degraded
-	if overall == "degraded" {
-		out := make(map[string]any, len(results)+1)
-		for k, v := range results {
-			out[k] = v
-		}
-		out["overall"] = overall
-		_ = json.NewEncoder(w).Encode(out)
-		return
+	w.WriteHeader(status)
+	out := make(map[string]any, len(results)+1)
+	for k, v := range results {
+		out[k] = v
 	}
-	_ = json.NewEncoder(w).Encode(results)
+	out["overall"] = overall
+	_ = json.NewEncoder(w).Encode(out)
 }

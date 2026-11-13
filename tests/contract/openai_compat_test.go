@@ -14,6 +14,7 @@ import (
 
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/proxy"
+	"github.com/fcordero/llm-api-gateway/internal/translate"
 )
 
 // mockProvider is a local test double to avoid import cycle with tests package.
@@ -54,13 +55,22 @@ func (m *mockProvider) SendStream(_ context.Context, _ provider.ChatRequest) (<-
 		}
 		return ch, eh
 	}
-	ch := make(chan provider.StreamChunk, 1)
+	ch := make(chan provider.StreamChunk, 2)
 	ch <- provider.StreamChunk{
 		ID:      "chatcmpl-test",
 		Object:  "chat.completion.chunk",
 		Created: time.Now().Unix(),
 		Model:   m.models[0],
 		Choices: []provider.StreamChoice{{Index: 0, Delta: provider.ChatMessage{Role: "assistant", Content: "Hello"}}},
+	}
+	finish := "stop"
+	ch <- provider.StreamChunk{
+		ID:      "chatcmpl-test",
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   m.models[0],
+		Choices: []provider.StreamChoice{{Index: 0, Delta: provider.ChatMessage{}, FinishReason: &finish}},
+		Usage:   &provider.Usage{PromptTokens: 4, CompletionTokens: 1, TotalTokens: 5},
 	}
 	close(ch)
 	eh := make(chan error)
@@ -179,25 +189,36 @@ func TestContract_UnknownModel_404(t *testing.T) {
 	}
 }
 
-// TestContract_DisallowUnknownFields ensures 400 on unknown JSON fields.
-func TestContract_DisallowUnknownFields(t *testing.T) {
+// TestContract_UnknownFieldsTolerated ensures the data plane accepts fields
+// OpenAI may add later instead of failing a valid request with 400.
+func TestContract_UnknownFieldsTolerated(t *testing.T) {
 	openai := &mockProvider{name: "openai", models: []string{"gpt-4o"}, resp: sampleChatResponse("gpt-4o")}
 	gw := buildGateway([]provider.Provider{openai}, []string{"openai"})
-	body, _ := json.Marshal(map[string]any{
-		"model":         "gpt-4o",
-		"messages":      []map[string]string{{"role": "user", "content": "hi"}},
+	body := []byte(`{
+		"model": "gpt-4o",
+		"messages": [{"role":"user","content":"hi","future_field":{"nested":true}}],
 		"unknown_field": "oops",
-	})
+		"future_top_level": 42
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	gw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("unknown fields must be tolerated, got %d body %s", w.Code, w.Body.String())
+	}
+}
+
+// TestContract_ConcatenatedJSONRejected keeps the strict single-value rule:
+// tolerating fields must not tolerate two bodies in one request.
+func TestContract_ConcatenatedJSONRejected(t *testing.T) {
+	openai := &mockProvider{name: "openai", models: []string{"gpt-4o"}, resp: sampleChatResponse("gpt-4o")}
+	gw := buildGateway([]provider.Provider{openai}, []string{"openai"})
+	body := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}{"model":"gpt-4o","messages":[]}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
 	w := httptest.NewRecorder()
 	gw.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for unknown field got %d body %s", w.Code, w.Body.String())
-	}
-	var er provider.ErrorResponse
-	_ = json.Unmarshal(w.Body.Bytes(), &er)
-	if !strings.Contains(strings.ToLower(er.Error.Message), "unknown") {
-		t.Errorf("err message %q should mention unknown field", er.Error.Message)
+		t.Fatalf("concatenated JSON must be rejected, got %d body %s", w.Code, w.Body.String())
 	}
 }
 
@@ -278,10 +299,15 @@ func TestContract_StreamFallbackBeforeHeaders(t *testing.T) {
 		models:    []string{"gpt-4o"},
 		streamErr: errorChannel(&provider.ProviderError{ProviderName: "openai", StatusCode: http.StatusBadGateway, Message: "upstream", Retryable: true}),
 	}
-	fallbackCh := make(chan provider.StreamChunk, 1)
+	fallbackCh := make(chan provider.StreamChunk, 2)
 	fallbackCh <- provider.StreamChunk{
 		ID: "chatcmpl-fallback", Object: "chat.completion.chunk", Model: "gpt-4o",
 		Choices: []provider.StreamChoice{{Index: 0, Delta: provider.ChatMessage{Role: "assistant", Content: "fallback"}}},
+	}
+	fallbackFinish := "stop"
+	fallbackCh <- provider.StreamChunk{
+		ID: "chatcmpl-fallback", Object: "chat.completion.chunk", Model: "gpt-4o",
+		Choices: []provider.StreamChoice{{Index: 0, Delta: provider.ChatMessage{}, FinishReason: &fallbackFinish}},
 	}
 	close(fallbackCh)
 	fallback := &mockProvider{name: "anthropic", models: []string{"claude-sonnet-4-6"}, streamCh: fallbackCh}
@@ -448,11 +474,11 @@ func TestContract_ToolsPassthrough(t *testing.T) {
 	}
 }
 
-// TestContract_BodyLimit ensures 1MiB limit triggers 413.
+// TestContract_BodyLimit ensures the 8MiB data-plane limit triggers 413.
 func TestContract_BodyLimit(t *testing.T) {
 	openai := &mockProvider{name: "openai", models: []string{"gpt-4o"}, resp: sampleChatResponse("gpt-4o")}
 	gw := buildGateway([]provider.Provider{openai}, []string{"openai"})
-	largeContent := strings.Repeat("a", 1<<20+100) // >1MiB
+	largeContent := strings.Repeat("a", (8<<20)+1024) // >8MiB
 	body, _ := json.Marshal(map[string]any{
 		"model": "gpt-4o", "messages": []map[string]string{{"role": "user", "content": largeContent}},
 	})
@@ -484,5 +510,204 @@ func TestContract_FallbackSuccess(t *testing.T) {
 	}
 	if w.Header().Get("X-Gateway-Provider") != "anthropic" {
 		t.Errorf("provider header %q want anthropic", w.Header().Get("X-Gateway-Provider"))
+	}
+}
+
+// TestContract_ProviderErrorStatusMapping pins the upstream-status contract:
+// caller errors stay caller errors, auth and 5xx failures are gateway problems,
+// and throttling keeps its own status plus a usable Retry-After.
+func TestContract_ProviderErrorStatusMapping(t *testing.T) {
+	cases := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+		wantRetry  string
+	}{
+		{
+			name:       "translate 400 keeps code and param",
+			err:        &translate.Error{Code: "invalid_request", Parameter: "messages[0].role", Message: "unsupported role"},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "invalid_request",
+		},
+		{
+			name:       "provider 400",
+			err:        &provider.ProviderError{StatusCode: http.StatusBadRequest, Message: "bad", Retryable: false},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "provider 404",
+			err:        &provider.ProviderError{StatusCode: http.StatusNotFound, Message: "no model", Retryable: false},
+			wantStatus: http.StatusNotFound,
+			wantCode:   "model_not_found",
+		},
+		{
+			name:       "provider 413",
+			err:        &provider.ProviderError{StatusCode: http.StatusRequestEntityTooLarge, Message: "too big", Retryable: false},
+			wantStatus: http.StatusRequestEntityTooLarge,
+			wantCode:   "request_too_large",
+		},
+		{
+			name:       "provider 429 rounds Retry-After up",
+			err:        &provider.ProviderError{StatusCode: http.StatusTooManyRequests, Message: "slow down", Retryable: false, RetryAfter: 1500 * time.Millisecond},
+			wantStatus: http.StatusTooManyRequests,
+			wantCode:   "rate_limit_exceeded",
+			wantRetry:  "2",
+		},
+		{
+			name:       "provider 401 is a gateway credential problem",
+			err:        &provider.ProviderError{StatusCode: http.StatusUnauthorized, Message: "bad key sk-secret", Retryable: false},
+			wantStatus: http.StatusBadGateway,
+			wantCode:   "provider_auth_error",
+		},
+		{
+			name:       "provider 500",
+			err:        &provider.ProviderError{StatusCode: http.StatusInternalServerError, Message: "boom", Retryable: false},
+			wantStatus: http.StatusBadGateway,
+		},
+		{
+			name:       "provider 503",
+			err:        &provider.ProviderError{StatusCode: http.StatusServiceUnavailable, Message: "down", Retryable: false},
+			wantStatus: http.StatusServiceUnavailable,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &mockProvider{name: "openai", models: []string{"gpt-4o"}, err: tc.err}
+			gw := buildGateway([]provider.Provider{p}, []string{"openai"})
+			body := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+			w := httptest.NewRecorder()
+			gw.ServeHTTP(w, req)
+
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d body %s", w.Code, tc.wantStatus, w.Body.String())
+			}
+			var er provider.ErrorResponse
+			if err := json.Unmarshal(w.Body.Bytes(), &er); err != nil {
+				t.Fatalf("decode error body: %v body %s", err, w.Body.String())
+			}
+			if tc.wantCode != "" && er.Error.Code != tc.wantCode {
+				t.Fatalf("code = %q, want %q", er.Error.Code, tc.wantCode)
+			}
+			if tc.wantRetry != "" {
+				if got := w.Header().Get("Retry-After"); got != tc.wantRetry {
+					t.Fatalf("Retry-After = %q, want %q", got, tc.wantRetry)
+				}
+			}
+			if tc.err != nil && strings.Contains(w.Body.String(), "sk-secret") {
+				t.Fatal("provider credential leaked into the error body")
+			}
+		})
+	}
+}
+
+// TestContract_TranslateErrorIncludesParam covers the param field OpenAI
+// clients use to point at the offending input.
+func TestContract_TranslateErrorIncludesParam(t *testing.T) {
+	p := &mockProvider{
+		name:   "openai",
+		models: []string{"gpt-4o"},
+		err:    &translate.Error{Code: "invalid_request", Parameter: "messages[0].role", Message: "unsupported role"},
+	}
+	gw := buildGateway([]provider.Provider{p}, []string{"openai"})
+	body := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	gw.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 body %s", w.Code, w.Body.String())
+	}
+	var envelope struct {
+		Error struct {
+			Code  string `json:"code"`
+			Param string `json:"param"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if envelope.Error.Code != "invalid_request" || envelope.Error.Param != "messages[0].role" {
+		t.Fatalf("code/param = %q/%q, want invalid_request/messages[0].role", envelope.Error.Code, envelope.Error.Param)
+	}
+}
+
+// TestContract_ModelsFilterPatternsAndDuplicates ensures routing globs and
+// repeated entries never appear in /v1/models.
+func TestContract_ModelsFilterPatternsAndDuplicates(t *testing.T) {
+	openai := &mockProvider{name: "openai", models: []string{"gpt-4*", "gpt-4o", "gpt-4o", "^o1-.*$"}}
+	anth := &mockProvider{name: "anthropic", models: []string{"gpt-4o", "claude-sonnet-4-6"}}
+	gw := buildGateway([]provider.Provider{openai, anth}, []string{"openai", "anthropic"})
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	w := httptest.NewRecorder()
+	gw.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	seen := map[string]int{}
+	for _, m := range resp.Data {
+		seen[m.ID]++
+	}
+	for _, pattern := range []string{"gpt-4*", "^o1-.*$"} {
+		if seen[pattern] > 0 {
+			t.Fatalf("routing pattern %q leaked into /v1/models", pattern)
+		}
+	}
+	for id, count := range seen {
+		if count > 1 {
+			t.Fatalf("model %q listed %d times", id, count)
+		}
+	}
+	if seen["gpt-4o"] != 1 || seen["claude-sonnet-4-6"] != 1 {
+		t.Fatalf("unexpected model set: %+v", seen)
+	}
+}
+
+// TestContract_EmbeddingsUnknownFieldsTolerated mirrors chat tolerance.
+func TestContract_EmbeddingsUnknownFieldsTolerated(t *testing.T) {
+	p := &mockProvider{
+		name:      "openai",
+		models:    []string{"text-embedding-3-small"},
+		embedResp: provider.EmbeddingResponse{Object: "list", Data: []provider.EmbeddingData{{Object: "embedding", Index: 0, Embedding: []float32{0.1}}}, Model: "text-embedding-3-small"},
+	}
+	gw := buildGateway([]provider.Provider{p}, []string{"openai"})
+	body := []byte(`{"model":"text-embedding-3-small","input":"hello","future_option":true}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	gw.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("unknown embedding fields must be tolerated, got %d body %s", w.Code, w.Body.String())
+	}
+}
+
+// TestContract_EmbeddingsUnsupportedEncoding ensures a provider that cannot
+// emit base64 answers 400 instead of silently returning floats.
+func TestContract_EmbeddingsUnsupportedEncoding(t *testing.T) {
+	p := &mockProvider{name: "anthropic", models: []string{"voyage-3"}}
+	gw := buildGateway([]provider.Provider{p}, []string{"anthropic"})
+	body := []byte(`{"model":"voyage-3","input":"hello","encoding_format":"base64"}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", bytes.NewReader(body))
+	w := httptest.NewRecorder()
+	gw.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 body %s", w.Code, w.Body.String())
+	}
+	var er provider.ErrorResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &er); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if er.Error.Code != "unsupported_parameter" {
+		t.Fatalf("code = %q, want unsupported_parameter", er.Error.Code)
 	}
 }

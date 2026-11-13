@@ -46,6 +46,24 @@ var (
 		Name: "gateway_cache_size",
 		Help: "Current cache size (entries)",
 	})
+
+	// StreamTTFT measures time from accepting the request to the first byte of
+	// the first SSE chunk. Streaming latency is dominated by this number, which
+	// request_duration conflates with the whole completion.
+	StreamTTFT = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "gateway_stream_ttft_seconds",
+		Help:    "Time to first streamed token (first SSE chunk)",
+		Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30},
+	}, []string{"provider"})
+
+	// StreamDuration measures how long the SSE response stayed open. A stream
+	// cut short by an upstream failure is recorded too, so the histogram is
+	// also a coarse view of incomplete generations.
+	StreamDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "gateway_stream_duration_seconds",
+		Help:    "Duration of streamed responses",
+		Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300},
+	}, []string{"provider"})
 )
 
 func ObserveTokens(provider string, prompt, completion int) {
