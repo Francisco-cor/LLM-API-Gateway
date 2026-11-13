@@ -504,3 +504,31 @@ func TestConfig_KeyPepperFromEnv(t *testing.T) {
 		t.Fatalf("explicit key_pepper = %q, want yaml-pepper", explicit.Auth.KeyPepper)
 	}
 }
+
+// TestConfig_ProductionProfilesLoad keeps the shipped profiles honest: the
+// production profile must pass strict validation with the documented env vars,
+// and the development profile must not silently qualify as production.
+func TestConfig_ProductionProfilesLoad(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "sk-test-openai")
+	t.Setenv("ANTHROPIC_API_KEY", "sk-test-anthropic")
+	t.Setenv("GEMINI_API_KEY", "test-gemini")
+	t.Setenv("GATEWAY_API_KEY", "test-gateway-key-at-least-32-characters")
+	t.Setenv("ADMIN_API_KEY", "test-admin-key-at-least-32-characters")
+	t.Setenv("REDIS_URL", "redis://localhost:6379/0")
+
+	prod, err := config.Load("../config.prod.yaml")
+	if err != nil {
+		t.Fatalf("load config.prod.yaml: %v", err)
+	}
+	if err := prod.ValidateStrict(); err != nil {
+		t.Fatalf("config.prod.yaml must satisfy strict validation: %v", err)
+	}
+
+	dev, err := config.Load("../config.dev.yaml")
+	if err != nil {
+		t.Fatalf("load config.dev.yaml: %v", err)
+	}
+	if err := dev.ValidateStrict(); err == nil {
+		t.Fatal("config.dev.yaml must not satisfy strict production validation")
+	}
+}

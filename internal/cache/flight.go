@@ -7,8 +7,7 @@ import (
 )
 
 // Group collapses concurrent cache misses for the same key into one provider
-// call. The request handler does not use it yet; wave 2 should wrap the
-// miss-then-fetch path:
+// call. Chat uses LoadOrStore around the miss-then-fetch path:
 //
 //	value, hit, err := group.LoadOrStore(c, key, ttl, func() ([]byte, error) {
 //	    return callProvider(ctx)

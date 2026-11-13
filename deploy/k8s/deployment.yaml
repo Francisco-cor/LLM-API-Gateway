@@ -59,6 +59,12 @@ spec:
               containerPort: 8081
               protocol: TCP
           env:
+            # Strict validation: auth, admin key, TLS-only base URLs, Redis.
+            - name: GATEWAY_ENV
+              value: "prod"
+            # Used for the multi-replica budget warning (HPA minReplicas).
+            - name: GATEWAY_REPLICAS
+              value: "3"
             - name: OPENAI_API_KEY
               valueFrom:
                 secretKeyRef:

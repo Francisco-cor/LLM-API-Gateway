@@ -620,11 +620,8 @@ func (h *Handler) finishStreamBudget(tenant string, reservation *budget.Reservat
 	}
 }
 
-// chatCostUSD prices chat usage. Cached prompt tokens are split out so a
-// provider cache hit is not billed as fresh input. budget.Manager exposes
-// CostForChat but not a cache-aware variant, so the cached slice is priced at
-// the rule's input rate: that over-reserves rather than under-bills, and it
-// avoids silently losing money when no cache rate exists.
+// chatCostUSD prices chat usage, splitting provider cache hits out of the
+// prompt so they are billed at the cache rate when the catalog defines one.
 func (h *Handler) chatCostUSD(providerName, model string, usage provider.Usage) (float64, bool) {
 	if h.budgetMgr == nil {
 		return 0, false
@@ -643,14 +640,7 @@ func (h *Handler) chatCostUSD(providerName, model string, usage provider.Usage) 
 	if cached > prompt {
 		cached = prompt
 	}
-	if cached > 0 {
-		base, baseErr := h.budgetMgr.CostForChat(providerName, model, prompt-cached, usage.CompletionTokens)
-		cachedEst, cachedErr := h.budgetMgr.CostForChat(providerName, model, cached, 0)
-		if baseErr == nil && cachedErr == nil {
-			return base.USD + cachedEst.USD, base.Known && cachedEst.Known
-		}
-	}
-	estimate, err := h.budgetMgr.CostForChat(providerName, model, prompt, usage.CompletionTokens)
+	estimate, err := h.budgetMgr.CostForChatWithCacheTokens(providerName, model, prompt, usage.CompletionTokens, cached, 0)
 	if err != nil {
 		h.log.Warn("provider/model price unavailable; using fallback estimate", "provider", providerName, "model", model, "error", err)
 		return h.budgetMgr.CostForTokens(usage.TotalTokens), false

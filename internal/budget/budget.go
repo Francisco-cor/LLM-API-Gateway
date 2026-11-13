@@ -305,6 +305,17 @@ func (m *Manager) CostForChat(provider, model string, promptTokens, completionTo
 	return pricing.Estimate{USD: m.CostForTokens(promptTokens + completionTokens), Known: false, Currency: pricing.DefaultCurrency}, nil
 }
 
+// CostForChatWithCacheTokens prices a completed request using the provider's
+// reported cache read/write token split. It falls back to the configured
+// per-token cost when no catalog is available.
+func (m *Manager) CostForChatWithCacheTokens(provider, model string, promptTokens, completionTokens, cacheReadTokens, cacheWriteTokens int) (pricing.Estimate, error) {
+	catalog := m.catalogSnapshot()
+	if catalog != nil {
+		return catalog.ChatWithCacheTokens(provider, model, promptTokens, completionTokens, cacheReadTokens, cacheWriteTokens)
+	}
+	return pricing.Estimate{USD: m.CostForTokens(promptTokens + completionTokens), Known: false, Currency: pricing.DefaultCurrency}, nil
+}
+
 func (m *Manager) EstimateChat(model string, promptTokens, completionTokens int) (pricing.Estimate, error) {
 	catalog := m.catalogSnapshot()
 	if catalog != nil {

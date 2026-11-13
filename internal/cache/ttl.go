@@ -3,8 +3,8 @@ package cache
 import "time"
 
 // ClampTTL bounds a caller-supplied cache TTL such as the X-Cache-TTL request
-// header against a configured maximum (cache.max_ttl). The handler does not
-// call it yet; wave 2 should apply it before passing the TTL to Set:
+// header against a configured maximum (cache.max_ttl). Handlers call it before
+// passing the TTL to Set:
 //
 //	cacheTTL = cache.ClampTTL(cacheTTL, cfg.Cache.MaxTTL)
 //
