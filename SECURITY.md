@@ -1,128 +1,128 @@
-# Security Policy
+# Política de seguridad
 
-## Supported versions
+## Versiones soportadas
 
-| Version | Supported | Notes |
+| Versión | Soportada | Notas |
 |---|---|---|
-| `1.1.x` | Yes | Current release line (`v1.1.0`). |
-| `1.0.x` | Best effort | Fixes may be backported if the change is small and low-risk. |
-| `< 1.0` | No | Pre-release history; upgrade. |
+| `1.1.x` | Sí | Línea actual (`v1.1.0`). |
+| `1.0.x` | Best effort | Se pueden backportear fixes pequeños y de bajo riesgo. |
+| `< 1.0` | No | Historial pre-release; actualiza. |
 
-Only the latest patch of a supported minor receives security fixes. The `main` branch is development; a fix on `main` is not a released fix until it is tagged.
+Solo el último parche de una minor soportada recibe fixes de seguridad. `main` es desarrollo; un fix en `main` no está publicado hasta que existe una etiqueta.
 
-## Reporting a vulnerability
+## Cómo reportar una vulnerabilidad
 
-**Do not open a public issue for a security problem.**
+**No abras un issue público para un problema de seguridad.**
 
-Use GitHub's private vulnerability reporting:
+Usa el reporte privado de GitHub:
 
-1. Go to the repository's **Security** tab → **Advisories** → **Report a vulnerability**.
-2. Or open a **private security advisory** directly from the repository page. GitHub keeps the discussion private until it is published.
+1. Pestaña **Security** del repositorio → **Advisories** → **Report a vulnerability**.
+2. O abre directamente un **private security advisory** desde la página del repositorio. GitHub mantiene la conversación privada hasta que se publica.
 
-Include, if possible:
+Incluye, si puedes:
 
-- affected version or commit (`cat VERSION`, `git rev-parse HEAD`);
-- a minimal reproduction (config snippet with secrets removed, request, observed vs expected);
-- impact (confidentiality, integrity, availability, cost);
-- whether the issue is reachable with a tenant API key, with admin access, or only with local access.
+- versión o commit afectado (`cat VERSION`, `git rev-parse HEAD`);
+- una reproducción mínima (config sin secretos, petición, observado vs esperado);
+- impacto (confidencialidad, integridad, disponibilidad, coste);
+- si el problema es alcanzable con una API key de tenant, con acceso admin o solo con acceso local.
 
-There is no security email address and no bug bounty. Do not send reports to personal addresses. If GitHub private reporting is unavailable, open a minimal public issue asking the maintainer to enable a private channel, without disclosing details.
+No hay dirección de email de seguridad ni bug bounty. No envíes reportes a direcciones personales. Si el reporte privado de GitHub no está disponible, abre un issue público mínimo pidiendo al maintainer habilitar un canal privado, sin revelar detalles.
 
-**What to expect:** acknowledgement via the advisory, a triage decision, and coordination on disclosure. No fixed SLA is promised; this is a single-maintainer project. Please allow time for a fix before publishing. Credit is given in the advisory unless you ask otherwise.
+**Qué esperar:** acuse de recibo en el advisory, decisión de triage y coordinación de la divulgación. No se promete un SLA fijo; es un proyecto de un solo maintainer. Da tiempo a un fix antes de publicar. Se dará crédito en el advisory salvo que pidas lo contrario.
 
-## Scope
+## Alcance
 
-In scope:
+Dentro del alcance:
 
-- the gateway HTTP surface (`/v1/*`, `/health*`, `/metrics`);
-- the admin API and pprof routes (`/admin/*`, `/debug/pprof/*`);
-- authentication, authorization, tenant isolation, rate limiting, budget and cache logic;
-- provider adapters and the translation layer, including secret handling and SSRF-relevant URL handling;
-- the container image, Kubernetes manifests and default configuration in this repository;
-- dependencies, when the vulnerability is exploitable through this project.
+- la superficie HTTP del gateway (`/v1/*`, `/health*`, `/metrics`);
+- la API de admin y las rutas de pprof (`/admin/*`, `/debug/pprof/*`);
+- autenticación, autorización, aislamiento de tenants, rate limit, budget y caché;
+- adaptadores de proveedor y capa de traducción, incluido el manejo de secretos y las URLs relevantes para SSRF;
+- la imagen de contenedor, los manifiestos de Kubernetes y la configuración por defecto del repositorio;
+- dependencias, cuando la vulnerabilidad sea explotable a través de este proyecto.
 
-Out of scope:
+Fuera del alcance:
 
-- vulnerabilities in OpenAI, Anthropic, Gemini or any upstream provider;
-- volumetric DoS, unless it exploits a specific unbounded resource in this code;
-- model output quality, hallucinations, prompt injection that only affects the model's answer (report it if it crosses a trust boundary in the gateway);
-- misconfiguration that is explicitly documented as insecure (for example `admin.allow_insecure: true` on a public interface);
-- findings that require a compromised host or cluster-admin access.
+- vulnerabilidades de OpenAI, Anthropic, Gemini o cualquier proveedor upstream;
+- DoS volumétrico, salvo que explote un recurso no acotado específico de este código;
+- calidad de las respuestas del modelo, alucinaciones o prompt injection que solo afecte a la respuesta (repórtalo si cruza una frontera de confianza del gateway);
+- mala configuración documentada explícitamente como insegura (por ejemplo `admin.allow_insecure: true` en una interfaz pública);
+- hallazgos que requieran un host comprometido o acceso de cluster-admin.
 
-## Threat model (summary)
+## Modelo de amenazas (resumen)
 
-### Assets
+### Activos
 
-- Provider API keys (money and account access).
-- Tenant API keys and their scopes.
-- Prompt and completion content (potentially personal or confidential).
-- Usage/budget state (financial integrity).
-- Admin control plane (can rewrite configuration and expose pprof).
+- Claves de API de proveedores (dinero y acceso a la cuenta).
+- Claves de tenant y sus scopes.
+- Prompts y respuestas (posiblemente personales o confidenciales).
+- Estado de uso/budget (integridad financiera).
+- Control plane de admin (puede reescribir configuración y exponer pprof).
 
-### Trust boundaries
+### Fronteras de confianza
 
 ```text
-tenant client ──Bearer key──> gateway :8080 ──provider key──> upstream
-                                   │
-operator ──admin key──> admin :8081 ┘ (same process)
+cliente tenant ──Bearer key──> gateway :8080 ──provider key──> upstream
+                                      │
+operador ──admin key──> admin :8081 ──┘ (mismo proceso)
 ```
 
-### Threats and current posture
+### Amenazas y postura actual
 
-| Threat | Current control | Gap / pending |
+| Amenaza | Control actual | Brecha / pendiente |
 |---|---|---|
-| **Admin API exposed** | Disabled-by-default auth is fail-closed: the process refuses to start when `admin.allow_insecure=false` and no key is set. Constant-time key comparison. Bind address defaults to `127.0.0.1`. | Admin key cannot be rotated without a restart; no per-operator identity or audit log; no mTLS. Roadmap R-09, R-26. |
-| **pprof leaks secrets/prompts** | pprof is **opt-in** (`admin.pprof_enabled`, default false) and lives only in the admin mux; no `:6060` listener. | A heap dump still contains keys and prompts. Treat dumps as secrets, restrict admin network access, disable pprof after use. |
-| **SSRF via `base_url`** | `base_url` is operator-controlled configuration, not tenant input; provider clients have a timeout and bounded response body (8 MiB). | No scheme/host allowlist, no private/loopback/link-local IP blocking, default HTTP redirects are followed, DNS rebinding is not addressed. Roadmap R-23. |
-| **Tenant isolation** | Auth middleware derives the tenant from the key and **overwrites** `X-Tenant-ID`; cache keys are SHA-256-salted with the Authorization value; semantic namespaces include identity and response shape. Scopes and expiry are enforced per endpoint. Unit tests cover key identity isolation. | When `auth.enabled=false`, `X-Tenant-ID` is client-controlled (dev mode only). No end-to-end HTTP isolation suite across tenants; no tenant CRUD/revocation propagation (static config). Roadmap R-06/R-07. |
-| **Secret exposure in logs** | `slog` redacts attributes named `authorization`, `x-api-key`, `api_key`, `api-key`, `key`, and string values that look like `Bearer ...` or `sk-...`; admin config responses redact provider/admin/Redis/auth keys as `***`. Gemini auth uses `x-goog-api-key`, not a query parameter. | Redaction is name/heuristic based; prompts/responses are not logged by default but can appear in errors. Provider error messages (bounded to 4 KiB) are returned to clients. No secret manager. Roadmap R-24/R-25. |
-| **Prompt/content leakage via cache** | Cache entries are isolated by identity and response-shaping fields; TTL bounded; only 200 non-stream responses; no cache for streams. | Contents are stored unencrypted in memory/Redis; Redis is a separate trust boundary; semantic cache is local to a process. No PII classification. |
-| **Credential stuffing / brute force** | API keys are high-entropy and compared by hash; missing keys use a constant-time dummy comparison. Rate limiting is per hashed identity. | No login endpoint (good), but no per-IP auth-failure alerting. |
-| **Rate-limit bypass during Redis outage** | Local token bucket keeps per-process protection. | Global limit multiplies by replica count; the degraded flag has no metric. Roadmap R-27. |
-| **Budget bypass / overspend** | Reservations are atomic (Redis Lua or in-process mutex); budget fails closed (`503`) when a configured Redis is unavailable; unknown prices can be rejected. | No ledger/reconciliation; no per-tenant quota UI; local mode is per replica. Roadmap R-10/R-11. |
-| **Request smuggling / oversized bodies** | `MaxBytesReader` 1 MiB on chat/embeddings and admin PATCH; unknown JSON fields rejected; one JSON value per body; upstream bodies bounded. | No dedicated fuzzing of the translation layer in CI. |
-| **Unauthenticated metrics** | `/metrics` is intentionally excluded from tenant auth. | It exposes traffic, cost, provider and tenant-adjacent labels. Restrict by network or add auth. Roadmap R-26. |
-| **Supply chain** | `govulncheck` and `golangci-lint` (includes `gosec`) run in CI; base images pinned by tag, not digest. | No SBOM, no image signing, no dependency pinning by digest. |
-| **Transport** | Gateway↔provider uses HTTPS by default; TLS verification is Go's default. | No mTLS to providers; Redis may be plaintext in the compose profile; no TLS termination in the repo. |
+| **Admin API expuesta** | El arranque es fail-closed: con `admin.allow_insecure=false` y sin key, el proceso no arranca. Comparación de key en tiempo constante. Bind por defecto a `127.0.0.1`. | La admin key no se puede rotar sin reiniciar; no hay identidad por operador ni audit log; no hay mTLS. Roadmap R-09, R-26. |
+| **pprof filtra secretos/prompts** | pprof es **opt-in** (`admin.pprof_enabled`, false por defecto) y vive solo en el mux del admin; no hay listener `:6060`. | Un heap dump contiene claves y prompts. Trátalo como secreto, restringe la red del admin y deshabilita pprof después. |
+| **SSRF vía `base_url`** | `base_url` lo controla el operador, no el tenant; los clientes tienen timeout y la respuesta upstream está acotada a 8 MiB. | No hay allowlist de esquema/host, ni bloqueo de IP privadas/loopback/link-local; se siguen redirects HTTP por defecto; no se cubre DNS rebinding. Roadmap R-23. |
+| **Aislamiento de tenants** | El middleware deriva el tenant de la key y **sobrescribe** `X-Tenant-ID`; las claves de caché se salan con SHA-256 del valor de Authorization; los namespaces semánticos incluyen identidad y forma de respuesta; se aplican scopes y expiración por endpoint. Hay tests unitarios de aislamiento por identidad. | Con `auth.enabled=false`, `X-Tenant-ID` lo controla el cliente (solo modo dev). No hay suite e2e de aislamiento por HTTP; no hay CRUD ni propagación de revocación (config estática). Roadmap R-06/R-07. |
+| **Exposición de secretos en logs** | `slog` redacta atributos llamados `authorization`, `x-api-key`, `api_key`, `api-key`, `key` y valores que parecen `Bearer ...` o `sk-...`; el admin redacta claves de proveedor/admin/Redis/auth como `***`. Gemini usa `x-goog-api-key`, no query string. | La redacción es por nombre/heurística; los prompts no se registran por defecto, pero pueden aparecer en errores. Los mensajes de error del proveedor (acotados a 4 KiB) se devuelven al cliente. No hay secret manager. Roadmap R-24/R-25. |
+| **Fuga de prompts/contenido vía caché** | Las entradas están aisladas por identidad y campos que moldean la respuesta; TTL acotado; solo 200 no-stream; los streams no se cachean. | El contenido se guarda sin cifrar en memoria/Redis; Redis es otra frontera de confianza; la caché semántica es local al proceso. No hay clasificación de PII. |
+| **Fuerza bruta de credenciales** | Las API keys son de alta entropía y se comparan por hash; una key inexistente usa una comparación dummy en tiempo constante. El rate limit va por identidad hasheada. | No hay alerta de fallos de autenticación por IP. |
+| **Bypass de rate limit con Redis caído** | El bucket local mantiene protección por proceso. | El límite global se multiplica por el número de réplicas; el flag `degraded` no tiene métrica. Roadmap R-27. |
+| **Bypass/overspend de budget** | Las reservas son atómicas (Redis Lua o mutex local); el budget falla cerrado (`503`) cuando el Redis configurado no está disponible; los precios desconocidos se pueden rechazar. | No hay ledger ni reconciliación; no hay cuotas por tenant en UI; el modo local es por réplica. Roadmap R-10/R-11. |
+| **Smuggling / cuerpos gigantes** | `MaxBytesReader` de 1 MiB en chat/embeddings y PATCH admin; campos JSON desconocidos rechazados; un solo valor JSON por cuerpo; respuestas upstream acotadas. | No hay fuzzing dedicado de la capa de traducción en CI. |
+| **Métricas sin autenticar** | `/metrics` se excluye intencionadamente de la auth de tenant. | Expone tráfico, coste, proveedor y etiquetas adyacentes al tenant. Restringe por red o añade auth. Roadmap R-26. |
+| **Supply chain** | `govulncheck` y `golangci-lint` (incluye `gosec`) corren en CI; las imágenes base van por tag, no por digest. | No hay SBOM, firma de imagen ni pin por digest. |
+| **Transporte** | Gateway↔proveedor usa HTTPS por defecto; la verificación TLS es la de Go. | No hay mTLS con proveedores; Redis puede ir en claro en el perfil compose; no hay terminación TLS en el repositorio. |
 
-### Explicit non-goals today
+### No objetivos explícitos hoy
 
-- The gateway is **not** a compliance boundary (HIPAA, PCI, SOC 2). It does not classify or redact PII.
-- It does not defend against a malicious operator with admin access: the admin API can change routes and provider URLs by design.
-- It does not sandbox model output or tool execution; the client executes tools.
+- El gateway **no** es una frontera de cumplimiento (HIPAA, PCI, SOC 2). No clasifica ni redacta PII.
+- No defiende contra un operador malicioso con acceso admin: la API de admin puede cambiar rutas y URLs de proveedor por diseño.
+- No sandboxea la salida del modelo ni la ejecución de tools; el cliente ejecuta las tools.
 
-## Hardening checklist for operators
+## Checklist de hardening para operadores
 
-- [ ] Set `ADMIN_API_KEY` to a random value ≥ 32 bytes; never use `admin.allow_insecure: true` outside localhost.
-- [ ] Keep `admin.bind_address: 127.0.0.1` unless you have a NetworkPolicy/ACL; do not expose `:8081` through a public Ingress.
-- [ ] Leave `admin.pprof_enabled: false`; enable it only during an incident, download dumps securely, delete them, disable it.
-- [ ] Require auth (`auth.enabled: true`) for every non-local deployment; scope keys to `chat:write`, `embeddings:write`, `models:read`.
-- [ ] Put Redis on a private network with auth/TLS; do not reuse it for unrelated data.
-- [ ] Restrict `/metrics` to the monitoring network or add an authenticating proxy.
-- [ ] Set `rate_limit.budget.enabled: true` and a real monthly limit; monitor `gateway_cost_usd_total`.
-- [ ] Use `readOnlyRootFilesystem`, `runAsNonRoot`, dropped capabilities (the K8s manifests do this).
-- [ ] Pin image digests and scan them (`docker scout`, `trivy`) in your own pipeline.
-- [ ] Rotate tenant keys with overlap; remember the admin key requires a restart.
-- [ ] Back up `config.yaml`/secrets and test restore; until Postgres exists, the YAML is the control plane.
+- [ ] Define `ADMIN_API_KEY` con un valor aleatorio de ≥ 32 bytes; nunca uses `admin.allow_insecure: true` fuera de localhost.
+- [ ] Mantén `admin.bind_address: 127.0.0.1` salvo que tengas NetworkPolicy/ACL; no expongas `:8081` por un Ingress público.
+- [ ] Deja `admin.pprof_enabled: false`; actívalo solo durante un incidente, descarga los dumps de forma segura, bórralos y desactívalo.
+- [ ] Exige auth (`auth.enabled: true`) en todo despliegue no local; limita los scopes a `chat:write`, `embeddings:write`, `models:read`.
+- [ ] Pon Redis en una red privada con auth/TLS; no lo reutilices para datos no relacionados.
+- [ ] Restringe `/metrics` a la red de monitorización o añade un proxy autenticado.
+- [ ] Activa `rate_limit.budget.enabled: true` con un límite mensual real; monitoriza `gateway_cost_usd_total`.
+- [ ] Usa `readOnlyRootFilesystem`, `runAsNonRoot` y capabilities eliminadas (los manifiestos K8s ya lo hacen).
+- [ ] Fija digests de imagen y escanéalos (`docker scout`, `trivy`) en tu propio pipeline.
+- [ ] Rota las keys de tenant con solape; recuerda que la admin key requiere reinicio.
+- [ ] Haz backup de `config.yaml`/secretos y prueba la restauración; hasta que exista Postgres, el YAML es el control plane.
 
-## Current controls vs pending (quick view)
+## Controles actuales vs pendientes (vista rápida)
 
-| Control | Status |
+| Control | Estado |
 |---|---|
-| Tenant Bearer auth, scopes, expiry | Implemented |
-| Admin fail-closed + constant-time compare | Implemented |
-| Admin bind loopback by default | Implemented |
-| pprof opt-in inside admin only | Implemented |
-| Secret redaction in logs/admin output | Implemented (heuristic) |
-| Request/response size bounds | Implemented |
-| CORS allowlist, security headers | Implemented |
-| Budget fail-closed with Redis | Implemented |
-| SSRF allowlist / private-IP blocking | **Pending** (R-23) |
-| Secret manager + rotation | **Pending** (R-24) |
-| PII redaction / prompt logging policy | **Pending** (R-25) |
-| Admin audit log + operator identity | **Pending** (R-09) |
-| Metrics authentication | **Pending** (R-26) |
-| SBOM + image signing | **Pending** |
-| Ledger/reconciliation | **Pending** (R-10/R-12) |
+| Auth Bearer de tenant, scopes, expiración | Implementado |
+| Admin fail-closed + comparación en tiempo constante | Implementado |
+| Bind del admin a loopback por defecto | Implementado |
+| pprof opt-in solo dentro del admin | Implementado |
+| Redacción de secretos en logs/salida admin | Implementado (heurístico) |
+| Límites de tamaño de petición/respuesta | Implementado |
+| CORS allowlist, cabeceras de seguridad | Implementado |
+| Budget fail-closed con Redis | Implementado |
+| SSRF allowlist / bloqueo de IP privadas | **Pendiente** (R-23) |
+| Secret manager + rotación | **Pendiente** (R-24) |
+| Redacción de PII / política de logs de prompts | **Pendiente** (R-25) |
+| Audit log de admin + identidad de operador | **Pendiente** (R-09) |
+| Autenticación de métricas | **Pendiente** (R-26) |
+| SBOM + firma de imagen | **Pendiente** |
+| Ledger / reconciliación | **Pendiente** (R-10/R-12) |
 
-If you are evaluating this project for production, treat the pending items as blockers, not as nice-to-haves.
+Si estás evaluando este proyecto para producción, trata los pendientes como bloqueantes, no como mejoras opcionales.
