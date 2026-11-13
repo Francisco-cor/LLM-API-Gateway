@@ -160,6 +160,8 @@ func main() {
 	embedHandler := proxy.NewEmbeddingsHandlerWithCache(registry, cfg.FallbackChain, log, limiter, overrideStore, cfg.RateLimit.Enabled && cfg.RateLimit.TokenAware, retryCfg, circuitCfg, budgetMgr, cacheInst, cfg.Cache.TTL)
 	handlerOpts.SetTokenLimits(cfg.RateLimit.TokensPerMinute, cfg.RateLimit.TokenBurst)
 	embedHandler.SetTokenLimits(cfg.RateLimit.TokensPerMinute, cfg.RateLimit.TokenBurst)
+	handlerOpts.SetCacheMaxTTL(cfg.Cache.MaxTTL)
+	embedHandler.SetCacheMaxTTL(cfg.Cache.MaxTTL)
 	mux.Handle("POST /v1/chat/completions", handlerOpts)
 	mux.Handle("POST /v1/embeddings", embedHandler)
 	mux.Handle("GET /v1/models", proxy.NewModelsHandler(registry))
@@ -308,6 +310,8 @@ func main() {
 		})
 		handlerOpts.SetCache(newCache, newCfg.Cache.TTL)
 		embedHandler.SetCache(newCache, newCfg.Cache.TTL)
+		handlerOpts.SetCacheMaxTTL(newCfg.Cache.MaxTTL)
+		embedHandler.SetCacheMaxTTL(newCfg.Cache.MaxTTL)
 		cacheInst = newCache
 		cacheCfg = newCacheCfg
 
