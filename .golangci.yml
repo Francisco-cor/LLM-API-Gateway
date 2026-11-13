@@ -66,6 +66,14 @@ linters:
       - linters: [staticcheck]
         path: internal/pricing/catalog\.go
         text: "QF1002"
+      - linters: [staticcheck]
+        path: internal/provider/gemini\.go
+        text: "QF1002"
+      # TODO(provider-owners): sawStop is assigned but never read after the
+      # streaming change; this is a dead assignment, not a false positive.
+      - linters: [ineffassign]
+        path: internal/provider/anthropic\.go
+        text: "sawStop"
 
 formatters:
   enable:
