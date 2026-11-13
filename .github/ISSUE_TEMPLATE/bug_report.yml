@@ -1,0 +1,69 @@
+name: Bug report
+description: Something is broken or behaves differently than documented.
+title: "bug: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not paste API keys, prompts, or customer data. Redact `config.yaml` and logs.
+        For security vulnerabilities, use the private security advisory instead of this form.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and the expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include the smallest request or config that triggers it.
+      placeholder: |
+        1. Start with config.dev.yaml
+        2. curl ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Output of `cat VERSION` and `git rev-parse --short HEAD`.
+      placeholder: "v1.1.0 @ a55130a"
+    validations:
+      required: true
+  - type: input
+    id: go
+    attributes:
+      label: Go version and OS
+      description: Output of `go version` and your OS/arch.
+      placeholder: "go1.24.0 linux/amd64"
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How are you running it?
+      options:
+        - Local go run
+        - Docker
+        - Docker Compose
+        - Kubernetes
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs (redacted)
+      description: Remove Authorization headers, API keys, prompts and response bodies.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I removed secrets and personal data from this report.
+          required: true
+        - label: I checked the README and docs/RUNBOOK.md for known behavior.
+          required: true

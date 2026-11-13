@@ -6,5 +6,6 @@ curl -s "$GATEWAY_URL/v1/models" -H "Authorization: Bearer $API_KEY" | jq .
 curl -s "$GATEWAY_URL/health" | jq .
 curl -s "$GATEWAY_URL/health/providers" -H "Authorization: Bearer $API_KEY" | jq .
 curl -s "$GATEWAY_URL/metrics" | grep -E "gateway_requests_total|gateway_cache_hits" | head -20
-echo "admin (needs ADMIN_API_KEY):"
-curl -s http://localhost:8081/admin/config -H "Authorization: Bearer ${ADMIN_API_KEY:-dummy}" | jq '.admin.api_key' || echo "admin auth required"
+echo "admin (needs ADMIN_API_KEY; admin binds 127.0.0.1 by default):"
+curl -s "http://127.0.0.1:8081/admin/config" \
+  -H "Authorization: Bearer ${ADMIN_API_KEY:-dummy}" | jq '.Admin.APIKey // .error'

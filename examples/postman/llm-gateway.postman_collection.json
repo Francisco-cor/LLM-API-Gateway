@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "LLM API Gateway",
-    "description": "OpenAI-compatible collection for gateway :8080 + admin :8081 + pprof :6060. Import to Postman. Set variable gateway_url=http://localhost:8080 admin_key.",
+    "description": "OpenAI-compatible collection for gateway :8080 and admin :8081 (pprof is opt-in under the admin listener, not :6060). Import to Postman. Set variables gateway_url=http://localhost:8080, admin_url=http://localhost:8081, admin_key.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -75,7 +75,7 @@
       "request": {
         "method": "GET",
         "header": [{ "key": "Authorization", "value": "Bearer {{admin_key}}" }],
-        "url": { "raw": "http://localhost:6060/debug/pprof/heap", "host": ["http://localhost:6060"], "path": ["debug","pprof","heap"] }
+        "url": { "raw": "{{admin_url}}/debug/pprof/heap", "host": ["{{admin_url}}"], "path": ["debug","pprof","heap"] }
       }
     }
   ]

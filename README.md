@@ -1,254 +1,303 @@
-# LLM API Gateway — v1.0.0
+# LLM API Gateway
 
 [![CI](https://github.com/Francisco-cor/LLM-API-Gateway/actions/workflows/ci.yaml/badge.svg)](https://github.com/Francisco-cor/LLM-API-Gateway/actions/workflows/ci.yaml)
-[![Go Version](https://img.shields.io/badge/go-1.24-blue.svg)](go.mod)
-[![Coverage](https://img.shields.io/badge/coverage-85%25-brightgreen)](coverage.out)
+[![Go 1.24](https://img.shields.io/badge/go-1.24-blue.svg)](go.mod)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Docker](https://img.shields.io/badge/docker-%230db7ed.svg?logo=docker&logoColor=white)](Dockerfile)
-[![K8s](https://img.shields.io/badge/k8s-Deploy-326CE5.svg?logo=kubernetes)](deploy/k8s/)
 
-A lightweight reverse proxy in Go that unifies OpenAI, Anthropic & Gemini behind a single **OpenAI-compatible** API — with fallback, streaming, resilience, observability, rate-limit, cache, routing, embeddings & control plane hot-reload + performance hardening. Fases 1-11 complete; `v1.0.0` is production-oriented beta pending the remaining product hardening items.
+**One OpenAI-compatible endpoint in front of OpenAI, Anthropic and Gemini.** Point an OpenAI SDK at the gateway, keep your client code, and get fallback, streaming, rate limits, budgets, caching and observability without adopting a Python proxy stack.
 
-```mermaid
-flowchart LR
-    Client -->|POST /v1/chat/completions<br>POST /v1/embeddings| Gateway[LLM API Gateway :8080]
-    Gateway -->|model: gpt-*| OpenAI[OpenAI API]
-    Gateway -->|model: claude-*| Anthropic[Anthropic Messages API]
-    Gateway -->|model: gemini-*| Gemini[Gemini generateContent API]
-    Gateway -.fallback 429/5xx.-> Anthropic
-    Gateway -.fallback 429/5xx.-> Gemini
-    Admin[Admin :8081 + pprof :6060] -.-> Gateway
-```
+> **Status: `v1.1.0` — production-oriented beta, not a finished product.**
+> The data plane is solid and tested. The control plane is still a YAML file plus a process-local admin API; there is no Postgres, no tenant/key CRUD, no usage ledger and no Helm chart. The honest gap list and the plan are in **[`docs/ROADMAP.md`](docs/ROADMAP.md)**. If you need multi-tenant billing or a control plane today, read [“When this is not for you”](#when-this-is-not-for-you) first.
 
-**Time-to-first-success <2 min** (see Quick start). If you can `docker` + `curl`, you can run it.
+---
 
-## Features
+## Why it exists
 
-- **Unified endpoint** — `POST /v1/chat/completions` + `POST /v1/embeddings` OpenAI-compatible, including multimodal content, tool calls, audio fields, logprobs and modern completion controls. Anthropic/Gemini tools are translated to their native function-call contracts. Auto-translation via `internal/translate` (Fase 8).
-- **Provider interface** — `Name/Send/SendStream/Embed/Models/HealthCheck/DiscoverModels` — add a provider = 1 file + translate (see `CONTRIBUTING.md`).
-- **Intelligent routing** — `providers.<name>.models` wildcards `gpt-4*`, regex `gpt-4.*`; `routing.weighted` canary 90/10 ±5% in 1k reqs; auto-discovery `models: []` → `GET /v1/models`.
-- **Streaming SSE** — `stream:true` `text/event-stream` + Anthropic/Gemini → OpenAI `data: {...}` + `data: [DONE]`, with retryable fallback before the first chunk and optional final usage via `stream_options.include_usage`; `tools`/`tool_choice`/`response_format`.
-- **Resilience** — retry jitter 3×200ms, circuit breaker 5→open 30s half-open 1, hedge 300ms race, `Retry-After` propagation, `X-Gateway-Provider`.
-- **Observability** — Prometheus `/metrics` (`gateway_requests_total`, `tokens_total`, `gateway_cost_usd_total`, `cache_hits`, `ProviderErrors`, `CircuitState`), OTEL `traceparent` span context with optional OTLP/gRPC batch export, `slog` with `request_id/tenant/provider/latency_ms`, plus optional Jaeger/Prometheus/Grafana containers.
-- **Traffic control** — sharded 16× `fnv` + TTL 10m limiter (56ns `Allow`), token-aware `AllowN`, per-tenant/model overrides, atomic monthly budget reservation/commit, provider/model pricing catalog with hot reload, atomic Redis Lua buckets with in-process fallback on Redis errors, and shared Redis reconnects on configuration reload.
-- **Cache** — `X-Cache:HIT/MISS` LRU 1000 TTL 5m + Redis, identity-isolated SHA-256 keys covering response-shaping fields for chat and embeddings, `X-Cache-TTL/Skip`, only 200 non-stream. Semantic mode is opt-in and uses provider embeddings with threshold/top-k/max-entry limits.
-- **Security** — Bearer multi-tenant + scopes/expiry, CORS allowlist, `X-Content-Type-Options nosniff` etc, secrets redacted `***`.
-- **Health** — `GET /health` (uptime), `/health/providers` fan-out with configurable timeouts, `/livez`/`/readyz` (K8s, cached provider readiness, optional skip for credit-bearing checks, `SetReady(false)` draining).
-- **Control plane** — Admin `:8081` `GET /admin/config` redacted, `POST /admin/reload` 400 rollback, `GET /admin/providers`, `PATCH /admin/config` hot knobs (`rate_limit/cache/circuit/hedge/routing/logging`), file watcher 1s poll + `SIGHUP`.
-- **Perf & Ops** — `ReadHeaderTimeout 5s` anti-Slowloris, `IdleTimeout 120s` keep-alive, shared `Transport MaxIdleConns100/PerHost20/KeepAlive30s`, `sync.Pool` JSON buffers, K8s `Deployment/HPA 3→10/PDB min 2/ServiceMonitor`, `pprof :6060` behind admin auth, `BENCH.md` + `k6` 1k RPS p95<30ms, `readOnlyRootFilesystem` + `runAsNonRoot`.
-- **DX & Release** — `examples/` (curl/python/node/langchain/postman), `CONTRIBUTING.md` (<10 min), `docs/ARCHITECTURE.md` C4 + ADR-001..003, `CHANGELOG.md` + `VERSION` SemVer `v1.0.0`, `make dev` air live-reload.
+You have one app and three model vendors. You do not want three SDKs, three retry policies and three dashboards. The gateway gives you:
 
-## Quick start (<2 min)
+- **A stable contract** — `POST /v1/chat/completions`, `POST /v1/embeddings`, `GET /v1/models`; OpenAI-shaped requests, responses, errors and SSE.
+- **Provider choice without client changes** — route `gpt-*`, `claude-*` and `gemini-*` to their APIs, with alias remapping on fallback.
+- **Resilience as code** — retry with jitter, circuit breaker, hedge for non-streaming calls, fallback before the first SSE chunk.
+- **Cost and traffic control** — per-client request/token buckets (local or Redis), monthly token/USD budgets, pricing catalog, exact and opt-in semantic cache.
+- **Operability** — health/readiness, Prometheus, OTLP traces, redacted logs, validated hot reload and an admin API that fails closed.
+
+It is a single Go binary with a small dependency set (see `go.mod`; 8 direct modules) and no framework.
+
+---
+
+## Quick start (under 2 minutes)
+
+### Docker Compose
 
 ```bash
+git clone https://github.com/Francisco-cor/LLM-API-Gateway.git
+cd LLM-API-Gateway
+
 cp .env.example .env
-# edit .env — set at least one of OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY
-# optionally: GATEWAY_API_KEY for auth, REDIS_URL, OTEL_EXPORTER_OTLP_ENDPOINT
+# Edit .env: set at least one of OPENAI_API_KEY / ANTHROPIC_API_KEY / GEMINI_API_KEY.
+# Optional: GATEWAY_API_KEY, ADMIN_API_KEY, REDIS_URL.
 
-docker-compose up --build -d
-# waits ~30s healthcheck
+docker compose up --build -d
+docker compose ps
 curl -s http://localhost:8080/health | jq
-# {"status":"ok","uptime_seconds":...,"ready":true}
+# { "status": "ok", "uptime_seconds": 1.2, "start_time": "...", "ready": true }
+```
 
-curl -s http://localhost:8080/v1/models -H "Authorization: Bearer local-dev" | jq
-# {"object":"list","data":[{"id":"gpt-4o","object":"model","owned_by":"openai"},...]}
+The default `config.yaml` has `auth.enabled: false`, so the demo below needs no `Authorization` header. The production profile (`config.prod.yaml`) requires `GATEWAY_API_KEY` and `ADMIN_API_KEY` and enables budgets.
 
+> The process exits with `no providers configured` if no provider key is set. That is intentional: the gateway does not ship a mock mode.
+
+### Docker
+
+```bash
+docker build -t llm-api-gateway .
+docker run --rm -p 8080:8080 \
+  -e OPENAI_API_KEY="$OPENAI_API_KEY" \
+  -e ADMIN_API_KEY="$ADMIN_API_KEY" \
+  llm-api-gateway
+```
+
+### Local Go
+
+```bash
+export OPENAI_API_KEY="sk-..."                # or ANTHROPIC_API_KEY / GEMINI_API_KEY
+go run ./cmd/gateway -config config.dev.yaml   # auth disabled, admin loopback, text logs
+# or: make dev                                   # air live-reload if installed, else go run
+```
+
+---
+
+## Demo
+
+Use a model that belongs to the provider key you configured. The examples below assume `OPENAI_API_KEY` and the shipped `config.yaml`.
+
+```bash
+# Chat
 curl -s http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer local-dev" \
-  -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"What is a token bucket?"}]}' | jq
-# {"id":"msg_01...","object":"chat.completion","model":"claude-sonnet-4-6","choices":[{"message":{"role":"assistant","content":"..."},"finish_reason":"stop"}],"usage":{"prompt_tokens":...}}
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gpt-4o",
+    "messages": [{"role":"user","content":"Explain a token bucket in one sentence."}],
+    "max_tokens": 64
+  }' | jq '{id, object, model, choices: [.choices[] | {finish_reason, content: .message.content}], usage}'
 
-# streaming
+# Streaming SSE
 curl -N http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer local-dev" \
-  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}'
-# data: {"id":"chatcmpl-...","choices":[{"delta":{"role":"assistant","content":"Hi"}}]}
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"Count to 3"}],"stream":true}'
+# data: {"id":"...","object":"chat.completion.chunk",...}
 # data: [DONE]
 
-# embeddings
+# Embeddings
 curl -s http://localhost:8080/v1/embeddings \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer local-dev" \
-  -d '{"model":"text-embedding-3-small","input":"hello world"}' | jq
+  -H 'Content-Type: application/json' \
+  -d '{"model":"text-embedding-3-small","input":["hello","world"]}' | jq '{object, model, usage, dimensions: (.data[0].embedding | length)}'
 
-# metrics / admin
-curl -s http://localhost:8080/metrics | grep gateway_requests_total
-curl -s http://localhost:8081/admin/config -H "Authorization: Bearer $ADMIN_API_KEY" | jq '.admin.api_key' # "***"
+# Models and provider health
+curl -s http://localhost:8080/v1/models | jq '.data[].id'
+curl -s http://localhost:8080/health/providers | jq
+
+# Which provider served the request?
+curl -sS -D - -o /dev/null http://localhost:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"max_tokens":8}' \
+  | grep -i x-gateway-provider
 ```
 
-No keys? Gateway runs with mocks in tests: `go test ./... -v`. For load with mocks: `k6 run tests/load/k6.js`.
+With `auth.enabled: true`, add `-H "Authorization: Bearer $GATEWAY_API_KEY"`.
 
-Stop: `docker-compose down`.
-
-Profiles: `config.dev.yaml` is the local unauthenticated profile; `config.prod.yaml` requires `GATEWAY_API_KEY` and `ADMIN_API_KEY` and enables the budget catalog. Kubernetes uses the same production posture through `deploy/k8s/configmap.yaml` and Secret references.
-
-## Running locally without Docker
+Metrics and admin:
 
 ```bash
-go run ./cmd/gateway -config config.dev.yaml   # or make dev (air live-reload)
-# config.yaml uses ${ENV} expansion; see Configuration reference
+curl -s http://localhost:8080/metrics | grep -E '^gateway_(requests_total|provider_errors_total|circuit_state)'
+
+# Admin requires ADMIN_API_KEY when admin.allow_insecure is false.
+# GET /admin/config serializes Go field names, and durations as integer nanoseconds.
+curl -s http://127.0.0.1:8081/admin/config \
+  -H "Authorization: Bearer $ADMIN_API_KEY" | jq '.Admin.APIKey'
+# "***"
 ```
 
-## Env matrix
+The admin listener binds to `127.0.0.1` by default. In Docker Compose, `config.yaml` therefore keeps the admin API **inside the container** even though the port is published; expose it deliberately with a config that sets `admin.bind_address` and a network/ACL. pprof is not on `:6060`: it is opt-in inside the admin mux (`admin.pprof_enabled: true`).
 
-| Env | Required | Description | Default / Example |
-|-----|----------|-------------|-------------------|
-| `OPENAI_API_KEY` | one of three | OpenAI `sk-...` | `${OPENAI_API_KEY}` in `config.yaml:providers.openai.api_key` |
-| `ANTHROPIC_API_KEY` | one of three | Anthropic `sk-ant-...` | `${ANTHROPIC_API_KEY}` |
-| `GEMINI_API_KEY` | one of three | Gemini key | `${GEMINI_API_KEY}` |
-| `GATEWAY_API_KEY` | opt | Tenant key when `auth.enabled:true` (see `config.yaml:auth.keys`) | `${GATEWAY_API_KEY}` |
-| `ADMIN_API_KEY` | opt (prod) | Protects `:8081` + `:6060/pprof` (`Bearer` or `X-Admin-API-Key`); empty → open in dev | `${ADMIN_API_KEY}` `admin.api_key` |
-| `REDIS_URL` | opt | `redis://localhost:6379/0` enables distributed limiter + cache; 100ms timeout → memory fallback | `${REDIS_URL}` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | opt | OTLP/gRPC trace export endpoint; accepts `host:port`, `http://` or `https://` | `http://localhost:4317` |
-| `OTEL_TRACES_EXPORTER` | opt | set to `none` to disable export while retaining local trace IDs | `otlp` |
+More runnable clients: [`examples/curl`](examples/curl), [`examples/openai-python`](examples/openai-python), [`examples/openai-node`](examples/openai-node), [`examples/langchain`](examples/langchain), [`examples/postman`](examples/postman).
 
-See `.env.example` + `config.yaml` for full keys.
+---
 
-## Configuration reference (`config.yaml`)
+## What is implemented (verified)
 
-| Key | Description |
-|---|---|
-| `server.port` | HTTP listen (`8080`) |
-| `server.read_timeout` / `write_timeout` | `http.Server` timeouts |
-| `providers.<name>.api_key` | `${ENV}` expanded at load |
-| `providers.<name>.base_url` | provider base |
-| `providers.<name>.timeout` | per-request client timeout |
-| `providers.<name>.models` | `gpt-4o`, `gpt-4*`, `claude-*` or `[]` auto-discovery |
-| `fallback_chain` | ordered fallback on retryable 429/5xx |
-| `model_aliases` | `gpt-4o: [claude-sonnet-4-6]` remap on fallback |
-| `routing.weighted` | `gpt-4o: [{provider: openai, weight:90}]` canary |
-| `resilience.retry/circuit/hedge` | `max_attempts`, `failure_threshold`, `open_timeout`, `hedge.delay` |
-| `cache.enabled/ttl/max_size` | exact + embeddings; semantic mode uses `semantic_enabled/threshold`, `semantic_embedding_model`, `semantic_top_k`, `semantic_max_entries` |
-| `rate_limit.enabled/requests_per_minute/burst/redis_url/token_aware` | + `overrides` per tenant/model + `budget.monthly_tokens/monthly_usd/cost_per_token_usd`; `redis_url` is hot-reloadable with local fallback |
-| `rate_limit.budget.pricing` | `currency`, `version`, `unknown_model_policy` (`fallback`/`reject`) and provider/model rates per 1M input/output/embedding tokens |
-| `health` | readiness cache/check/provider timeouts and `skip_expensive_checks` for credit-bearing provider probes |
-| `auth.enabled/keys` | `key`, `tenant`, `scopes`, `expires_at` |
-| `admin.port/api_key` | `:8081` + `${ADMIN_API_KEY}` |
-| `cors.allowed_origins` | CORS |
-| `logging.level` / `format` | `debug/info/warn/error`, `json/text` |
-
-Provider registered only if key non-empty → subset fine.
-
-## Endpoints
-
-| Method | Path | Description |
+| Capability | Status | Notes |
 |---|---|---|
-| `POST` | `/v1/chat/completions` | OpenAI compat (stream+tools) |
-| `POST` | `/v1/embeddings` | `input` string/array → Gemini `embedContent` |
-| `GET` | `/v1/models` | aggregated registry |
-| `GET` | `/health` | liveness `status:ok` + `uptime_seconds` |
-| `GET` | `/health/providers` | configurable parallel provider checks; `degraded` if any unhealthy |
-| `GET` | `/livez` / `/readyz` | K8s probes (`readyz` 503 when draining) |
-| `GET` | `/metrics` | Prometheus |
-| `GET` | `/admin/config` | redacted `***` (auth `ADMIN_API_KEY`) |
-| `POST` | `/admin/reload` | validate 400 rollback |
-| `GET` | `/admin/providers` | list |
-| `PATCH` | `/admin/config` | hot knobs `rate_limit/cache/circuit/hedge/routing/logging/health`; Redis URL changes are applied through the shared reconnect manager |
-| `GET` | `/debug/pprof/*` | heap/goroutine/mutex on `:6060` & `:8081` (admin auth) |
+| OpenAI chat completions | Yes | Text, multimodal content parts (OpenAI passthrough), tools, tool results, `response_format.type`, audio fields, logprobs, `seed`, `n`, `stop`, `max_completion_tokens` |
+| Tools, streaming, usage | Yes | Anthropic/Gemini native tool contracts; SSE `data: [DONE]`; `stream_options.include_usage` when the provider returns usage |
+| Embeddings | Yes (OpenAI, Gemini) | Anthropic has no embeddings API |
+| Models endpoint | Yes | Configured registry, wildcard/regex matching, optional auto-discovery via upstream `/models` |
+| Providers | 3 | `openai`, `anthropic`, `gemini`; adapters implement `Provider` (+ `Embedder`) |
+| Routing | Yes | Exact, glob, regex, weighted canary, `model_aliases` on fallback |
+| Resilience | Yes | Retry 3× with jitter, circuit breaker 5 failures → 30 s open → 1 half-open probe, hedge 300 ms for **non-streaming**, fallback before first SSE chunk |
+| Rate limiting | Yes | 16-shard token bucket, TTL cleanup, token-aware `AllowWithLimits`, per-tenant/model overrides, Redis Lua, local fallback on Redis failure |
+| Budget | Yes | Atomic monthly token/USD reservation and commit, versioned pricing catalog, `insufficient_quota` / `budget_unavailable` |
+| Cache | Yes | Exact LRU or Redis, identity- and shape-scoped keys, `X-Cache-Skip` / `X-Cache-TTL`; opt-in semantic cache via embeddings. **No runtime memory fallback if Redis dies**; streams are never cached |
+| Admin | Yes | Redacted config, validated reload, provider list, hot knobs, `SIGHUP`, 1 s file watcher |
+| Health | Yes | `/health`, `/health/providers`, `/livez`, `/readyz` with drain semantics and cached provider checks |
+| Observability | Yes | Prometheus metrics, OTLP/gRPC traces, `slog` with `request_id`/tenant/provider/latency; **`/metrics` is unauthenticated** |
+| Auth | Yes | Static tenant keys, scopes, expiry; admin fail-closed and constant-time compare |
+| HTTP hardening | Yes | 1 MiB request cap, unknown-field rejection, 8 MiB upstream cap, CORS allowlist, `nosniff`/`DENY`/`no-referrer` |
+| Deployment | Manifests | Dockerfile (non-root, read-only root FS in K8s), Deployment/HPA/PDB/ServiceMonitor. **No Helm/Terraform** |
+| Persistence / tenancy / billing | **No** | Static YAML, no CRUD, no usage ledger, no reconciliation. See roadmap |
 
-## Benchmarks
+Not implemented: `/v1/responses`, audio transcription, files/batches, Realtime, fine-tuning, prompt guardrails, PII redaction, SSRF allowlisting, idempotency keys, capability-aware routing, generic OpenAI-compatible provider, Azure/Bedrock/Vertex, UI.
 
-See `BENCH.md`. TL;DR on 4-core (Go 1.24, sharded 16×):
-
-```
-BenchmarkLimiter_Allow      56 ns/op  0 allocs  — sharded fnv + TTL 10m p99<5ms @1k RPS
-BenchmarkBuildKey         1820 ns/op 400B 5 alloc — sha256 canonicalJSON
-BenchmarkCache_Get_Hit      75 ns/op  16B 1 alloc — LRU hit <200ns
-```
-
-`k6` 1k RPS 30s sustain (mock): `p50 2ms p95 8ms p99 18ms`; 1 instance ~3.2k RPS @80% CPU.
-
-```bash
-go test ./... -bench=. -benchmem -count=1
-k6 run tests/load/k6.js --env GATEWAY_URL=http://localhost:8080
-curl -H "Authorization: Bearer $ADMIN_API_KEY" http://localhost:6060/debug/pprof/heap > heap.prof && go tool pprof heap.prof
-```
-
-## Comparison vs LiteLLM / Kong / Portkey
-
-| Capability | This Gateway (v1.0.0) | LiteLLM Proxy | Kong AI Gateway | Portkey |
-|---|---|---|---|---|
-| OpenAI compat `chat/completions`+`stream` | ✅ `tools` + `models` + `embeddings` | ✅ | ✅ | ✅ |
-| Providers | OpenAI+Anthropic+Gemini (1 PR per new) | 10+ | 10+ (plugin) | 10+ |
-| Fallback/retry/circuit | ✅ retry jitter + circuit 5→30s + hedge + alias remap | ✅ | ✅ plugin | ✅ |
-| Rate-limit token-aware + budget | ✅ sharded+lru+Redis | ✅ Redis | ✅ plugin | ✅ |
-| Cache exact/semantic | ✅ LRU+Redis 0.97 | ✅ Redis semantic | ❌/plugin | ✅ |
-| Observability | ✅ Prometheus + OTEL + slog redacted | ✅ | ✅ | ✅ |
-| Hot reload admin | ✅ `:8081` + `SIGHUP` + `Watch` | ❌ restart | - | - |
-| Perf tuning | ✅ `Transport` `Pool` `Server` p95<30ms 1k RPS | Python | Nginx | Node |
-| K8s `HPA/PDB/ServiceMonitor` + `readOnlyRoot` | ✅ | ✅ Helm | ✅ | ✅ |
-| Deps | 5 (`yaml.v3`+prom+redis+otel+sync) | many (py) | many | many |
-| `go vet`/`govulncheck` clean + `BENCH.md`+`k6` | ✅ | - | - | - |
-
-Pick this if you want **Go minimal**, **one-binary <20MB**, **OpenAI SDK drop-in** with minimal deps, and full control (own circuit/limiter 180 LOC vs library).
+---
 
 ## Architecture
 
-See `docs/ARCHITECTURE.md` (C4 Context→Container→Component + sequence fallback) + ADR-001 pivot OpenAI, ADR-002 sharded limiter, ADR-003 cache. Quick diagram:
-
 ```mermaid
-flowchart TB
-    Client -->|OpenAI SDK| Edge --> Auth --> RL --> Cache{hit?} --> Router --> CB --> P1 & P2 & P3 --> Translate --> Stream --> Usage --> OTEL
-    Admin -.-> Config -.-> Router & RL & CB
+flowchart LR
+    SDK[OpenAI SDK / curl] -->|Bearer tenant key| GW[Gateway :8080]
+    GW --> AUTH[Auth + scopes]
+    AUTH --> LIM[Rate limit + budget]
+    LIM --> CACHE{Exact cache?}
+    CACHE -->|hit| OUT[Response + X-Cache]
+    CACHE -->|miss| ROUTER[Model registry: exact/glob/weighted/alias]
+    ROUTER --> RES[Retry + circuit + hedge]
+    RES --> OAI[OpenAI]
+    RES --> ANT[Anthropic]
+    RES --> GEM[Gemini]
+    OAI & ANT & GEM --> TR[Translate to OpenAI shape]
+    TR --> SSE[SSE or JSON]
+    SSE --> OUT
+    OUT --> METRICS["/metrics + OTLP"]
+    ADMIN["Admin :8081<br/>pprof opt-in"] -.-> ROUTER
+    ADMIN -.-> LIM
 ```
 
-## Examples
+- Canonical format is OpenAI (`internal/types`); Anthropic/Gemini translation lives in `internal/translate`.
+- The registry resolves exact → weighted exact → weighted pattern → pattern; wildcard patterns are glob-to-regex.
+- The data plane holds state in memory plus Redis; there is no database.
+- Full C4, component map, sequence diagram and corrected operational caveats: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). Decisions: [`docs/adr`](docs/adr).
 
-- `examples/curl/` — `chat.sh` `stream.sh` `embeddings.sh` `models.sh` + `README`
-- `examples/openai-python/` — `chat.py` `stream.py` `embeddings.py` (`base_url=http://localhost:8080/v1`)
-- `examples/openai-node/` — `chat.mjs` `stream.mjs` (`openai` npm)
-- `examples/langchain/` — `langchain_py.py` (LangChain `ChatOpenAI` with gateway)
-- `examples/postman/llm-gateway.postman_collection.json` — import Postman
-- `tests/load/k6.js` + `payload.json` + `BENCH.md`
+---
 
-Run any: `docker-compose up -d && ./examples/curl/chat.sh`.
+## Configuration
+
+Config is YAML with `${ENV}` expansion and strict unknown-field rejection. Provider keys may be empty (provider disabled); the process requires at least one enabled provider.
+
+| Key | Meaning |
+|---|---|
+| `server.port`, `server.read_timeout`, `server.write_timeout` | Listen port and HTTP timeouts (`8080`, `30s`, `60s`). `ReadHeaderTimeout` is 5 s, `IdleTimeout` 120 s. |
+| `providers.<name>.api_key` | Expanded from `${ENV}` at load. Empty/unexpanded disables the provider. |
+| `providers.<name>.base_url` | Upstream base URL. **No SSRF allowlist today.** |
+| `providers.<name>.timeout` | Per-provider HTTP client timeout. |
+| `providers.<name>.models` | Exact names, globs (`gpt-4*`), regex, or `[]` for auto-discovery. |
+| `fallback_chain` | Ordered providers to try on retryable 429/5xx. |
+| `model_aliases` | Model remap when falling back, e.g. `gpt-4o: [claude-sonnet-4-6]`. |
+| `routing.weighted` | Canary/blue-green weights per model. |
+| `resilience.retry/circuit/hedge` | `max_attempts`, `base_delay`, `max_delay`; `failure_threshold`, `open_timeout`; `hedge.enabled/delay`. |
+| `rate_limit.*` | `enabled`, `requests_per_minute`, `burst`, `redis_url`, `token_aware`, `tokens_per_minute`, `token_burst`, `overrides`. |
+| `rate_limit.budget.*` | `enabled`, `monthly_tokens`, `monthly_usd`, `cost_per_token_usd`, `pricing.catalog`. |
+| `cache.*` | `enabled`, `ttl`, `max_size`, `semantic_enabled`, `semantic_threshold`, `semantic_embedding_model`, `semantic_top_k`, `semantic_max_entries`. |
+| `health.*` | `readiness_cache_ttl`, `check_timeout`, `provider_timeout`, `skip_expensive_checks`. |
+| `auth.enabled/keys` | Static keys with `tenant`, `scopes`, `expires_at`. |
+| `admin.port`, `admin.bind_address`, `admin.api_key`, `admin.allow_insecure`, `admin.pprof_enabled` | Admin listener. Defaults: `8081`, `127.0.0.1`, fail closed, pprof off. |
+| `cors.allowed_origins` | CORS allowlist; empty disables CORS. |
+| `logging.level`, `logging.format` | `debug/info/warn/error`, `json/text`. |
+
+Environment variables:
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | one provider | OpenAI key |
+| `ANTHROPIC_API_KEY` | one provider | Anthropic key |
+| `GEMINI_API_KEY` | one provider | Gemini key |
+| `GATEWAY_API_KEY` | if `auth.enabled` | Tenant key in the production profile |
+| `ADMIN_API_KEY` | production | Admin auth; empty + `allow_insecure: false` refuses to start |
+| `REDIS_URL` | optional | Distributed rate limit, budget, cache |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | optional | OTLP/gRPC collector (`host:port`, `http://`, `https://`) |
+| `OTEL_TRACES_EXPORTER` | optional | `none` disables export but keeps local trace IDs |
+
+Two profiles ship in the repo: `config.dev.yaml` (no auth, debug logs, loopback admin) and `config.prod.yaml` (auth, budget, `0.0.0.0` admin bind, pprof off). Kubernetes uses `deploy/k8s/configmap.yaml`.
+
+---
+
+## Operations
+
+| Endpoint | Behavior |
+|---|---|
+| `GET /health`, `/livez` | 200 while the process is alive; `ready` flips false during drain |
+| `GET /readyz` | 503 when draining or zero healthy providers; provider result cached |
+| `GET /health/providers` | 200 + per-provider map; `overall: degraded` when any status is not `healthy` (including `skipped`) |
+| `GET /metrics` | Prometheus exposition; **not authenticated** |
+| `POST /admin/reload` | Re-read the config file; validation failure → 400 with old config active |
+| `PATCH /admin/config` | Hot knobs: rate limit, cache, health, resilience, routing, logging |
+| `GET /admin/config`, `/admin/providers` | Redacted config (Go field names) and provider list |
+| `GET /debug/pprof/*` | Only when `admin.pprof_enabled: true`, under the admin mux and admin auth |
+
+Hot reload covers providers, fallback, aliases, weights, limits, budget, pricing, cache, auth keys, health options and resilience. It does **not** cover `admin.port`, `admin.bind_address`, `admin.api_key`, `admin.pprof_enabled` or `server.*`; those need a restart.
+
+Runbooks for Redis outage, provider 429/5xx, open circuits, exhausted budget, cut streams, key rotation and profiling: [`docs/RUNBOOK.md`](docs/RUNBOOK.md). Proposed SLOs and alert thresholds are there too; they are not measured yet.
+
+---
+
+## Benchmarks
+
+There are Go microbenchmarks for the limiter, cache and key builder. There are **no reproducible end-to-end throughput numbers committed** in this repo state, and there is no mock provider mode: the `k6` script in `tests/load` points at a real upstream, so its p95 target is not comparable to gateway overhead.
+
+```bash
+go test ./tests -run '^$' -bench=. -benchmem -count=1
+go test ./tests -run '^$' -bench='Benchmark(Limiter|Cache|BuildKey)' -benchmem -count=3
+```
+
+Last recorded local reference (Windows AMD64, Go 1.24, 2026-09-01, not re-measured for this release) is kept in [`BENCH.md`](BENCH.md) with its command and caveats. Treat those figures as **local reference, not a guarantee**; hardware and load shape change the result. See the roadmap for the missing load harness (R-28/R-29).
+
+---
 
 ## Tests
 
 ```bash
-go test ./... -v -cover
-# v1.0.0: the suite covers router, embeddings, translate, admin/Watch, cache, auth and contract behavior
-go test ./... -race -coverprofile=coverage.out && go tool cover -html=coverage.out
-go test ./tests/contract -run TestOpenAI -v   # OpenAI SDK compat (no external deps, httptest)
+go test ./... -race -cover
+go test ./tests/contract -run TestContract -v
+go vet ./...
+make bench
+make vulncheck
 ```
 
-Contract suite (`tests/contract/openai_compat_test.go`) asserts OpenAI shape (`id/object/choices/usage`), streaming `data: [DONE]`, `model_not_found 404`, `DisallowUnknownFields 400`, `Retry-After` etc.
+The contract suite runs against `httptest`-backed providers with no external network: response shape, SSE `[DONE]`, unknown model 404, unknown-field 400, validation, `Retry-After`. CI runs tests with `-race`, golangci-lint and govulncheck; coverage is uploaded as an artifact. **No coverage badge or coverage gate is claimed here.** A prior measurement with `-coverpkg` was around 53%, and it has not been re-run for this release.
 
-## Makefile
+---
 
-```bash
-make build       # go build -o bin/gateway
-make run         # ./bin/gateway -config config.yaml
-make dev         # air if installed else go run (live-reload **/*.go)
-make test        # -v -cover
-make test-race   # -race -coverprofile
-make test-cover  # html
-make lint        # golangci-lint
-make lint-fix    # --fix
-make bench       # -bench=. -benchmem
-make vulncheck   # govulncheck
-make docker      # build llm-api-gateway
-make clean
-```
+## Comparison (honest)
 
-`air` config: `go install github.com/air-verse/air@latest` then `make dev` watches `cmd/**/*.go internal/**/*.go config.yaml`.
+| | This gateway `v1.1.0` | LiteLLM Proxy | Portkey / hosted gateways |
+|---|---|---|---|
+| Language / deploy | Go single binary + Redis | Python; Postgres/Redis; container | Hosted/self-hosted hybrid |
+| OpenAI compatibility | Chat, embeddings, models, SSE, tools | Broad, many endpoints | Broad |
+| Providers | 3 (OpenAI, Anthropic, Gemini) | Many | Many |
+| Control plane | YAML + process-local admin; **no DB** | DB-backed virtual keys, budgets, UI | Managed control plane, guardrails, analytics |
+| Multi-tenant billing | Monthly counters only; **no ledger** | Yes | Yes |
+| Cache | Exact + opt-in semantic | Exact + semantic + Redis | Yes |
+| Resilience | Retry, circuit, hedge (non-stream), fallback | Retry/fallback/routing | Retry/fallback/routing |
+| Observability | Prometheus + OTLP + structured logs | Prometheus/OTEL + integrations | Hosted analytics |
+| Ops packaging | Docker + raw K8s manifests | Helm/compose | SaaS or Helm |
+| Best fit | Go teams that want a small, inspectable data plane and are willing to build the control plane | Teams that want batteries-included tenancy today | Teams that want a vendor-managed platform |
 
-## Contributing
+Choose this if you value a small Go codebase you can read end to end, want to own the routing/resilience logic, and are prepared to invest in persistence (roadmap phases 2–3). Do not choose it if you need tenant CRUD, invoicing, SSO, 20+ providers or compliance features this week.
 
-See `CONTRIBUTING.md` (<10 min setup, branch/commit/DoD, adding provider, PR checklist).
+### When this is not for you
 
-## Release
+- You need **self-service API keys, usage dashboards or invoices** — no control plane/ledger yet.
+- You handle **regulated PII** — no classification/redaction, cache stores response bodies unencrypted.
+- You need **20+ providers** or Azure/Bedrock/Vertex — only 3 adapters today.
+- You need **active-active multi-region** — state is local + optional Redis; no global control plane.
+- You cannot run Redis but need **global** rate limits across replicas — the local fallback multiplies limits.
 
-`VERSION` file (`v1.0.0`) + `CHANGELOG.md` (Keep a Changelog) + `git tag v1.0.0` triggers `.github/workflows/release.yaml` (build `go vet` + `docker build` + `gh release`).
+The plan to close these gaps, with acceptance criteria and effort, is in **[`docs/ROADMAP.md`](docs/ROADMAP.md)**.
 
-```bash
-cat VERSION  # v1.0.0
-cat CHANGELOG.md | head -20
-git tag v1.0.0 -m "v1.0.0 Fase 11" && git push origin v1.0.0
-```
+---
 
-## License
+## Contributing, security, license
 
-MIT — `LICENSE` © 2026 Francisco Cordero.
+- Setup, make targets, PR criteria and how to add a provider: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+- Report vulnerabilities via **GitHub private security advisory**; details and threat model: [`SECURITY.md`](SECURITY.md).
+- Changelog: [`CHANGELOG.md`](CHANGELOG.md). Version: `VERSION`.
+- MIT — see [`LICENSE`](LICENSE).
