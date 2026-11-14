@@ -6,6 +6,11 @@ info:
   description: |
     Contract for the gateway's public HTTP surface and its admin API.
 
+    This document is gated in CI: Redocly must report zero problems and
+    `oasdiff breaking` must find no incompatible change against the previous
+    published revision. Wire compatibility is also exercised with the official
+    OpenAI Python and Node SDKs; see `tests/conformance/`.
+
     **Base URLs.** The data plane listens on `:8080`; the admin API listens on
     `:8081` and defaults to `127.0.0.1`. Every admin operation overrides the
     server to the admin listener.
