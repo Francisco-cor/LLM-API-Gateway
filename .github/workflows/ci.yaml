@@ -16,7 +16,7 @@ concurrency:
 
 env:
   GO_VERSION: "1.26"
-  # Line coverage floor measured with -coverpkg=./... (current baseline ~58%).
+  # Line coverage floor measured with -coverpkg=./... (current baseline ~66%).
   COVERAGE_MIN: "55"
 
 jobs:
@@ -86,7 +86,6 @@ jobs:
         with:
           version: v2.15.0
           only-new-issues: false
-          timeout: 5m
           args: --timeout=5m
 
   vulncheck:
@@ -100,20 +99,12 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - name: govulncheck (advisory while deps are upgraded)
-        id: govulncheck
-        # Known called vulnerabilities come from the pinned module graph and
-        # Go stdlib (owned by the Go/dependency workstream). Report them, but
-        # do not block CI on findings this workstream cannot fix.
-        continue-on-error: true
+      - name: govulncheck (blocking)
+        # Go 1.26.11 and the upgraded module graph are clean; keep this gate
+        # blocking so a reachable vulnerability fails the build.
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           govulncheck ./...
-      - name: Surface govulncheck findings
-        if: steps.govulncheck.outcome == 'failure'
-        run: |
-          echo "::warning title=govulncheck::Called vulnerabilities found in Go modules/stdlib; upgrade dependencies to make this gate blocking again."
-          echo "### govulncheck: findings (advisory)" >> "$GITHUB_STEP_SUMMARY"
 
   integration:
     runs-on: ubuntu-latest
@@ -174,12 +165,10 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
           exit-code: "1"
-      # Go module/stdlib findings are reported but not blocking while the
-      # dependency upgrade is owned elsewhere. Flip exit-code to 1 once
-      # go.mod is upgraded and this scan is clean.
-      - name: Trivy Go modules report (advisory)
+      # The Go module graph is upgraded and govulncheck is clean, so library
+      # findings are blocking too.
+      - name: Trivy Go modules scan (blocking)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        continue-on-error: true
         with:
           image-ref: llm-api-gateway:ci
           format: table

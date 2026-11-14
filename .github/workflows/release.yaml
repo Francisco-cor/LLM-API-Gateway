@@ -35,17 +35,11 @@ jobs:
         with:
           version: v2.15.0
           only-new-issues: false
-          timeout: 5m
           args: --timeout=5m
-      - name: Vulncheck (advisory while deps are upgraded)
-        id: govulncheck
-        continue-on-error: true
+      - name: Vulncheck (blocking)
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
           govulncheck ./...
-      - name: Surface govulncheck findings
-        if: steps.govulncheck.outcome == 'failure'
-        run: echo "::warning title=govulncheck::Called vulnerabilities in Go modules/stdlib; dependency upgrade is owned by the Go workstream."
 
   release:
     runs-on: ubuntu-latest
