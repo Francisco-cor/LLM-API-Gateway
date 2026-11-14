@@ -138,21 +138,11 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      # Integration tests are opt-in: add `//go:build integration` to a test
-      # file and it runs here against the Redis service. Until such tests
-      # exist this job is green and reports the skip explicitly.
-      - name: Detect integration tests
-        id: detect
-        run: |
-          if grep -rqE '^//go:build .*\bintegration\b' --include='*_test.go' .; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "No //go:build integration tests yet; nothing to run."
-          fi
+      # Redis-backed tests are skipped when REDIS_URL is unreachable; the
+      # gateway smoke tests run unconditionally. REDIS_URL points at the
+      # service container above.
       - name: Run integration tests
-        if: steps.detect.outputs.found == 'true'
-        run: go test -tags=integration ./... -count=1 -race -v
+        run: go test -tags=integration ./tests/integration/... -count=1 -race -v
 
   docker:
     runs-on: ubuntu-latest
