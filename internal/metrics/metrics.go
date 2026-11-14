@@ -42,6 +42,13 @@ var (
 		Help: "Cache hits vs misses",
 	}, []string{"result"}) // result=hit|miss
 
+	// CapabilityMismatches counts requests rejected before any provider call
+	// and fallbacks skipped because a model cannot serve tools/vision/JSON.
+	CapabilityMismatches = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gateway_capability_mismatches_total",
+		Help: "Capability mismatches by provider, missing capability and action",
+	}, []string{"provider", "capability", "action"}) // action=request_rejected|fallback_skipped
+
 	CacheSize = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "gateway_cache_size",
 		Help: "Current cache size (entries)",

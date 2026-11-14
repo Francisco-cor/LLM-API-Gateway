@@ -14,7 +14,7 @@ No es todavía un **producto SaaS multi-tenant**. Le faltan las cosas que no se 
 
 - no hay **control plane persistente**: la configuración vive en YAML y en memoria del proceso; no hay Postgres, migraciones, CRUD de tenants/keys ni historial de cambios;
 - no hay **ledger de uso**: el budget se calcula con contadores mensuales en memoria/Redis, sin eventos auditables ni reconciliación;
-- no hay **capability registry**: el routing sabe de proveedor y modelo, no de “este modelo soporta tools/visión/JSON schema”;
+- el routing ya conoce capacidades por modelo (tools/visión/audio/JSON/embeddings) y las respeta en fallback, pero no hay routing por coste, latencia ni tenant;
 - el soporte multi-proveedor es **tres adaptadores hardcodeados** (`openai`, `anthropic`, `gemini`) en `cmd/gateway/main.go`, no un registro genérico;
 - no hay **idempotencia**, **límites de concurrencia/backpressure**, **SSRF guard** para `base_url`, **secret manager**, **PII**, **Helm/Terraform**, **UI**, **conformance con SDKs oficiales** ni **SLOs medidos**.
 
@@ -42,7 +42,7 @@ Niveles: **prototipo** (funciona en local, sin garantías), **beta** (usable con
 |---|---|---|---|
 | Contrato HTTP OpenAI | **beta** | `POST /v1/chat/completions`, `/v1/embeddings`, `GET /v1/models`; contrato tolerante a campos desconocidos; `api/openapi.yaml` 1.1.1 con `param`, `index`, usage details y `json_schema` | Conformance contra SDKs oficiales en CI; idempotencia; versionado de contrato; `/v1/responses`, audio, batches fuera de alcance |
 | Proveedores | **prototipo** | 3 adaptadores en `buildProviders`; interfaz `Provider` + `Embedder`; salud por proveedor | Registro genérico OpenAI-compatible, Azure/Bedrock/Vertex, presets (Groq, DeepSeek, OpenRouter, Ollama, vLLM), fixtures de contrato por proveedor |
-| Routing | **beta** | exacto, glob/regex, `routing.weighted`, aliases, auto-discovery | Routing por capacidad, coste, latencia y tenant; canary por cabecera; presupuesto de contexto |
+| Routing | **beta** | exacto, glob/regex, `routing.weighted`, aliases, auto-discovery, capability registry con fallback restringido | Routing por coste, latencia y tenant; canary por cabecera; presupuesto de contexto |
 | Resiliencia | **beta** | retry 3× con jitter, circuit 5→30 s, hedge 300 ms (no-stream), fallback antes del primer chunk SSE, streaming truncado honesto | Backpressure, bulkheads, timeouts por ruta, presupuesto de reintentos global, hedge en streaming |
 | Control plane | **prototipo** | YAML + `SIGHUP` + watcher con reintento + admin `:8081`; validación y rollback; ETag/If-Match, audit y rotación de admin key en caliente | Postgres, migraciones, CRUD tenants/keys/proveedores/rutas, versionado y auditoría persistente, coherencia entre réplicas |
 | Multi-tenancy | **beta** | API keys con scopes obligatorios/allowlist, expiración, pepper y throttle 401; `X-Tenant-ID` derivado de la key | CRUD, rotación con solape entre réplicas, cuotas por tenant/modelo, aislamiento verificable, límites de modelo por tenant |
@@ -244,10 +244,13 @@ Prioridad: **P0** bloquea adopción; **P1** necesaria para operar; **P2** mejora
 | R-07 | **Parcial** | Keys de tenant y admin key se recargan en caliente; el solape entre réplicas y la revocación ≤ 5 s requieren control plane. |
 | R-09 | **Parcial** | Audit `admin_audit` con actor fingerprint, acción y detalle; es log de proceso, no tabla persistente ni identidad de operador. |
 | R-13 | **Parcial** | Catálogo versionado y tarifas por millón con cache read/write; falta precio efectivo por fecha. |
+| R-15 | **Cerrado** | `internal/capability` define `Set`/`Overrides`/`Table` con defaults por proveedor y overrides por modelo/glob; `providers.<name>.capabilities` en YAML; `GET /admin/providers` expone el set efectivo. |
+| R-16 | **Cerrado** | `Registry.ResolveForChat` y `RemapForFallbackWithCapabilities` filtran weighted/patrón/fallback por capacidades; hedge y streaming también. Fallback sin candidato compatible registra `gateway_capability_mismatches_total` y no degrada tools/visión/JSON. |
+| R-17 | **Cerrado** | Validación temprana antes de llamar al proveedor: 400 `model_capability_mismatch` con `param` (`tools`, `messages`, `response_format`, `stream`) para tools/visión/audio/JSON. |
 | R-23 | **Parcial** | Strict valida https, hosts privados/loopback/link-local y metadata, con `allow_private`; faltan DNS pinning y allowlist de redirects. |
 | R-26 | **Parcial** | Admin key rota sin reiniciar; `/metrics` sigue sin autenticación. |
 
-Todo lo demás (R-02, R-03, R-05, R-06, R-08, R-10–R-12, R-14–R-22, R-24, R-25, R-27–R-30) sigue **pendiente**.
+Todo lo demás (R-02, R-03, R-05, R-06, R-08, R-10–R-12, R-14, R-18–R-22, R-24, R-25, R-27–R-30) sigue **pendiente**.
 
 **Fuera de alcance hasta que lo pidan clientes:** operador de Kubernetes, plugins WASM, facturación con Stripe, multi-región activo-activo, fine-tuning, batches, realtime API.
 
@@ -419,7 +422,7 @@ Un release se etiqueta solo si:
 1. **R-02/R-04** (1 semana): congelar la conformidad con SDKs y el e2e; R-01 ya está cerrado. Barato y mejora todo lo demás.
 2. **R-05/R-06/R-07** (3–4 semanas): Postgres, tenants y keys. Sin esto no hay producto.
 3. **R-10/R-11/R-14** (2–3 semanas): ledger y cuotas. Es lo que convierte “gateway bonito” en “servicio facturable”.
-4. **R-15/R-16/R-18** (2–3 semanas): capacidades y proveedor genérico. Aquí el producto se vuelve útil fuera de OpenAI.
+4. **R-18/R-19** (2–3 semanas): proveedor genérico y presets. R-15/R-16/R-17 ya están cerrados; aquí el producto se vuelve útil fuera de OpenAI.
 5. **R-23/R-24/R-27/R-28** (2–3 semanas): seguridad y operación. Sin esto no pasa una revisión seria de compra.
 6. **R-29/R-30** (2 semanas): entrega instalable y consola mínima.
 
@@ -441,11 +444,12 @@ Commits de la rama `docs/final` (docs) sobre `main` en `f8663d0`; los cambios de
 | Caché | `max_bytes`, `max_ttl`, single-flight, semántico sin doble embedding, stats Redis reales | `internal/cache/*` |
 | Hot reload | `auth.enabled`, CORS, `logging.level`, admin key/pepper; bind/port/pprof/formato requieren reinicio; watcher con reintento; Redis no bloquea | `cmd/gateway/main.go`, `internal/config/config.go` |
 | Auth/seguridad | Scopes fail-closed, allowlist, keys ≥32, pepper, throttle 401, strict mode, validación `base_url`, ETag/audit/rotación admin, pprof opt-in, bind loopback | `internal/auth/*`, `internal/admin/server.go`, `internal/config/config.go`, ADR-005 |
+| Capacidades | `capability.Set/Table` con defaults por proveedor y overrides por modelo/glob; 400 `model_capability_mismatch` antes de llamar; fallback/hedge/streaming filtran por capacidad; `/admin/providers` expone el set; métrica `gateway_capability_mismatches_total` | `internal/capability/*`, `internal/proxy/router.go`, `internal/proxy/handler.go` |
 | CI/deploy | golangci-lint v2, cobertura `-coverpkg` + gate 55 %, Redis service, gate OpenAPI (Redocly cero warnings + oasdiff breaking), multiarch+SBOM+cosign, NetworkPolicy/SA/topology, perfil prod, `GATEWAY_ENV`/`GATEWAY_REPLICAS`, ConfigMap con `redis_url` | `.github/workflows/*`, `deploy/k8s/*`, `docker-compose.yaml` |
 | Docs | README/RUNBOOK/ARCHITECTURE/OpenAPI/SECURITY/CONTRIBUTING/BENCH/ROADMAP sincronizados; ADR-005; cobertura medida 66.0 % y benchmarks locales | este repo |
 | Tests | Cobertura real 66.0 % (`-coverpkg=./...`, 2026-11-13, `f8663d0`); suite de integración Redis con `-tags=integration` (requiere `REDIS_URL`) | `go test ./... -coverpkg=./...`, `go test -tags=integration ./...` |
 
-**Lo que sigue pendiente y no se debe presentar como hecho:** Postgres/control plane persistente, CRUD de tenants/keys, ledger de uso y reconciliación, cuotas por tenant contra ledger, capability registry y fallback por capacidad, proveedor OpenAI-compatible genérico y adaptadores enterprise (Azure/Bedrock/Vertex), UI, SLOs medidos, load/chaos testing, `/metrics` autenticado, secret manager, PII, mTLS, Helm/Terraform y e2e en kind.
+**Lo que sigue pendiente y no se debe presentar como hecho:** Postgres/control plane persistente, CRUD de tenants/keys, ledger de uso y reconciliación, cuotas por tenant contra ledger, proveedor OpenAI-compatible genérico y adaptadores enterprise (Azure/Bedrock/Vertex), UI, SLOs medidos, load/chaos testing, `/metrics` autenticado, secret manager, PII, mTLS, Helm/Terraform y e2e en kind.
 
 ## 10. Enlaces
 

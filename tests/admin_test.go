@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/fcordero/llm-api-gateway/internal/admin"
+	"github.com/fcordero/llm-api-gateway/internal/capability"
 	"github.com/fcordero/llm-api-gateway/internal/config"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/proxy"
@@ -388,6 +389,46 @@ func TestAdmin_GetProviders(t *testing.T) {
 	}
 	if !ok || len(provs) != 2 {
 		t.Fatalf("providers %v", body["providers"])
+	}
+}
+
+func TestAdmin_GetProvidersIncludesCapabilities(t *testing.T) {
+	cfg, _ := config.Load(writeTempConfig(t, minimalValidConfig()))
+	registry := proxy.NewRegistryWithCapabilities(
+		[]provider.Provider{
+			&mockProvider{name: "openai", models: []string{"gpt-4o", "text-embedding-3-small"}},
+		},
+		nil,
+		nil,
+		map[string]capability.Table{"openai": capability.NewTable("openai", nil)},
+	)
+	srv := admin.New(slog.New(slog.NewTextHandler(io.Discard, nil)), "secret123", "", cfg, registry, nil, nil)
+	h := srv.Handler()
+	req := httptest.NewRequest(http.MethodGet, "/admin/providers", nil)
+	req.Header.Set("Authorization", "Bearer secret123")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /admin/providers %d", w.Code)
+	}
+	var body struct {
+		Providers []struct {
+			Name         string                    `json:"name"`
+			Capabilities map[string]capability.Set `json:"capabilities"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Providers) != 1 {
+		t.Fatalf("providers = %d", len(body.Providers))
+	}
+	caps := body.Providers[0].Capabilities
+	if caps["gpt-4o"].Chat != true || caps["gpt-4o"].Vision != true {
+		t.Errorf("gpt-4o capabilities = %+v", caps["gpt-4o"])
+	}
+	if caps["text-embedding-3-small"].Chat != false || caps["text-embedding-3-small"].Embeddings != true {
+		t.Errorf("embedding capabilities = %+v", caps["text-embedding-3-small"])
 	}
 }
 

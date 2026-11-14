@@ -21,6 +21,7 @@ import (
 	"github.com/fcordero/llm-api-gateway/internal/auth"
 	"github.com/fcordero/llm-api-gateway/internal/budget"
 	"github.com/fcordero/llm-api-gateway/internal/cache"
+	"github.com/fcordero/llm-api-gateway/internal/capability"
 	"github.com/fcordero/llm-api-gateway/internal/config"
 	"github.com/fcordero/llm-api-gateway/internal/logger"
 	"github.com/fcordero/llm-api-gateway/internal/pricing"
@@ -77,11 +78,12 @@ func main() {
 
 	// build weighted routing map for Fase 8
 	weighted := buildWeighted(cfg, providers)
+	capabilities := buildCapabilityTables(cfg)
 	var registry *proxy.Registry
 	if len(weighted) > 0 {
-		registry = proxy.NewRegistryWithWeighted(providers, cfg.ModelAliases, weighted)
+		registry = proxy.NewRegistryWithCapabilities(providers, cfg.ModelAliases, weighted, capabilities)
 	} else {
-		registry = proxy.NewRegistryWithAliases(providers, cfg.ModelAliases)
+		registry = proxy.NewRegistryWithCapabilities(providers, cfg.ModelAliases, nil, capabilities)
 	}
 	registry.SetRandSeed(time.Now().UnixNano())
 	// Redis is shared by rate-limit, budget, and cache. Its manager can swap
@@ -258,7 +260,7 @@ func main() {
 		}
 
 		// atomically update registry in place
-		registry.Reload(newProviders, newCfg.ModelAliases, newWeighted)
+		registry.ReloadWithCapabilities(newProviders, newCfg.ModelAliases, newWeighted, buildCapabilityTables(newCfg))
 
 		// update limiter and overrides
 		limiter.UpdateLimits(newCfg.RateLimit.RequestsPerMinute, newCfg.RateLimit.Burst)
@@ -618,6 +620,19 @@ func semanticEmbedder(registry *proxy.Registry, model string) cache.EmbeddingFun
 		}
 		return resp.Data[0].Embedding, nil
 	}
+}
+
+// buildCapabilityTables converts providers[].capabilities into per-provider
+// tables. A table with only a kind still enables provider-kind defaults.
+func buildCapabilityTables(cfg *config.Config) map[string]capability.Table {
+	if len(cfg.Providers) == 0 {
+		return nil
+	}
+	tables := make(map[string]capability.Table, len(cfg.Providers))
+	for name, pc := range cfg.Providers {
+		tables[name] = capability.NewTable(name, pc.Capabilities)
+	}
+	return tables
 }
 
 // buildProviders constructs a Provider for each configured backend that has

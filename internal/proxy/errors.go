@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fcordero/llm-api-gateway/internal/capability"
+	"github.com/fcordero/llm-api-gateway/internal/metrics"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 	"github.com/fcordero/llm-api-gateway/internal/translate"
 )
@@ -55,6 +57,12 @@ func writeErrorWithDetails(w http.ResponseWriter, status int, errType, code, mes
 // rate limit stays a 429) instead of collapsing into a 502 that callers cannot
 // act on.
 func writeDispatchError(w http.ResponseWriter, err error) {
+	var ce *capability.MismatchError
+	if errors.As(err, &ce) {
+		for _, missing := range ce.Missing {
+			metrics.CapabilityMismatches.WithLabelValues(ce.Provider, missing, "request_rejected").Inc()
+		}
+	}
 	status, errType, code, message, param := mapDispatchError(err)
 	var pe *provider.ProviderError
 	if errors.As(err, &pe) {
@@ -66,6 +74,10 @@ func writeDispatchError(w http.ResponseWriter, err error) {
 func mapDispatchError(err error) (status int, errType, code, message, param string) {
 	if errors.Is(err, provider.ErrNoProvider) {
 		return http.StatusNotFound, "invalid_request_error", "model_not_found", err.Error(), ""
+	}
+	var ce *capability.MismatchError
+	if errors.As(err, &ce) {
+		return http.StatusBadRequest, "invalid_request_error", "model_capability_mismatch", sanitizeUpstreamMessage(ce.Error()), ce.Param()
 	}
 	if errors.Is(err, context.Canceled) {
 		return 499, "provider_error", "client_closed_request", "client closed the request", ""

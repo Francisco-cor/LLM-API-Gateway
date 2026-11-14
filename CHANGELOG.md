@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Capability registry and capability-aware fallback (R-15/R-16/R-17):**
+  `internal/capability` defines per-model `chat`, `stream`, `tools`,
+  `parallel_tools`, `vision`, `audio`, `json_object`, `json_schema` and
+  `embeddings`, with provider-kind defaults refined by
+  `providers.<name>.capabilities` (model name, glob or `default`).
+  `Registry.ResolveForChat` rejects an incompatible model with
+  `400 model_capability_mismatch` and an actionable `param` **before** any
+  provider call. Normal fallback, hedge and streaming fallback skip models that
+  would drop a required capability instead of degrading silently; skips are
+  logged and counted in `gateway_capability_mismatches_total`. Weighted routing
+  filters incompatible providers, and `GET /admin/providers` exposes the
+  effective set per model.
 - **OpenAPI contract gate in CI:** Redocly lints `api/openapi.yaml` with zero
   warnings allowed, and `oasdiff breaking --fail-on ERR` compares the spec with
   the PR base branch (or `HEAD^` on direct pushes). Breaking changes require the

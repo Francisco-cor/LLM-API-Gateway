@@ -15,6 +15,7 @@ import (
 
 	"github.com/fcordero/llm-api-gateway/internal/budget"
 	"github.com/fcordero/llm-api-gateway/internal/cache"
+	"github.com/fcordero/llm-api-gateway/internal/capability"
 	"github.com/fcordero/llm-api-gateway/internal/metrics"
 	"github.com/fcordero/llm-api-gateway/internal/pricing"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
@@ -313,6 +314,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Messages) == 0 {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", `"messages" must be a non-empty array`)
+		return
+	}
+
+	// Capability check runs before rate-limit/budget accounting and before any
+	// provider call. dispatch/openStream repeat it because weighted routing may
+	// resolve a different (still capable) provider; the early check exists so a
+	// client error never consumes token quota.
+	if _, err := h.registry.ResolveForChat(req.Model, capability.ChatRequirements(req)); err != nil {
+		writeDispatchError(w, err)
 		return
 	}
 
@@ -678,7 +688,7 @@ func writeBudgetError(w http.ResponseWriter, err error) {
 // fallback remapping). Billing must use that model, not the one the client
 // asked for.
 func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req provider.ChatRequest, requestID string, ctx context.Context) (started bool, usage provider.Usage, effectiveModel string) {
-	primary, err := h.registry.Resolve(req.Model)
+	primary, err := h.registry.ResolveForChat(req.Model, capability.ChatRequirements(req))
 	if err != nil {
 		writeDispatchError(w, err)
 		return false, usage, req.Model
@@ -907,6 +917,7 @@ func (h *Handler) openStream(ctx context.Context, req provider.ChatRequest, prim
 	}
 
 	var lastErr error
+	reqs := capability.ChatRequirements(req)
 	for i, p := range providers {
 		b := h.breakerFor(p.Name())
 		if !b.Allow() {
@@ -915,7 +926,20 @@ func (h *Handler) openStream(ctx context.Context, req provider.ChatRequest, prim
 		}
 		mapped := req
 		if i > 0 {
-			mapped = h.registry.RemapForFallback(req, p)
+			capable := false
+			mapped, capable = h.registry.RemapForFallbackWithCapabilities(req, p, reqs)
+			if !capable {
+				_, missing := h.registry.Supports(p.Name(), req.Model, reqs)
+				metrics.CapabilityMismatches.WithLabelValues(p.Name(), capabilityName(missing), "fallback_skipped").Inc()
+				h.log.Warn("stream fallback skipped: no model preserves the required capabilities",
+					"provider", p.Name(),
+					"model", req.Model,
+					"request_id", requestID,
+					"missing_capabilities", missing,
+				)
+				b.Release()
+				continue
+			}
 		}
 		streamCtx, cancel := context.WithCancel(ctx)
 		ch, errCh := p.SendStream(streamCtx, mapped)
@@ -995,7 +1019,8 @@ func firstStreamChunk(ctx context.Context, providerName string, ch <-chan provid
 // If primary returns retryable error, it tries each fallback in chain, remapping model via aliases.
 func (h *Handler) dispatch(ctx context.Context, req provider.ChatRequest, requestID string) (provider.ChatResponse, string, error) {
 	var lastErr error
-	primary, err := h.registry.Resolve(req.Model)
+	reqs := capability.ChatRequirements(req)
+	primary, err := h.registry.ResolveForChat(req.Model, reqs)
 	if err != nil {
 		return provider.ChatResponse{}, "", err
 	}
@@ -1028,7 +1053,7 @@ func (h *Handler) dispatch(ctx context.Context, req provider.ChatRequest, reques
 	hedgeCfg := h.getHedgeConfig()
 	fallbackChain := h.getFallbackChain()
 	if hedgeCfg.Enabled && len(fallbackChain) > 1 {
-		resp, name, hedgeAttempted, hedgeErr := h.dispatchHedge(ctx, req, requestID, primary.Name())
+		resp, name, hedgeAttempted, hedgeErr := h.dispatchHedge(ctx, req, requestID, primary.Name(), reqs)
 		for providerName := range hedgeAttempted {
 			attempted[providerName] = true
 		}
@@ -1058,7 +1083,18 @@ func (h *Handler) dispatch(ctx context.Context, req provider.ChatRequest, reques
 			h.log.Warn("circuit open, skipping fallback", "provider", fallback.Name(), "request_id", requestID, "state", b.StateReadOnly().String())
 			continue
 		}
-		mappedReq := h.registry.RemapForFallback(req, fallback)
+		mappedReq, capable := h.registry.RemapForFallbackWithCapabilities(req, fallback, reqs)
+		if !capable {
+			_, missing := h.registry.Supports(fallback.Name(), req.Model, reqs)
+			metrics.CapabilityMismatches.WithLabelValues(fallback.Name(), capabilityName(missing), "fallback_skipped").Inc()
+			h.log.Warn("fallback skipped: no model preserves the required capabilities",
+				"provider", fallback.Name(),
+				"model", req.Model,
+				"request_id", requestID,
+				"missing_capabilities", missing,
+			)
+			continue
+		}
 		resp, err := h.sendWithRetry(ctx, fallback, mappedReq)
 		if err == nil {
 			h.breakerFor(fallback.Name()).RecordSuccess()
@@ -1086,6 +1122,15 @@ func (h *Handler) dispatch(ctx context.Context, req provider.ChatRequest, reques
 		return provider.ChatResponse{}, "", lastErr
 	}
 	return provider.ChatResponse{}, "", fmt.Errorf("all providers failed for model %q", req.Model)
+}
+
+// capabilityName picks the first missing capability for a bounded metric
+// label. The full list is logged, not used as a label (cardinality).
+func capabilityName(missing []string) string {
+	if len(missing) == 0 {
+		return "unknown"
+	}
+	return missing[0]
 }
 
 // settleBreakerFailure settles a breaker permission using provider-health semantics.
@@ -1132,7 +1177,7 @@ func (h *Handler) sendWithRetry(ctx context.Context, p provider.Provider, req pr
 // open. Candidates are selected by a read-only state check; Allow() is only
 // called by the branch that actually runs, so mere participation in the
 // selection cannot consume half-open probe permissions.
-func (h *Handler) dispatchHedge(ctx context.Context, req provider.ChatRequest, requestID, primaryName string) (provider.ChatResponse, string, map[string]bool, error) {
+func (h *Handler) dispatchHedge(ctx context.Context, req provider.ChatRequest, requestID, primaryName string, reqs capability.Requirements) (provider.ChatResponse, string, map[string]bool, error) {
 	fallbackChain := h.getFallbackChain()
 	hedgeCfg := h.getHedgeConfig()
 	retryCfg := h.getRetryConfig()
@@ -1142,9 +1187,13 @@ func (h *Handler) dispatchHedge(ctx context.Context, req provider.ChatRequest, r
 			continue
 		}
 		if p, ok := h.registry.Get(name); ok {
-			if h.breakerFor(p.Name()).StateReadOnly() != resilience.StateOpen {
-				candidates = append(candidates, p)
+			if h.breakerFor(p.Name()).StateReadOnly() == resilience.StateOpen {
+				continue
 			}
+			if _, capable := h.registry.RemapForFallbackWithCapabilities(req, p, reqs); !capable {
+				continue
+			}
+			candidates = append(candidates, p)
 		}
 		if len(candidates) == 2 {
 			break
@@ -1181,7 +1230,11 @@ func (h *Handler) dispatchHedge(ctx context.Context, req provider.ChatRequest, r
 				Retryable:    true,
 			}
 		}
-		mapped := h.registry.RemapForFallback(req, candidate)
+		mapped, capable := h.registry.RemapForFallbackWithCapabilities(req, candidate, reqs)
+		if !capable {
+			breaker.Release()
+			return nil, errHedgeUnavailable
+		}
 		resp, err := h.sendWithRetry(branchCtx, candidate, mapped)
 		if err == nil {
 			breaker.RecordSuccess()

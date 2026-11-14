@@ -398,6 +398,7 @@ Métricas reales (`internal/metrics/metrics.go`):
 | `gateway_circuit_state` | gauge | `provider` (0/1/2) | breaker |
 | `gateway_cache_hits_total` | counter | `result` (`hit\|miss`) | efectividad |
 | `gateway_cache_size` | gauge | — | entradas (memoria; Redis cuenta claves con SCAN cacheado 30 s) |
+| `gateway_capability_mismatches_total` | counter | `provider,capability,action` (`request_rejected\|fallback_skipped`) | 400 por capacidad o fallback descartado |
 | `gateway_stream_ttft_seconds` | histogram | `provider` | time to first token SSE |
 | `gateway_stream_duration_seconds` | histogram | `provider` | duración del stream, incluidos los cortados |
 
@@ -427,7 +428,18 @@ sum(rate(gateway_cache_hits_total{result="hit"}[15m]))
 
 # streams truncados por proveedor
 sum by (provider) (rate(gateway_provider_errors_total{code="stream_truncated"}[10m]))
+
+# fallbacks descartados por capacidad (chain sin modelo compatible)
+sum by (provider, capability) (
+  increase(gateway_capability_mismatches_total{action="fallback_skipped"}[15m])
+)
 ```
+
+Un valor distinto de cero en `fallback_skipped` significa que el `fallback_chain` no tiene
+ningún modelo con la capacidad requerida (tools, visión, audio, `json_schema` o
+`json_object`): revisa `providers.<name>.capabilities` y `model_aliases`.
+`action="request_rejected"` es un 400 `model_capability_mismatch`; si el modelo sí soporta
+la capacidad, corrige el override.
 
 **No existe** hoy una métrica de budget restante, de tamaño de cola, de Redis up/down ni de latencia separada del upstream. No inventes paneles con esos nombres; están en el backlog (R-14, R-27, R-28).
 

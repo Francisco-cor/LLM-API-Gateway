@@ -73,6 +73,52 @@ logging:
 ` + extra
 }
 
+func TestConfig_ProviderCapabilities(t *testing.T) {
+	content := strings.Replace(baseConfigYAML(""), "    models: [gpt-4o]", `    models: [gpt-4o, text-embedding-3-small]
+    capabilities:
+      default:
+        vision: false
+      "gpt-4o":
+        tools: true
+      "text-embedding-*":
+        chat: false
+        embeddings: true
+      "gpt-4o-mini":
+        context_window: 128000`, 1)
+	cfg, err := loadConfig(t, content)
+	if err != nil {
+		t.Fatalf("load config with capabilities: %v", err)
+	}
+	caps := cfg.Providers["openai"].Capabilities
+	if len(caps) != 4 {
+		t.Fatalf("capabilities keys = %d, want 4", len(caps))
+	}
+	if caps["gpt-4o"].Tools == nil || !*caps["gpt-4o"].Tools {
+		t.Error("gpt-4o tools override not parsed")
+	}
+	if caps["default"].Vision == nil || *caps["default"].Vision {
+		t.Error("default vision override not parsed")
+	}
+	if caps["gpt-4o-mini"].ContextWindow == nil || *caps["gpt-4o-mini"].ContextWindow != 128000 {
+		t.Error("context_window not parsed")
+	}
+}
+
+func TestConfig_ProviderCapabilitiesRejectInvalidValues(t *testing.T) {
+	for name, block := range map[string]string{
+		"empty key":       "\"\": {chat: true}",
+		"negative window": "\"gpt-4o\": {context_window: -1}",
+		"negative output": "\"gpt-4o\": {max_output: -5}",
+	} {
+		t.Run(name, func(t *testing.T) {
+			content := strings.Replace(baseConfigYAML(""), "    models: [gpt-4o]", "    models: [gpt-4o]\n    capabilities:\n      "+block, 1)
+			if _, err := loadConfig(t, content); err == nil {
+				t.Fatalf("invalid capabilities accepted: %s", block)
+			}
+		})
+	}
+}
+
 func TestConfig_AdminKeyRequiredUnlessInsecure(t *testing.T) {
 	t.Setenv("ADMIN_API_KEY", "")
 	content := strings.Replace(baseConfigYAML(""), "  api_key: admin-test-key\n", "", 1)

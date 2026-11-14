@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fcordero/llm-api-gateway/internal/capability"
 	"github.com/fcordero/llm-api-gateway/internal/config"
 	"github.com/fcordero/llm-api-gateway/internal/proxy"
 	"gopkg.in/yaml.v3"
@@ -61,6 +62,9 @@ type ProviderInfo struct {
 	Name    string   `json:"name"`
 	BaseURL string   `json:"base_url"`
 	Models  []string `json:"models"`
+	// Capabilities is keyed by concrete model. Omitted when the registry has
+	// no capability metadata (for example in lightweight unit tests).
+	Capabilities map[string]capability.Set `json:"capabilities,omitempty"`
 }
 
 // New creates an admin Server.
@@ -266,7 +270,16 @@ func (s *Server) handleGetProviders(w http.ResponseWriter, _ *http.Request) {
 		all := s.registry.All()
 		var out []ProviderInfo
 		for _, p := range all {
-			out = append(out, ProviderInfo{Name: p.Name(), Models: p.Models()})
+			info := ProviderInfo{Name: p.Name(), Models: p.Models()}
+			for _, model := range p.Models() {
+				if caps, ok := s.registry.Capabilities(p.Name(), model); ok {
+					if info.Capabilities == nil {
+						info.Capabilities = make(map[string]capability.Set)
+					}
+					info.Capabilities[model] = caps
+				}
+			}
+			out = append(out, info)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"providers": out})

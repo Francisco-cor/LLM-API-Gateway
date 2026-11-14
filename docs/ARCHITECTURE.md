@@ -201,7 +201,9 @@ type Embedder interface {
 4. provider pattern (`glob` → regex, `path.Match` fallback), random among multiple candidates;
 5. `ErrNoProvider` → HTTP `404 model_not_found`.
 
-`Reload(providers, aliases, weighted)` swaps state under an `RWMutex`; handlers keep their pointers. `RemapForFallback` uses `model_aliases`, then the fallback provider's first model.
+`ResolveForChat(model, requirements)` applies the same order but filters weighted/pattern candidates by the capability table in `internal/capability`; when candidates exist but none can serve the request it returns `400 model_capability_mismatch` before any provider call. Capabilities come from provider-kind defaults plus `providers.<name>.capabilities` overrides (model names, globs, `default`).
+
+`ReloadWithCapabilities(providers, aliases, weighted, tables)` swaps state under an `RWMutex`; handlers keep their pointers. `RemapForFallbackWithCapabilities` walks `model_aliases`, then the fallback provider's concrete models, and picks the first one that still satisfies the request; fallback, hedge and streaming all use it, so a tools/vision/JSON request is never silently degraded.
 
 **Translate** (`internal/translate/`):
 
@@ -281,11 +283,11 @@ Streams have no retry, no hedge, no cache and no resume. A mid-stream cut cannot
 ## 6. Operational concerns
 
 - **Hot reload:** `config.Watch(ctx, path, 1s, onChange)` polls mtime with a 100 ms debounce and retries a failed load/apply with exponential backoff up to 10 s; it does not advance the last-seen mtime until the apply succeeds. `SIGHUP`, the watcher and `POST /admin/reload` share `applyConfig`. Order: `Validate` (+ `ValidateStrict` in strict mode) → `ValidateReload` → build providers → auto-discover → weighted → pricing → `redisStore.ReplaceURL` only if the URL changed (a failure logs and keeps the previous backend; it no longer aborts the reload) → `registry.Reload` → limiter/overrides → budget → auth (keys + pepper) → CORS → `logging.level` → health → cache → resilience → fallback chains → admin snapshot and key. A failed reload keeps the previous state.
-- **Hot-reloadable:** providers, fallback, aliases, weights, rate limits (including token limits and overrides), budget, pricing, cache, auth (`enabled`, keys, pepper), CORS, `logging.level`, the **admin API key** and resilience.
+- **Hot-reloadable:** providers, fallback, aliases, weights, capability overrides, rate limits (including token limits and overrides), budget, pricing, cache, auth (`enabled`, keys, pepper), CORS, `logging.level`, the **admin API key** and resilience.
 - **Restart-only:** `server.port`, `server.read_timeout`/`write_timeout`, `admin.port`, `admin.bind_address`, `admin.pprof_enabled`, `logging.format`. `ValidateReload` returns a clear error; a format change is logged and ignored rather than failing the whole reload.
 - **Admin config JSON:** config structs have YAML tags only, so `GET /admin/config` uses Go field names (`Admin.APIKey`) and `time.Duration` values as integer nanoseconds. `PATCH /admin/config` accepts duration strings and an `If-Match` ETag (409 on mismatch), and both GET and PATCH emit audit records. Secrets are redacted to `***`; `base_url` userinfo and query strings are stripped.
 - **Graceful drain:** `SIGTERM`/`SIGINT` → `health.SetReady(false)` → `/readyz` 503 → 5 s wait for endpoint removal → admin shutdown (5 s) → gateway `Shutdown` (30 s). The K8s grace period is 45 s; long streams may be cut after 30 s.
-- **Observability:** metrics are `gateway_requests_total`, `gateway_request_duration_seconds`, `gateway_tokens_total`, `gateway_cost_usd_total`, `gateway_provider_errors_total`, `gateway_circuit_state`, `gateway_cache_hits_total`, `gateway_cache_size`, `gateway_stream_ttft_seconds`, `gateway_stream_duration_seconds`. Path labels are bounded to known routes. `/metrics` is not authenticated. There is no queue depth, Redis health, budget remaining or gateway-overhead metric yet.
+- **Observability:** metrics are `gateway_requests_total`, `gateway_request_duration_seconds`, `gateway_tokens_total`, `gateway_cost_usd_total`, `gateway_provider_errors_total`, `gateway_circuit_state`, `gateway_cache_hits_total`, `gateway_cache_size`, `gateway_capability_mismatches_total`, `gateway_stream_ttft_seconds`, `gateway_stream_duration_seconds`. Path labels are bounded to known routes. `/metrics` is not authenticated. There is no queue depth, Redis health, budget remaining or gateway-overhead metric yet.
 - **Security:** tenant auth is a static key store with SHA-256 or HMAC-SHA256(pepper) digests (constant-time compare), mandatory scopes, an allowlist of scopes and a fail-closed route→scope map, expiry, and a per-IP 401 throttle (20/min → 429). The admin uses a separate key with constant-time compare, fails closed unless `allow_insecure` is explicitly set, rotates its key on reload, and supports ETag/If-Match plus an audit trail. pprof is opt-in and contains secrets. Strict mode validates `base_url` (https, no private/loopback/link-local/metadata hosts) but does not pin DNS or restrict redirects. See `SECURITY.md` and ADR-005.
 
 ---
@@ -315,6 +317,6 @@ No Helm, no Terraform, no migration job. The Dockerfile exposes only 8080/8081.
 - **`ServeMux` instead of a framework:** Go 1.22 patterns are enough; no Gin/Echo dependency.
 - **In-process state + Redis:** simple and fast, but per-replica semantics for local fallbacks, semantic cache and budget without Redis.
 - **YAML control plane:** excellent for a demo and single-node ops; insufficient for tenant CRUD, audit, multi-replica consistency and billing.
-- **Known gaps:** Postgres/migrations, tenant/key CRUD, usage ledger, quotas per tenant, capability registry, generic OpenAI-compatible provider, Azure/Bedrock/Vertex, idempotency, DNS-rebinding/redirect-safe SSRF guard, secret manager, PII, SLOs/backpressure, Helm/Terraform, UI. Full plan and acceptance criteria: `docs/ROADMAP.md`.
+- **Known gaps:** Postgres/migrations, tenant/key CRUD, usage ledger, quotas per tenant, cost/latency/tenant routing, generic OpenAI-compatible provider, Azure/Bedrock/Vertex, idempotency, DNS-rebinding/redirect-safe SSRF guard, secret manager, PII, SLOs/backpressure, Helm/Terraform, UI. Full plan and acceptance criteria: `docs/ROADMAP.md`.
 
 Refs: `BENCH.md`, `config.yaml`, `config.dev.yaml`, `config.prod.yaml`, `deploy/`, `examples/`, `docs/adr/`, `docs/adr/ADR-005-fail-closed-auth-and-strict-mode.md`.

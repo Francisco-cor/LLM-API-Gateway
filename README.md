@@ -148,8 +148,8 @@ More runnable clients: [`examples/curl`](examples/curl), [`examples/openai-pytho
 | Embeddings | Yes (OpenAI, Gemini) | Anthropic has no embeddings API; embeddings have their own budget/retry/cache path |
 | Models endpoint | Yes | Configured registry, wildcard/regex matching, optional auto-discovery via upstream `/models` |
 | Providers | 3 | `openai`, `anthropic`, `gemini`; adapters implement `Provider` (+ `Embedder`) |
-| Routing | Yes | Exact, glob, regex, weighted canary, `model_aliases` on fallback |
-| Resilience | Yes | Retry 3× with jitter, circuit breaker 5 failures → 30 s open → 1 half-open probe, hedge 300 ms for **non-streaming**, fallback before first SSE chunk |
+| Routing | Yes | Exact, glob, regex, weighted canary, `model_aliases` on fallback, capability-aware selection |
+| Resilience | Yes | Retry 3× with jitter, circuit breaker 5 failures → 30 s open → 1 half-open probe, hedge 300 ms for **non-streaming**, fallback before first SSE chunk; fallback never drops a required capability |
 | Rate limiting | Yes | 16-shard token bucket, TTL cleanup; **separate token bucket measured in tokens** (`tokens_per_minute`/`token_burst`), per-tenant/model overrides with isolated buckets, Redis Lua, local fallback on Redis failure |
 | Budget | Yes | Atomic monthly token/USD reservation with **leases** (TTL + reconciliation), UTC months, versioned per-million pricing catalog, cached-token rates, `require_shared_store` fail-closed mode, `insufficient_quota` / `budget_unavailable` |
 | Cache | Yes | Exact LRU or Redis, byte budget (`max_bytes`), TTL cap (`max_ttl`), `X-Cache-Skip` / `X-Cache-TTL`, **single-flight** for concurrent chat misses, semantic cache with one embedding per request, real Redis stats. Streams are never cached and there is no runtime memory fallback if Redis dies |
@@ -161,7 +161,7 @@ More runnable clients: [`examples/curl`](examples/curl), [`examples/openai-pytho
 | Deployment | Manifests | Dockerfile (non-root, read-only root FS in K8s), Deployment/HPA/PDB/ServiceMonitor/NetworkPolicy/ServiceAccount/topology spread; multi-arch image, SBOM and cosign signing on tag. **No Helm/Terraform** |
 | Persistence / tenancy / billing | **No** | Static YAML, no CRUD, no usage ledger, no reconciliation. See roadmap |
 
-Not implemented: `/v1/responses`, audio transcription, files/batches, Realtime, fine-tuning, prompt guardrails, PII redaction, idempotency keys, capability-aware routing, generic OpenAI-compatible provider, Azure/Bedrock/Vertex, UI, usage ledger, Postgres control plane.
+Not implemented: `/v1/responses`, audio transcription, files/batches, Realtime, fine-tuning, prompt guardrails, PII redaction, idempotency keys, generic OpenAI-compatible provider, Azure/Bedrock/Vertex, UI, usage ledger, Postgres control plane.
 
 ---
 
@@ -207,6 +207,7 @@ Config is YAML with `${ENV}` expansion and strict unknown-field rejection at the
 | `providers.<name>.allow_private` | Opt-in for `http` and private addresses in strict mode. Metadata endpoints remain blocked. |
 | `providers.<name>.timeout` | Per-provider HTTP client timeout. |
 | `providers.<name>.models` | Exact names, globs (`gpt-4*`), regex, or `[]` for auto-discovery. |
+| `providers.<name>.capabilities` | Per-model capability overrides keyed by model name, glob, or `default`. Fields: `chat`, `stream`, `tools`, `parallel_tools`, `vision`, `audio`, `json_object`, `json_schema`, `embeddings`, `context_window`, `max_output`. Missing fields inherit provider-kind defaults. |
 | `fallback_chain` | Ordered providers to try on retryable 429/5xx. |
 | `model_aliases` | Model remap when falling back, e.g. `gpt-4o: [claude-sonnet-4-6]`. |
 | `routing.weighted` | Canary/blue-green weights per model. |
@@ -242,6 +243,26 @@ Environment variables:
 
 Two profiles ship in the repo: `config.dev.yaml` (no auth, debug logs, loopback admin) and `config.prod.yaml` (auth, budget, `0.0.0.0` admin bind, pprof off). Kubernetes uses `deploy/k8s/configmap.yaml`.
 
+Capability metadata is optional but recommended when you rely on fallback:
+
+```yaml
+providers:
+  openai:
+    capabilities:
+      default: {vision: true, tools: true, json_schema: true}
+      "gpt-4o-mini": {vision: false}
+      "o1-*": {tools: false, json_schema: false}
+      "text-embedding-*": {chat: false, embeddings: true}
+  anthropic:
+    capabilities:
+      default: {json_schema: false, json_object: false}
+  gemini:
+    capabilities:
+      "gemini-2.5-flash": {json_schema: false}
+```
+
+Built-in defaults already mark embedding and audio-only models as non-chat and reflect adapter behaviour (Anthropic has no JSON mode, Gemini supports `json_object` but not arbitrary JSON Schema). Overrides win; exact keys and longer globs are applied after broader ones. `GET /admin/providers` returns the effective set per model.
+
 ### Strict mode
 
 `--strict` or `GATEWAY_ENV=prod` adds a second validation pass at startup **and on every hot reload**:
@@ -266,10 +287,10 @@ Two profiles ship in the repo: `config.dev.yaml` (no auth, debug logs, loopback 
 | `GET /admin/config` | Redacted config + `ETag` |
 | `POST /admin/reload` | Re-read the config file; validation failure → 400 with old config active |
 | `PATCH /admin/config` | Hot knobs exposed by the admin API (rate limit, cache, health, resilience, routing, logging); send `If-Match` to get 409 instead of overwriting a concurrent change. auth/CORS/providers are changed by editing the file and reloading. |
-| `GET /admin/providers` | Provider list |
+| `GET /admin/providers` | Provider list with effective per-model capabilities |
 | `GET /debug/pprof/*` | Only when `admin.pprof_enabled: true`, under the admin mux and admin auth |
 
-Hot reload covers providers, fallback, aliases, weights, limits, token limits, overrides, budget, pricing, cache, auth (including `auth.enabled` and the pepper), CORS, `logging.level`, the admin API key, health options and resilience. `PATCH /admin/config` exposes the subset listed above; auth, CORS and providers require a file reload (`SIGHUP`/`POST /admin/reload`). It does **not** cover `server.*`, `admin.port`, `admin.bind_address`, `admin.pprof_enabled` or `logging.format`; those require a restart and a reload that tries to change them is rejected (format only logs a warning and keeps the current handler). The file watcher retries a failed apply with backoff; a Redis outage does not block the rest of the reload.
+Hot reload covers providers, fallback, aliases, weights, capability overrides, limits, token limits, overrides, budget, pricing, cache, auth (including `auth.enabled` and the pepper), CORS, `logging.level`, the admin API key, health options and resilience. `PATCH /admin/config` exposes the subset listed above; auth, CORS and providers require a file reload (`SIGHUP`/`POST /admin/reload`). It does **not** cover `server.*`, `admin.port`, `admin.bind_address`, `admin.pprof_enabled` or `logging.format`; those require a restart and a reload that tries to change them is rejected (format only logs a warning and keeps the current handler). The file watcher retries a failed apply with backoff; a Redis outage does not block the rest of the reload.
 
 Runbooks for Redis outage, provider 429/5xx, open circuits, exhausted budget, truncated streams, strict mode, admin key rotation, ETag conflicts, scopes and profiling: [`docs/RUNBOOK.md`](docs/RUNBOOK.md). Proposed SLOs and alert thresholds are there too; they are not measured yet.
 

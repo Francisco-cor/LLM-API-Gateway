@@ -7,7 +7,8 @@
 # Negative values are rejected at load time.
 #
 # Hot reload (SIGHUP, admin PATCH, file watcher) applies auth, CORS, logging
-# level, provider keys, rate limits, cache, resilience and the admin API key.
+# level, provider keys, capability overrides, rate limits, cache, resilience and
+# the admin API key.
 # The HTTP bind address/port, admin bind/port, admin.pprof_enabled and
 # logging.format require a restart and are rejected with a clear error.
 server:
@@ -28,6 +29,21 @@ providers:
       # Wildcard example: uncomment to use pattern matching
       # - "gpt-4*"
     # models: []  # leave empty to enable auto-discovery via GET /v1/models (Fase 8)
+    # Optional capability overrides (model name, glob, or "default"). Missing
+    # fields inherit provider-kind defaults; requests needing tools/vision/
+    # json_schema are rejected before dispatch when the model lacks them.
+    # capabilities:
+    #   default:
+    #     vision: true
+    #     tools: true
+    #   "gpt-4o-mini":
+    #     vision: false
+    #   "o1-*":
+    #     tools: false
+    #     json_schema: false
+    #   "text-embedding-*":
+    #     chat: false
+    #     embeddings: true
   anthropic:
     api_key: ${ANTHROPIC_API_KEY}
     base_url: https://api.anthropic.com

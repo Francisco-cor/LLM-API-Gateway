@@ -30,10 +30,19 @@ info:
     responses are capped at 8 MiB.
 
     **Validation scope.** The gateway itself validates the JSON shape, required
-    `model`/`messages`, non-empty embedding `input`, and body size. Numeric
-    ranges, enums and provider-specific combinations in this schema describe
-    the expected OpenAI shape; they are forwarded to the provider and may be
-    rejected upstream with `400`/`502` rather than by the gateway.
+    `model`/`messages`, non-empty embedding `input`, body size, and the
+    capabilities of the resolved model. Numeric ranges, enums and
+    provider-specific combinations in this schema describe the expected OpenAI
+    shape; they are forwarded to the provider and may be rejected upstream
+    with `400`/`502` rather than by the gateway.
+
+    **Capabilities.** Models expose `chat`, `stream`, `tools`,
+    `parallel_tools`, `vision`, `audio`, `json_object`, `json_schema` and
+    `embeddings`. A request that needs tools, vision, audio or structured
+    output is rejected with `400 model_capability_mismatch` before any provider
+    call when the resolved model cannot serve it. Fallback skips models that
+    would lose a required capability instead of silently degrading the
+    response.
 
     **Error mapping.** Upstream 400/422 → `400`; 404 → `404`; 413 → `413`;
     429 → `429`; 401/403 → `502`; 503/504 → `503`; other 5xx/network → `502`.
@@ -292,7 +301,8 @@ paths:
         `gateway_requests_total`, `gateway_request_duration_seconds`,
         `gateway_tokens_total`, `gateway_cost_usd_total`,
         `gateway_provider_errors_total`, `gateway_circuit_state`,
-        `gateway_cache_hits_total` and `gateway_cache_size`.
+        `gateway_cache_hits_total`, `gateway_cache_size` and
+        `gateway_capability_mismatches_total`.
       security: []
       responses:
         '200':
@@ -469,6 +479,10 @@ components:
         or a request the provider could not represent (for example an
         `unsupported_parameter` with `param`). Unknown fields are tolerated by
         the data plane and do not produce this error.
+
+        Also returned as `code: model_capability_mismatch` when the resolved
+        model lacks a capability the request needs (tools, vision, audio,
+        `json_schema`/`json_object`); this happens before any provider call.
       content:
         application/json:
           schema:
@@ -489,6 +503,14 @@ components:
                   type: invalid_request_error
                   code: unsupported_parameter
                   param: response_format.type
+            modelCapabilityMismatch:
+              summary: The resolved model cannot serve tools/vision/structured output
+              value:
+                error:
+                  message: 'model "claude-sonnet-4-6" on provider "anthropic" lacks required capabilities: tools'
+                  type: invalid_request_error
+                  code: model_capability_mismatch
+                  param: tools
     Unauthorized:
       description: Missing/invalid/expired API key.
       content:
@@ -1372,8 +1394,44 @@ components:
                 type: string
               base_url:
                 type: string
-                description: Present but empty in this version; the code populates only name and models.
+                description: Present but empty in this version; the code populates only name, models and capabilities.
               models:
                 type: array
                 items:
                   type: string
+              capabilities:
+                type: object
+                description: Effective capability set per concrete model. Omitted when the registry has no capability metadata.
+                additionalProperties:
+                  $ref: '#/components/schemas/ModelCapabilities'
+    ModelCapabilities:
+      type: object
+      description: |
+        Capabilities enforced before dispatch and during fallback. Provider-kind
+        defaults are refined by `providers.<name>.capabilities` overrides.
+      required: [chat, stream, tools, parallel_tools, vision, audio, json_object, json_schema, embeddings]
+      properties:
+        chat:
+          type: boolean
+        stream:
+          type: boolean
+        tools:
+          type: boolean
+        parallel_tools:
+          type: boolean
+        vision:
+          type: boolean
+        audio:
+          type: boolean
+        json_object:
+          type: boolean
+        json_schema:
+          type: boolean
+        embeddings:
+          type: boolean
+        context_window:
+          type: integer
+          description: Advisory context window in tokens (0/omitted means unknown).
+        max_output:
+          type: integer
+          description: Advisory maximum output tokens (0/omitted means unknown).

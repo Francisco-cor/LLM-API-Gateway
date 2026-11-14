@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fcordero/llm-api-gateway/internal/capability"
+
 	"gopkg.in/yaml.v3"
 )
 
@@ -78,6 +80,10 @@ type ProviderConfig struct {
 	// local gateways (Ollama, vLLM) remain usable while strict production
 	// validation rejects SSRF-shaped provider endpoints by default.
 	AllowPrivate bool `yaml:"allow_private"`
+	// Capabilities maps a model name, a glob, or "default" to the capabilities
+	// that model supports. Partial overrides are merged over provider-kind
+	// defaults; see internal/capability.
+	Capabilities map[string]capability.Overrides `yaml:"capabilities"`
 }
 
 type RateLimitConfig struct {
@@ -373,6 +379,17 @@ func (c *Config) Validate() error {
 		// models may be empty -> auto-discovery (Fase 8) will fetch upstream
 		if len(p.Models) == 0 && !isDisabled {
 			// allow empty for auto-discovery; no error
+		}
+		for key, caps := range p.Capabilities {
+			if strings.TrimSpace(key) == "" {
+				return fmt.Errorf("providers.%s.capabilities has an empty model key", name)
+			}
+			if caps.ContextWindow != nil && *caps.ContextWindow < 0 {
+				return fmt.Errorf("providers.%s.capabilities[%q].context_window must be >= 0", name, key)
+			}
+			if caps.MaxOutput != nil && *caps.MaxOutput < 0 {
+				return fmt.Errorf("providers.%s.capabilities[%q].max_output must be >= 0", name, key)
+			}
 		}
 	}
 	// fallback_chain must reference known providers

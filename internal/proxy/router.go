@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/fcordero/llm-api-gateway/internal/capability"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
 )
 
@@ -29,8 +30,11 @@ type Registry struct {
 	weighted        map[string][]weightedEntry
 	weightedPattern []weightedPatternEntry
 	patterns        []patternEntry
-	randMu          sync.Mutex
-	rnd             *rand.Rand
+	// capabilities is keyed by provider name. A missing table means the
+	// provider has no capability metadata and requests are not gated.
+	capabilities map[string]capability.Table
+	randMu       sync.Mutex
+	rnd          *rand.Rand
 }
 
 type weightedEntry struct {
@@ -70,12 +74,19 @@ func NewRegistryWithAliases(providers []provider.Provider, aliases map[string][]
 // weighted is map model -> []{provider name, weight}. Provider names are resolved
 // against the passed providers list.
 func NewRegistryWithWeighted(providers []provider.Provider, aliases map[string][]string, weighted map[string][]WeightedConfig) *Registry {
+	return NewRegistryWithCapabilities(providers, aliases, weighted, nil)
+}
+
+// NewRegistryWithCapabilities builds a Registry with capability metadata.
+// Tables are keyed by provider name; nil disables capability enforcement.
+func NewRegistryWithCapabilities(providers []provider.Provider, aliases map[string][]string, weighted map[string][]WeightedConfig, tables map[string]capability.Table) *Registry {
 	r := &Registry{
-		byName:   make(map[string]provider.Provider),
-		byModel:  make(map[string]provider.Provider),
-		aliases:  cloneAliases(aliases),
-		weighted: make(map[string][]weightedEntry),
-		rnd:      rand.New(rand.NewSource(42)), // deterministic seed for tests; overwritten with time-based in production via SetRandSeed
+		byName:       make(map[string]provider.Provider),
+		byModel:      make(map[string]provider.Provider),
+		aliases:      cloneAliases(aliases),
+		weighted:     make(map[string][]weightedEntry),
+		capabilities: tables,
+		rnd:          rand.New(rand.NewSource(42)), // deterministic seed for tests; overwritten with time-based in production via SetRandSeed
 	}
 	for _, p := range providers {
 		r.byName[p.Name()] = p
@@ -243,6 +254,122 @@ func (r *Registry) Resolve(model string) (provider.Provider, error) {
 	return nil, fmt.Errorf("%w: model %q", provider.ErrNoProvider, model)
 }
 
+// ResolveForChat resolves model and enforces capability requirements before
+// any provider call. Unlike Resolve, it filters weighted and pattern candidates
+// instead of picking an incompatible provider at random, and returns a
+// *capability.MismatchError when candidates exist but none can serve reqs.
+func (r *Registry) ResolveForChat(model string, reqs capability.Requirements) (provider.Provider, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var lastMismatch *capability.MismatchError
+	if we, ok := r.weighted[model]; ok && len(we) > 0 {
+		if p, mismatch := r.pickWeightedCompatible(we, model, reqs); p != nil {
+			return p, nil
+		} else if mismatch != nil {
+			lastMismatch = mismatch
+		}
+	}
+	if p, ok := r.byModel[model]; ok {
+		if ok, missing := r.supportsLocked(p.Name(), model, reqs); ok {
+			return p, nil
+		} else {
+			// The exact owner cannot serve the request; a pattern provider may
+			// still be able to, so keep looking instead of failing immediately.
+			lastMismatch = &capability.MismatchError{Provider: p.Name(), Model: model, Missing: missing}
+		}
+	}
+	for _, wp := range r.weightedPattern {
+		if !r.weightedPatternMatches(wp, model) {
+			continue
+		}
+		if p, mismatch := r.pickWeightedCompatible(wp.entries, model, reqs); p != nil {
+			return p, nil
+		} else if mismatch != nil {
+			lastMismatch = mismatch
+		}
+	}
+	var compatible []provider.Provider
+	for _, pe := range r.patterns {
+		if !r.matchesPattern(pe, model) {
+			continue
+		}
+		if ok, missing := r.supportsLocked(pe.provider.Name(), model, reqs); ok {
+			compatible = append(compatible, pe.provider)
+		} else if lastMismatch == nil {
+			lastMismatch = &capability.MismatchError{Provider: pe.provider.Name(), Model: model, Missing: missing}
+		}
+	}
+	if len(compatible) == 1 {
+		return compatible[0], nil
+	}
+	if len(compatible) > 1 {
+		r.randMu.Lock()
+		idx := r.rnd.Intn(len(compatible))
+		r.randMu.Unlock()
+		return compatible[idx], nil
+	}
+	if lastMismatch != nil {
+		return nil, lastMismatch
+	}
+	return nil, fmt.Errorf("%w: model %q", provider.ErrNoProvider, model)
+}
+
+func (r *Registry) weightedPatternMatches(wp weightedPatternEntry, model string) bool {
+	if wp.regex != nil {
+		return wp.regex.MatchString(model)
+	}
+	matched, _ := path.Match(wp.key, model)
+	return matched
+}
+
+func (r *Registry) pickWeightedCompatible(entries []weightedEntry, model string, reqs capability.Requirements) (provider.Provider, *capability.MismatchError) {
+	var compatible []weightedEntry
+	var mismatch *capability.MismatchError
+	for _, e := range entries {
+		if ok, missing := r.supportsLocked(e.provider.Name(), model, reqs); ok {
+			compatible = append(compatible, e)
+		} else if mismatch == nil {
+			mismatch = &capability.MismatchError{Provider: e.provider.Name(), Model: model, Missing: missing}
+		}
+	}
+	if len(compatible) > 0 {
+		return r.pickWeighted(compatible), nil
+	}
+	return nil, mismatch
+}
+
+// Capabilities returns the effective capability set for a provider model.
+// ok is false when the provider has no capability table.
+func (r *Registry) Capabilities(providerName, model string) (capability.Set, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	t, ok := r.capabilities[providerName]
+	if !ok || t.Empty() {
+		return capability.Set{}, false
+	}
+	return t.For(model), true
+}
+
+// Supports reports whether providerName/model covers reqs. Providers without a
+// capability table are treated as compatible (no enforcement).
+func (r *Registry) Supports(providerName, model string, reqs capability.Requirements) (bool, []string) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.supportsLocked(providerName, model, reqs)
+}
+
+func (r *Registry) supportsLocked(providerName, model string, reqs capability.Requirements) (bool, []string) {
+	if reqs.Empty() {
+		return true, nil
+	}
+	t, ok := r.capabilities[providerName]
+	if !ok || t.Empty() {
+		return true, nil
+	}
+	return t.For(model).Supports(reqs)
+}
+
 func (r *Registry) pickWeighted(entries []weightedEntry) provider.Provider {
 	total := 0
 	for _, e := range entries {
@@ -290,8 +417,18 @@ func (r *Registry) Aliases(model string) []string {
 
 // Reload atomically replaces registry contents with new providers/aliases/weighted.
 // Used for hot-reload without replacing the *Registry pointer (so all handlers see update).
+// Capability tables are preserved; use ReloadWithCapabilities to replace them too.
 func (r *Registry) Reload(providers []provider.Provider, aliases map[string][]string, weighted map[string][]WeightedConfig) {
-	newR := NewRegistryWithWeighted(providers, aliases, weighted)
+	r.mu.RLock()
+	tables := r.capabilities
+	r.mu.RUnlock()
+	r.ReloadWithCapabilities(providers, aliases, weighted, tables)
+}
+
+// ReloadWithCapabilities replaces providers, aliases, weighted routing and
+// capability metadata atomically.
+func (r *Registry) ReloadWithCapabilities(providers []provider.Provider, aliases map[string][]string, weighted map[string][]WeightedConfig, tables map[string]capability.Table) {
+	newR := NewRegistryWithCapabilities(providers, aliases, weighted, tables)
 	// preserve RNG seed
 	r.randMu.Lock()
 	newR.rnd = r.rnd
@@ -305,6 +442,7 @@ func (r *Registry) Reload(providers []provider.Provider, aliases map[string][]st
 	r.weighted = newR.weighted
 	r.weightedPattern = newR.weightedPattern
 	r.patterns = newR.patterns
+	r.capabilities = newR.capabilities
 }
 
 // UpdateAliases atomically updates aliases (for PATCH runtime).
@@ -318,8 +456,12 @@ func (r *Registry) UpdateAliases(aliases map[string][]string) {
 // if an alias exists. Otherwise returns req unchanged.
 func (r *Registry) RemapForFallback(req provider.ChatRequest, fallback provider.Provider) provider.ChatRequest {
 	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.remapForFallbackLocked(req, fallback)
+}
+
+func (r *Registry) remapForFallbackLocked(req provider.ChatRequest, fallback provider.Provider) provider.ChatRequest {
 	targets := append([]string(nil), r.aliases[req.Model]...)
-	r.mu.RUnlock()
 	if len(targets) == 0 {
 		return req
 	}
@@ -337,6 +479,57 @@ func (r *Registry) RemapForFallback(req provider.ChatRequest, fallback provider.
 		req.Model = fallback.Models()[0]
 	}
 	return req
+}
+
+// RemapForFallbackWithCapabilities picks a fallback model that still satisfies
+// reqs. It returns ok=false when the fallback cannot serve the request, so the
+// caller can skip it instead of silently degrading tools, vision or structured
+// output. Providers without capability metadata keep the historical remap.
+func (r *Registry) RemapForFallbackWithCapabilities(req provider.ChatRequest, fallback provider.Provider, reqs capability.Requirements) (provider.ChatRequest, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	if !r.hasCapabilityTableLocked(fallback.Name()) {
+		return r.remapForFallbackLocked(req, fallback), true
+	}
+	if modelOwnedBy(fallback, req.Model) {
+		if ok, _ := r.supportsLocked(fallback.Name(), req.Model, reqs); ok {
+			return req, true
+		}
+	}
+	for _, target := range r.aliases[req.Model] {
+		if !modelOwnedBy(fallback, target) {
+			continue
+		}
+		if ok, _ := r.supportsLocked(fallback.Name(), target, reqs); ok {
+			req.Model = target
+			return req, true
+		}
+	}
+	for _, model := range fallback.Models() {
+		if isPattern(model) {
+			continue
+		}
+		if ok, _ := r.supportsLocked(fallback.Name(), model, reqs); ok {
+			req.Model = model
+			return req, true
+		}
+	}
+	return req, false
+}
+
+func (r *Registry) hasCapabilityTableLocked(providerName string) bool {
+	t, ok := r.capabilities[providerName]
+	return ok && !t.Empty()
+}
+
+func modelOwnedBy(p provider.Provider, model string) bool {
+	for _, m := range p.Models() {
+		if m == model || matchesModelPattern(m, model) || matchesModelPattern(model, m) {
+			return true
+		}
+	}
+	return false
 }
 
 func cloneAliases(aliases map[string][]string) map[string][]string {
