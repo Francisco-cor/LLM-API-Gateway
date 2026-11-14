@@ -29,9 +29,10 @@ Useful commands:
 make build        # go build -o bin/gateway ./cmd/gateway
 make run          # build + run with config.yaml
 make dev          # air if installed, else go run (config.yaml)
-make test         # go test ./... -v -cover
-make test-race    # go test ./... -race -coverprofile=coverage.out -v
-make test-cover   # test-race + go tool cover -html
+make test         # go test ./... -count=1 -shuffle=on
+make test-race    # go test ./... -race
+make test-integration # REDIS_URL=... go test -tags=integration ./... -race
+make cover        # go test ./... -coverpkg=./... + total
 make lint         # golangci-lint run ./...
 make lint-fix     # golangci-lint run --fix ./...
 make bench        # go test ./... -bench=. -benchmem
@@ -54,12 +55,22 @@ go test ./tests -run '^$' -bench=. -benchmem -count=1
 The workflow in `.github/workflows/ci.yaml` runs, on push to `main` and pull requests:
 
 - `go vet ./...`
-- `go test ./... -race -coverprofile=coverage.out -v`
-- `golangci-lint` (configuration in `.golangci.yml`, includes `gosec`)
-- `govulncheck` with a pinned version
-- `docker build`
+- `go test ./... -race -coverpkg=./... -coverprofile=coverage.out`
+- a coverage floor of **55 %** on the `-coverpkg` total
+- `golangci-lint` v2 (configuration in `.golangci.yml`, includes `gosec`)
+- `govulncheck` with a pinned version (advisory while `go.mod` is upgraded)
+- a Redis 7 service and an opt-in `-tags=integration` job
+- `docker build`, a blocking Trivy OS scan, an advisory Go-module scan and an SBOM artifact
 
-Coverage is uploaded as an artifact, **not** enforced as a percentage. Do not claim a coverage number in a PR unless you attach the command and the result. A previous `-coverpkg` measurement was around 53%; it is not a gate.
+Coverage is measured, not guessed: a local `go test ./... -coverpkg=./...` on 2026-11-13 at `f8663d0` measured 66.0 %. Do not claim a different number without the command and the result. The gate is 55 %, not the measured value.
+
+Integration tests use a build tag and `REDIS_URL`:
+
+```bash
+REDIS_URL=redis://127.0.0.1:6379/0 go test -tags=integration ./... -count=1
+```
+
+If no integration-tagged files exist, the command still passes and runs the normal suite.
 
 ## Pull requests
 

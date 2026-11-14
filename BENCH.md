@@ -1,11 +1,12 @@
 # Benchmarks
 
 > **These are microbenchmarks, not a capacity claim.**
-> The last recorded reference was captured on **2026-09-01 on Windows AMD64 with
-> Go 1.24** using the command below. It has **not** been re-measured for
-> `v1.1.0`, and the repository does not commit an end-to-end load test result.
-> Treat the numbers as a local reference, not a guarantee. CPU model, governor,
-> background load and Go version change them.
+> The figures below were captured on **2026-11-13 at commit `f8663d0`**
+> inside `golang:1.24-alpine` on an **AMD Ryzen 5 3600X (6 cores / 12
+> threads)**, using the command shown. They measure individual components, not
+> gateway throughput, and the repository still does not commit an end-to-end
+> load-test result. CPU model, governor, background load, container limits and
+> Go version change them; re-run before quoting.
 
 ## What is actually benchmarked
 
@@ -50,25 +51,58 @@ Commit:     git rev-parse --short HEAD
 Command:    go test ./tests -run '^$' -bench=. -benchmem -count=3
 ```
 
-## Last recorded reference (not re-measured)
+## Measured reference (2026-11-13)
 
-Source: the previous `BENCH.md`, dated 2026-09-01, Windows AMD64, Go 1.24,
-`go test ./... -bench=. -benchmem -count=1`. Formatting normalized; values are
-shown as recorded, not re-validated:
+Metadata:
 
 ```text
-BenchmarkLimiter_Allow-8            210 ns/op      0 allocs/op
-BenchmarkLimiter_Allow_Sharded-8    145 ns/op      0 allocs/op   # sharded path
-BenchmarkLimiter_AllowN_Token-8     220 ns/op      0 allocs/op
-BenchmarkBuildKey-8                1150 ns/op    512 allocs/op   # sha256(canonical JSON)
-BenchmarkCache_Get_Hit-8            180 ns/op      0 allocs/op
-BenchmarkCache_Get_Miss-8           150 ns/op      0 allocs/op
+CPU:        AMD Ryzen 5 3600X 6-Core Processor (12 threads visible)
+OS:         linux/amd64 (golang:1.24-alpine container)
+Go:         go1.24 (toolchain in the image)
+Commit:     f8663d0
+Command:    go test ./tests -run '^$' -bench=. -benchmem -count=3
+GOMAXPROCS: 12
 ```
 
-Earlier README/BENCH text also quoted `56 ns`, `75 ns` and `1.8 µs` for the same
-paths. Those values conflict with the recorded table above and with each other;
-they have been removed rather than presented as fact. If you need a number,
-run the command on your hardware and publish the metadata.
+Results, three runs per benchmark (not cherry-picked):
+
+```text
+BenchmarkLimiter_Allow-12            254.0 / 299.0 / 424.4 ns/op     40 B/op   3 allocs/op
+BenchmarkLimiter_Allow_Sharded-12    353.0 / 343.6 / 334.2 ns/op     48 B/op   3 allocs/op
+BenchmarkLimiter_AllowN_Token-12     305.5 / 231.7 / 278.8 ns/op     40 B/op   3 allocs/op
+BenchmarkBuildKey-12                2610 / 2249 / 2145 ns/op         753 B/op   7 allocs/op
+BenchmarkCache_Get_Hit-12             97.64 / 112.7 / 98.73 ns/op    16 B/op   1 alloc/op
+BenchmarkCache_Get_Miss-12            16.36 / 16.46 / 17.09 ns/op     0 B/op   0 allocs/op
+```
+
+The spread is real: shared CI machines and background load move these by
+30–60 %. Prefer the median of repeated runs over a single number.
+
+## How to run
+
+```bash
+# from the repository root
+go test ./tests -run '^$' -bench=. -benchmem -count=3
+
+# a single family, with a stable machine and no other load
+go test ./tests -run '^$' -bench='Benchmark(Limiter|Cache|BuildKey)' \
+  -benchmem -count=5 -benchtime=2s
+
+# capture CPU and memory profiles for one benchmark
+go test ./tests -run '^$' -bench='BenchmarkBuildKey' \
+  -benchmem -cpuprofile=/tmp/cpu.prof -memprofile=/tmp/mem.prof
+go tool pprof -http=:9091 /tmp/cpu.prof
+```
+
+Report the result with **hardware, OS, Go version, commit and command**:
+
+```text
+CPU:        <model>, <cores>, <RAM>
+OS:         <linux/amd64 | darwin/arm64 | ...>
+Go:         go version
+Commit:     git rev-parse --short HEAD
+Command:    go test ./tests -run '^$' -bench=. -benchmem -count=3
+```
 
 ## Load testing: what is missing
 
@@ -128,13 +162,18 @@ do not attach them to tickets, and disable pprof afterwards.
 - `http.Transport` is shared with `MaxIdleConns=100`,
   `MaxIdleConnsPerHost=20`, `MaxConnsPerHost=100`, `IdleConnTimeout=90s`,
   `TLSHandshakeTimeout=5s` and `ForceAttemptHTTP2=true`.
-- The server sets `ReadHeaderTimeout=5s`, `IdleTimeout=120s`, and clears the
-  write deadline for active SSE streams.
+- The server sets `ReadHeaderTimeout=5s`, `IdleTimeout=120s`, and renews the
+  SSE write deadline by 60 s before every chunk (a rolling deadline, not a
+  cleared one).
 - The limiter uses 16 shards, a 10-minute bucket TTL and a 2-minute cleanup
-  tick. Those are implementation facts, not throughput claims.
-- The cache is either in-memory LRU or Redis, not a layered cache. If Redis is
-  configured and dies at runtime, gets return miss and sets fail silently; the
-  request still succeeds. See the runbook.
+  tick. The token bucket capacity is `token_burst` (tokens), independent from
+  the request burst.
+- The cache is either in-memory LRU or Redis, not a layered cache, and enforces
+  `max_bytes`/`max_ttl`. If Redis is configured and dies at runtime, gets
+  return miss and sets fail silently; the request still succeeds. See the
+  runbook.
+- Chat cache misses are coalesced with single-flight; a benchmark of the
+  provider call would measure the provider, not the coalescer.
 
 ## Next (roadmap)
 

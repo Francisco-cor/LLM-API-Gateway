@@ -3,7 +3,7 @@
 **Status:** Proposed (dirección aceptada para el roadmap; implementación pendiente)
 **Date:** 2026-11-13 · **Deciders:** maintainer
 **Supersedes:** nada. Complementa ADR-001, ADR-002 y ADR-003.
-**Related:** [`../ROADMAP.md`](../ROADMAP.md)
+**Related:** [`../ROADMAP.md`](../ROADMAP.md), [`ADR-005-fail-closed-auth-and-strict-mode.md`](ADR-005-fail-closed-auth-and-strict-mode.md) (implementa la parte de auth fail-closed y strict de la decisión 4).
 
 ## Contexto
 

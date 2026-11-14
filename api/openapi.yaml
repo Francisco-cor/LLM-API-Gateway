@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: LLM API Gateway
-  version: 1.1.0
+  version: 1.1.1
   summary: OpenAI-compatible gateway for OpenAI, Anthropic and Gemini.
   description: |
     Contract for the gateway's public HTTP surface and its admin API.
@@ -11,21 +11,33 @@ info:
     server to the admin listener.
 
     **Authentication.** Tenant endpoints require `Authorization: Bearer <key>`
-    only when `auth.enabled` is true. The admin API accepts either a Bearer
-    token or `X-Admin-API-Key`. Config validation refuses to start when
+    only when `auth.enabled` is true. Keys must declare at least one allowed
+    scope (`chat:write`, `embeddings:write`, `models:read`, `admin:write`,
+    `resource:<name>`, `*`); a route without an explicit scope mapping is
+    denied. The admin API accepts either a Bearer token or
+    `X-Admin-API-Key`. Config validation refuses to start when
     `admin.allow_insecure` is false and no admin key is configured; if the
     admin handler is somehow wired without a key, it returns `503` instead of
-    serving the control plane.
+    serving the control plane. `--strict`/`GATEWAY_ENV=prod` additionally
+    requires auth, an admin key, pprof off, no wildcard CORS and https
+    provider URLs.
 
-    **Limits.** Chat and embeddings bodies are capped at 1 MiB. Unknown JSON
-    fields are rejected with `400`. Exactly one JSON value per request body is
-    accepted. Upstream responses are capped at 8 MiB.
+    **Limits and decoding.** Chat and embeddings bodies are capped at **8 MiB**
+    (vision/audio); larger bodies get `413`. Admin patches are capped at 1 MiB.
+    Exactly one JSON value per request body is accepted. The **data plane
+    tolerates unknown JSON fields** (OpenAI adds fields over time) and ignores
+    them; the control plane (YAML config, admin) remains strict. Upstream
+    responses are capped at 8 MiB.
 
     **Validation scope.** The gateway itself validates the JSON shape, required
     `model`/`messages`, non-empty embedding `input`, and body size. Numeric
     ranges, enums and provider-specific combinations in this schema describe
     the expected OpenAI shape; they are forwarded to the provider and may be
-    rejected upstream with `502` rather than by the gateway with `400`.
+    rejected upstream with `400`/`502` rather than by the gateway.
+
+    **Error mapping.** Upstream 400/422 → `400`; 404 → `404`; 413 → `413`;
+    429 → `429`; 401/403 → `502`; 503/504 → `503`; other 5xx/network → `502`.
+    `Retry-After` is rounded up to a whole second and never below 1.
 
     **Durations in the admin config.** `GET /admin/config` serializes the Go
     config structs with their default JSON encoding: field names are
@@ -57,13 +69,16 @@ paths:
         then calls the provider with retry, circuit breaker and fallback.
 
         With `stream: true`, responds `200` with `text/event-stream`. Each event
-        is `data: <StreamChunk>`; the stream ends with `data: [DONE]`. A
-        mid-stream provider failure emits `event: error` followed by
-        `data: [DONE]`. Streams are never cached and cannot be resumed.
+        is `data: <StreamChunk>`; the stream ends with `data: [DONE]` **only**
+        on a successful completion. A mid-stream provider failure emits
+        `event: error` and then closes **without** `[DONE]`; an upstream close
+        without a terminal `finish_reason`/usage emits `event: error` with
+        `code: "stream_truncated"`, also without `[DONE]`. Streams are never
+        cached and cannot be resumed.
 
-        If all providers fail before a stream starts, the gateway responds
-        `502` (never starts SSE). A provider `429` may surface as `502` after
-        fallbacks are exhausted; `Retry-After` is propagated.
+        If all providers fail before a stream starts, the gateway responds with
+        the mapped status (`400`/`404`/`413`/`429`/`502`/`503`/`504`) and never
+        starts SSE. `Retry-After` is propagated, rounded up to seconds.
       security:
         - bearerAuth: []
       requestBody:
@@ -91,9 +106,10 @@ paths:
                 type: string
                 description: |
                   SSE stream. Lines are `data: {json}` separated by a blank
-                  line. Terminal frames: `data: [DONE]`; on provider failure
-                  after headers, `event: error` with an OpenAI error body then
-                  `data: [DONE]`.
+                  line. Terminal frames: `data: [DONE]` on success only. On a
+                  provider failure after headers, `event: error` with an OpenAI
+                  error body and no `[DONE]`; on a silent upstream close,
+                  `code: stream_truncated`, also with no `[DONE]`.
               example: |
                 data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1760000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},"finish_reason":null}]}
 
@@ -437,16 +453,34 @@ components:
 
   responses:
     BadRequest:
-      description: Invalid JSON, unknown field, missing `model`/`messages`, or invalid input.
+      description: |
+        Invalid JSON, trailing JSON, missing `model`/`messages`, invalid input,
+        or a request the provider could not represent (for example an
+        `unsupported_parameter` with `param`). Unknown fields are tolerated by
+        the data plane and do not produce this error.
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
           example:
             error:
-              message: 'invalid JSON body: json: unknown field "foo"'
+              message: 'invalid JSON body: unexpected end of JSON input'
               type: invalid_request_error
               code: invalid_request_error
+    UnsupportedParameter:
+      description: |
+        A caller-supplied parameter cannot be represented in the selected
+        provider's native API. The offending field is reported in `param`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              message: 'response_format.type: json_schema is not supported by this provider'
+              type: invalid_request_error
+              code: unsupported_parameter
+              param: response_format.type
     Unauthorized:
       description: Missing/invalid/expired API key.
       content:
@@ -486,21 +520,23 @@ components:
               type: model_not_found
               code: model_not_found
     PayloadTooLarge:
-      description: Body exceeds 1 MiB.
+      description: Body exceeds 8 MiB.
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
           example:
             error:
-              message: request body too large (max 1MiB)
+              message: request body too large (max 8MiB)
               type: invalid_request_error
               code: invalid_request_error
     RateLimited:
       description: |
-        `rate_limit_exceeded` (local token bucket) or `insufficient_quota`
-        (monthly budget). Both are 429. `Retry-After` is set for the limiter
-        path; `X-RateLimit-*` headers are set only by the request limiter.
+        `rate_limit_exceeded` (local request/token bucket), `insufficient_quota`
+        (monthly budget), or an upstream 429 after fallbacks are exhausted.
+        `Retry-After` is set for the limiter path and for an upstream 429
+        (rounded up to a whole second, minimum 1); `X-RateLimit-*` headers are
+        set only by the request limiter.
       headers:
         Retry-After:
           $ref: '#/components/headers/Retry-After'
@@ -519,14 +555,29 @@ components:
                   message: rate limit exceeded, retry later
                   type: rate_limit_exceeded
                   code: rate_limit_exceeded
+            tokenLimit:
+              value:
+                error:
+                  message: token budget exceeded, retry later
+                  type: rate_limit_exceeded
+                  code: rate_limit_exceeded
             quota:
               value:
                 error:
                   message: 'insufficient_quota: monthly budget reservation denied'
                   type: insufficient_quota
                   code: insufficient_quota
+            upstream:
+              value:
+                error:
+                  message: '[openai] rate limit exceeded'
+                  type: rate_limit_error
+                  code: rate_limit_exceeded
     ProviderError:
-      description: All providers failed, or the primary and fallbacks returned retryable errors.
+      description: |
+        All providers failed, or the primary and fallbacks returned retryable
+        errors. An upstream 5xx/network failure maps here as `502`; an upstream
+        401/403 also maps to `502` without echoing the provider body.
       headers:
         Retry-After:
           $ref: '#/components/headers/Retry-After'
@@ -541,9 +592,11 @@ components:
               code: provider_error
     ServiceUnavailable:
       description: |
-        Budget backend unavailable (`budget_unavailable`), price missing under
-        `reject` policy (`pricing_unavailable`), or admin key not configured on
-        the admin listener.
+        Budget backend unavailable (`budget_unavailable` when
+        `require_shared_store` is set), price missing under `reject` policy
+        (`pricing_unavailable`), an upstream 503/504 after fallbacks
+        (`provider_unavailable`), or admin key not configured on the admin
+        listener.
       content:
         application/json:
           schema:
@@ -561,6 +614,12 @@ components:
                   message: provider/model price is not configured
                   type: pricing_unavailable
                   code: pricing_unavailable
+            provider:
+              value:
+                error:
+                  message: '[anthropic] provider unavailable'
+                  type: provider_error
+                  code: provider_unavailable
     GatewayTimeout:
       description: The request context or provider call timed out.
       content:
@@ -601,7 +660,10 @@ components:
     ChatCompletionRequest:
       type: object
       required: [model, messages]
-      additionalProperties: false
+      additionalProperties: true
+      description: |
+        Unknown fields are accepted and ignored, mirroring OpenAI's evolving
+        schema. The gateway only requires `model` and a non-empty `messages`.
       properties:
         model:
           type: string
@@ -671,10 +733,11 @@ components:
     ChatMessage:
       type: object
       required: [role]
-      additionalProperties: false
+      additionalProperties: true
       description: |
-        OpenAI message shape. Unknown fields are rejected. `content` may be a
-        string, an array of content parts, or null (for assistant tool calls).
+        OpenAI message shape. Unknown message fields are tolerated and ignored
+        by the data plane. `content` may be a string, an array of content parts,
+        or null (for assistant tool calls).
       properties:
         role:
           type: string
@@ -776,13 +839,20 @@ components:
       required: [type]
       additionalProperties: false
       description: |
-        The gateway models only `type` and forwards the string. The OpenAI
-        `json_schema` payload (`{type:"json_schema", json_schema:{...}}`) is not
-        modeled and its extra field is rejected as unknown. Values are not
-        validated against an enum.
+        `type` selects text, JSON object or JSON schema output. For
+        `json_schema`, the `json_schema` object is passed through verbatim
+        (including the caller's `name`, `strict` and `schema`) to providers
+        that support it. Values are not validated against an enum; a provider
+        that cannot represent the type returns `400 unsupported_parameter`.
       properties:
         type:
           type: string
+        json_schema:
+          type: object
+          additionalProperties: true
+          description: 'Pass-through JSON Schema envelope for type: json_schema.'
+        strict:
+          type: boolean
     StreamOptions:
       type: object
       additionalProperties: false
@@ -795,6 +865,12 @@ components:
       required: [id, type, function]
       additionalProperties: false
       properties:
+        index:
+          type: integer
+          description: |
+            Position of the tool call in the assistant message or in the
+            streamed delta. Emitted by provider translation and stream deltas;
+            clients normally send it only in assistant history.
         id:
           type: string
         type:
@@ -901,6 +977,18 @@ components:
           type: integer
         total_tokens:
           type: integer
+        prompt_tokens_details:
+          type: object
+          description: Provider-reported prompt breakdown (cache hits).
+          properties:
+            cached_tokens:
+              type: integer
+        completion_tokens_details:
+          type: object
+          description: Provider-reported completion breakdown (reasoning tokens).
+          properties:
+            reasoning_tokens:
+              type: integer
     StreamChunk:
       type: object
       description: SSE `data:` payload.
@@ -1088,6 +1176,12 @@ components:
               type: string
             code:
               type: string
+            param:
+              type: string
+              description: |
+                Offending request field for `unsupported_parameter` and
+                translation errors. Omitted when the failure is not tied to a
+                parameter.
     AdminError:
       type: object
       required: [error]
@@ -1141,6 +1235,14 @@ components:
             burst:
               type: integer
               minimum: 0
+            tokens_per_minute:
+              type: integer
+              minimum: 0
+              description: Token-bucket refill rate (tokens per minute).
+            token_burst:
+              type: integer
+              minimum: 0
+              description: Token-bucket capacity in tokens (>= 1024 when enabled).
             redis_url:
               type: string
         cache:
@@ -1149,9 +1251,16 @@ components:
           properties:
             ttl:
               type: string
+            max_ttl:
+              type: string
+              description: Upper bound for X-Cache-TTL (max 24h).
             max_size:
               type: integer
               minimum: 0
+            max_bytes:
+              type: integer
+              minimum: 0
+              description: Byte budget for the in-memory cache.
             semantic_enabled:
               type: boolean
             semantic_threshold:
