@@ -104,10 +104,12 @@ jobs:
             redocly/cli:2.78.0@sha256:ab4ca2d6d1cfb316677b79ae6462132a7e4c496037b7eb405ca7d3818fe9346d \
             lint api/openapi.yaml --max-problems 0
       - name: Detect breaking OpenAPI changes
-        # Comparison baseline: the PR base branch, or the previous commit on a
-        # direct push. Intentional breaks must carry the explicit marker.
+        # Comparison baseline: the PR base branch, or the previous remote tip
+        # on a push (github.event.before), so multi-commit pushes are checked
+        # against the last published spec, not just the last commit.
         env:
           BASE_REF: ${{ github.base_ref }}
+          BEFORE_SHA: ${{ github.event.before }}
           COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -117,6 +119,8 @@ jobs:
           if [ -n "$BASE_REF" ]; then
             git fetch --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
             base_desc="origin/$BASE_REF"
+          elif [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ] && git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+            base_desc="$BEFORE_SHA"
           elif git rev-parse --verify -q HEAD^ >/dev/null; then
             base_desc="HEAD^"
           else

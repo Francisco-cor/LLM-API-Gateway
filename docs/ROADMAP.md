@@ -239,7 +239,7 @@ Prioridad: **P0** bloquea adopción; **P1** necesaria para operar; **P2** mejora
 
 | ID | Estado | Evidencia / qué falta |
 |---|---|---|
-| R-01 | **Cerrado** | `redocly lint --max-problems 0` (OpenAPI 3.1, zero warnings) y `oasdiff breaking --fail-on ERR` contra la rama base del PR o `HEAD^` en push directo, en el job `openapi` de CI. Los cambios incompatibles intencionados requieren el marcador `[openapi-breaking-approved]`. Local: `make openapi-lint` / `make openapi-breaking`. |
+| R-01 | **Cerrado** | `redocly lint --max-problems 0` (OpenAPI 3.1, zero warnings) y `oasdiff breaking --fail-on ERR` contra la rama base del PR o el tip remoto anterior (`github.event.before`) en push directo, en el job `openapi` de CI. Los cambios incompatibles intencionados requieren el marcador `[openapi-breaking-approved]`. Local: `make openapi-lint` / `make openapi-breaking`. |
 | R-03 | **Cerrado** | `internal/idempotency`: `Idempotency-Key` por tenant+ruta, fingerprint del body, replay de 2xx con `Idempotent-Replayed`, 409 `idempotency_key_reuse`/`in_progress`, single-flight local + lock Redis `SET NX`; store LRU acotado + Redis. Tests unitarios, de middleware y de integración cross-réplica. |
 | R-02 | **Cerrado** | Job `conformance` de CI: gateway real + upstream falso stdlib, `openai==3.51.0` (Python) y `openai@7.57.0` (Node) cubriendo chat, streaming con usage, tools, embeddings, `/v1/models`, 404 e idempotencia. `make conformance` en local. |
 | R-04 | **Cerrado** | Gate de cobertura 55 % con `-coverpkg=./...` y job de integración con Redis real; los smoke tests e2e de `tests/integration` usan upstream falso y se ejecutan en CI. |
