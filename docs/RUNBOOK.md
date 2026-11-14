@@ -101,7 +101,7 @@ curl -sS -X POST http://127.0.0.1:8081/admin/reload \
   -H "Authorization: Bearer $ADMIN_API_KEY"
 ```
 
-**Importante:** `POST /admin/reload`, `SIGHUP` y el watcher **no** pueden cambiar `server.port`, `server.read_timeout`/`write_timeout`, `admin.port`, `admin.bind_address`, `admin.pprof_enabled` ni `logging.format`: se rechazan con un error claro (`... requires restart`). `logging.format` es la excepción: registra un warning y mantiene el handler actual. La **admin key sí se rota en caliente** (§4.6). También se recargan `auth.enabled`, la pepper, CORS, `logging.level`, rate limit (incluido token bucket), cache, resiliencia, rutas, health, budget, pricing y proveedores.
+**Importante:** `POST /admin/reload`, `SIGHUP` y el watcher **no** pueden cambiar `server.port`, `server.read_timeout`/`write_timeout`, `admin.port`, `admin.bind_address`, `admin.pprof_enabled` ni `logging.format`: se rechazan con un error claro (`... requires restart`). `logging.format` es la excepción: registra un warning y mantiene el handler actual. La **admin key sí se rota en caliente** (§4.6). También se recargan `auth.enabled`, la pepper, CORS, `logging.level`, rate limit (incluido token bucket), cache, resiliencia, rutas, health, budget, pricing y proveedores. `PATCH /admin/config` solo expone rate limit, cache, health, resiliencia, routing y logging; auth/CORS/proveedores se cambian editando el archivo y recargando.
 
 ### 3.1 Modo strict
 

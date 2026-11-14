@@ -1235,6 +1235,14 @@ components:
             burst:
               type: integer
               minimum: 0
+            tokens_per_minute:
+              type: integer
+              minimum: 0
+              description: Token-bucket refill rate (tokens per minute).
+            token_burst:
+              type: integer
+              minimum: 0
+              description: Token-bucket capacity in tokens (>= 1024 when enabled).
             redis_url:
               type: string
         cache:
@@ -1243,9 +1251,16 @@ components:
           properties:
             ttl:
               type: string
+            max_ttl:
+              type: string
+              description: Upper bound for X-Cache-TTL (max 24h).
             max_size:
               type: integer
               minimum: 0
+            max_bytes:
+              type: integer
+              minimum: 0
+              description: Byte budget for the in-memory cache.
             semantic_enabled:
               type: boolean
             semantic_threshold:

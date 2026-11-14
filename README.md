@@ -265,11 +265,11 @@ Two profiles ship in the repo: `config.dev.yaml` (no auth, debug logs, loopback 
 | `GET /metrics` | Prometheus exposition; **not authenticated** |
 | `GET /admin/config` | Redacted config + `ETag` |
 | `POST /admin/reload` | Re-read the config file; validation failure → 400 with old config active |
-| `PATCH /admin/config` | Hot knobs (rate limit, cache, health, resilience, routing, logging, auth, CORS); send `If-Match` to get 409 instead of overwriting a concurrent change |
+| `PATCH /admin/config` | Hot knobs exposed by the admin API (rate limit, cache, health, resilience, routing, logging); send `If-Match` to get 409 instead of overwriting a concurrent change. auth/CORS/providers are changed by editing the file and reloading. |
 | `GET /admin/providers` | Provider list |
 | `GET /debug/pprof/*` | Only when `admin.pprof_enabled: true`, under the admin mux and admin auth |
 
-Hot reload covers providers, fallback, aliases, weights, limits, token limits, overrides, budget, pricing, cache, auth (including `auth.enabled` and the pepper), CORS, `logging.level`, the admin API key, health options and resilience. It does **not** cover `server.*`, `admin.port`, `admin.bind_address`, `admin.pprof_enabled` or `logging.format`; those require a restart and a reload that tries to change them is rejected (format only logs a warning and keeps the current handler). The file watcher retries a failed apply with backoff; a Redis outage does not block the rest of the reload.
+Hot reload covers providers, fallback, aliases, weights, limits, token limits, overrides, budget, pricing, cache, auth (including `auth.enabled` and the pepper), CORS, `logging.level`, the admin API key, health options and resilience. `PATCH /admin/config` exposes the subset listed above; auth, CORS and providers require a file reload (`SIGHUP`/`POST /admin/reload`). It does **not** cover `server.*`, `admin.port`, `admin.bind_address`, `admin.pprof_enabled` or `logging.format`; those require a restart and a reload that tries to change them is rejected (format only logs a warning and keeps the current handler). The file watcher retries a failed apply with backoff; a Redis outage does not block the rest of the reload.
 
 Runbooks for Redis outage, provider 429/5xx, open circuits, exhausted budget, truncated streams, strict mode, admin key rotation, ETag conflicts, scopes and profiling: [`docs/RUNBOOK.md`](docs/RUNBOOK.md). Proposed SLOs and alert thresholds are there too; they are not measured yet.
 

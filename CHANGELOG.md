@@ -7,18 +7,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Pending integration (other workstreams)
+Nothing yet. The next milestone is the Postgres control plane and the usage
+ledger; see `docs/ROADMAP.md`.
 
-The following areas are being worked on in parallel branches. They are **not**
-claimed as part of `v1.1.0` until their commits are merged and verified; this
-section will be replaced by concrete entries when that happens.
+## [v1.1.1] - 2026-11-13
 
-- **Streaming** — further SSE and usage-accounting work beyond the v1.1.0 fixes.
-- **Pricing** — additional price catalog and reconciliation work; the ledger
-  does not exist yet, so no billing claim is made.
-- **Cache** — shared/distributed semantic index and invalidation work.
-- **CI** — coverage gate, OpenAPI validation and load/conformance jobs. The
-  current workflow uploads coverage but does not enforce a threshold.
+### Added
+
+- **Strict production profile:** `--strict` or `GATEWAY_ENV=prod` applies a
+  second validation pass at startup and on every reload. It requires auth, an
+  admin key, pprof off, no wildcard CORS, https provider URLs (unless
+  `allow_private: true`) and a shared Redis store for limits/budgets.
+- **Provider `base_url` validation:** strict mode rejects `http`, localhost,
+  private/loopback/link-local addresses and cloud metadata endpoints
+  (`169.254.169.254`, `100.100.100.200`, `fd00:ec2::254`). `allow_private`
+  is the explicit opt-in for local Ollama/vLLM backends.
+- **Admin hardening:** the admin key rotates live on reload; `GET
+  /admin/config` returns an `ETag` and `PATCH` honours `If-Match` with `409` on
+  conflict. Every authenticated admin operation emits an `admin_audit` record.
+- **Auth hardening:** mandatory scopes with an allowlist, fail-closed route →
+  scope map, keys ≥ 32 characters in production, optional HMAC-SHA256 pepper
+  (`auth.key_pepper` / `AUTH_KEY_PEPPER`) and a per-IP 401 throttle
+  (20 failures/minute → 429 with `Retry-After`).
+- **Token bucket in real units:** `rate_limit.tokens_per_minute` and
+  `token_burst` size a bucket measured in tokens, independent from the request
+  bucket. Overrides get isolated per-model buckets, and authenticated tenant
+  identity is authoritative for the limiter key.
+- **Honest streaming:** a truncated upstream or a mid-stream provider failure
+  emits `event: error` and **no `data: [DONE]`**; a silent close reports
+  `code: stream_truncated`. Real provider usage is preserved in the terminal
+  chunk, `choices[].index` and `tool_calls[].index` are stable, and the SSE
+  write deadline is rolling (60 s).
+- **OpenAI error mapping:** upstream 400/422 → 400, 404 → 404, 413 → 413,
+  429 → 429, 401/403 → 502, 503/504 → 503, other 5xx → 502. `Retry-After` is
+  rounded up and floored at 1; `invalid_request_error` /
+  `unsupported_parameter` errors include `param`.
+- **Tolerant data-plane contract:** unknown request/message fields are ignored,
+  `response_format.json_schema` is passed through verbatim, and the request
+  cap is 8 MiB for vision/audio. Config and admin remain strict.
+- **Budget correctness:** prices are per million tokens with the per-token
+  fallback converted once; reservations are leases with `reservation_ttl` and
+  a per-minute reconciler; months are UTC; cached prompt tokens are priced at
+  the catalog cache rate; `require_shared_store` fails closed instead of
+  silently multiplying the quota per replica.
+- **Cache correctness:** byte budget (`cache.max_bytes`), TTL cap
+  (`cache.max_ttl`), single-flight coalescing for chat misses (the leader
+  bills once), semantic lookup reusing its embedding when storing the miss, and
+  real Redis stats (SCAN count cached for 30 s).
+- **Hot reload, actually:** `auth.enabled`, CORS, `logging.level`, the admin
+  key and the pepper are reloadable. Bind/port/pprof and `logging.format`
+  require a restart with a clear error. The watcher retries with backoff and a
+  Redis outage no longer aborts the rest of the reload.
+- **CI and release:** golangci-lint v2 config, coverage measured with
+  `-coverpkg=./...` and enforced at 55 %, a Redis service plus an opt-in
+  `-tags=integration` job, multi-arch images, SPDX SBOM and keyless cosign
+  signing.
+- **Deployment:** NetworkPolicy, ServiceAccount without a mounted token,
+  hostname topology spread, `GATEWAY_ENV=prod` and `GATEWAY_REPLICAS` in the
+  manifests/config, `redis_url` in the ConfigMap, and a read-only `prod`
+  Compose profile.
+- **OpenAPI 1.1.1:** `param` on errors, `index` on tool calls, prompt/completion
+  token details, `json_schema`, tolerant request schemas, 8 MiB 413 and the
+  400/404/413/429/502/503/504 mapping.
+
+### Changed
+
+- Benchmark documentation now publishes a measured local run with hardware,
+  date, commit and command instead of old unverified figures.
+- README, RUNBOOK, ARCHITECTURE, SECURITY, CONTRIBUTING and ROADMAP were
+  reconciled with the code: pprof is only in the admin mux, auth is not
+  optional in production, the admin key rotates live, and the data plane no
+  longer rejects unknown fields.
+
+### Fixed
+
+- Price unit bug: a `cost_per_token_usd` fallback was interpreted as USD per
+  million tokens, under-pricing unknown models by 1,000,000×.
+- `Retry-After` no longer becomes `0` for sub-second upstream hints.
+- Retry/hedge losers settle circuit breakers honestly; readiness survives
+  client disconnects.
+- Cache stats no longer report a fake `-1` size for Redis, and a single large
+  response cannot flush the whole memory cache.
+- Rate-limit overrides no longer share a bucket with the global limit.
+
+### Security
+
+- Fail-closed scopes and route allowlist; unknown scopes are a startup error.
+- HMAC-SHA256 key pepper, 32-character key floor in production, 401 throttling.
+- Strict mode blocks SSRF-shaped provider URLs by configuration (literal
+  scheme/host/IP); DNS rebinding and redirect allowlists remain future work.
+- Admin ETag/If-Match, audit trail, live key rotation and userinfo/query
+  redaction in `base_url`.
+
+### Tests
+
+- `go test ./... -coverpkg=./...` measured **66.0 %** on 2026-11-13 at commit
+  `f8663d0` (Go 1.24 in Docker). CI enforces a 55 % floor, not the measured
+  number.
+- Redis integration tests are opt-in with `-tags=integration` and require
+  `REDIS_URL`; CI provides a Redis 7 service and skips the job cleanly when no
+  tagged files exist.
 
 ## [v1.1.0] - 2026-11-13
 
@@ -213,6 +301,7 @@ section will be replaced by concrete entries when that happens.
 - Initial scaffold: `Provider` interface, 3 providers, naive fallback,
   in-memory limiter, `slog`, Docker multi-stage.
 
-[Unreleased]: https://github.com/Francisco-cor/LLM-API-Gateway/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/Francisco-cor/LLM-API-Gateway/compare/v1.1.1...HEAD
+[v1.1.1]: https://github.com/Francisco-cor/LLM-API-Gateway/releases/tag/v1.1.1
 [v1.1.0]: https://github.com/Francisco-cor/LLM-API-Gateway/releases/tag/v1.1.0
 [v1.0.0]: https://github.com/Francisco-cor/LLM-API-Gateway/releases/tag/v1.0.0
