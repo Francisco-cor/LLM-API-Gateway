@@ -1,6 +1,6 @@
 # ROADMAP — de proyecto de entrevista a producto operable
 
-> **Estado:** documento vivo · **Última revisión:** 2026-11-13 · **Rama:** `docs/product`
+> **Estado:** documento vivo · **Última revisión:** 2026-11-13 · **Rama:** `docs/final` (integrada en `main`)
 > **Alcance:** qué es hoy el gateway, qué le falta para operar como producto y en qué orden hacerlo.
 > Este documento es la fuente de verdad del plan. El README resume y enlaza aquí; no dupliques el backlog en otros sitios.
 
@@ -40,20 +40,20 @@ Niveles: **prototipo** (funciona en local, sin garantías), **beta** (usable con
 
 | Dimensión | Nivel | Evidencia verificable | Qué falta para profesional |
 |---|---|---|---|
-| Contrato HTTP OpenAI | **beta** | `POST /v1/chat/completions`, `/v1/embeddings`, `GET /v1/models`; rechazo de campos desconocidos; `api/openapi.yaml` describe el contrato | Conformance contra SDKs oficiales en CI; idempotencia; versionado de contrato; `/v1/responses`, audio, batches fuera de alcance |
+| Contrato HTTP OpenAI | **beta** | `POST /v1/chat/completions`, `/v1/embeddings`, `GET /v1/models`; contrato tolerante a campos desconocidos; `api/openapi.yaml` 1.1.1 con `param`, `index`, usage details y `json_schema` | Conformance contra SDKs oficiales en CI; idempotencia; versionado de contrato; `/v1/responses`, audio, batches fuera de alcance |
 | Proveedores | **prototipo** | 3 adaptadores en `buildProviders`; interfaz `Provider` + `Embedder`; salud por proveedor | Registro genérico OpenAI-compatible, Azure/Bedrock/Vertex, presets (Groq, DeepSeek, OpenRouter, Ollama, vLLM), fixtures de contrato por proveedor |
 | Routing | **beta** | exacto, glob/regex, `routing.weighted`, aliases, auto-discovery | Routing por capacidad, coste, latencia y tenant; canary por cabecera; presupuesto de contexto |
-| Resiliencia | **beta** | retry 3× con jitter, circuit 5→30 s, hedge 300 ms (no-stream), fallback antes del primer chunk SSE | Backpressure, bulkheads, timeouts por ruta, presupuesto de reintentos global, hedge en streaming |
-| Control plane | **prototipo** | YAML + `SIGHUP` + watcher 1 s + admin `:8081`; validación y rollback | Postgres, migraciones, CRUD tenants/keys/proveedores/rutas, versionado y auditoría, coherencia entre réplicas |
-| Multi-tenancy | **beta** | API keys con scopes, expiración y tenant; `X-Tenant-ID` derivado de la key | CRUD, rotación con solape, cuotas por tenant/modelo, aislamiento verificable, límites de modelo por tenant |
-| Uso y coste | **prototipo** | budget mensual con reserva/commit; catálogo de precios; `gateway_cost_usd_total` | Ledger append-only, reconciliación, cuotas, facturación, exportación, precio efectivo por fecha |
-| Caché | **beta** | exacta en memoria/Redis, namespace por identidad y forma de respuesta, semántica opt-in por embeddings | Índice semántico compartido entre réplicas, invalidación, TTL por tenant, métricas de ahorro |
-| Observabilidad | **beta** | Prometheus (8 métricas), OTLP/gRPC, `slog` con `request_id`; `/metrics` | SLOs, dashboards, alertas como código, latencia de upstream separada, métricas de budget/cola/Redis, auth de `/metrics` |
-| Seguridad | **beta** | auth Bearer, scopes, admin fail-closed, pprof opt-in, bind admin loopback por defecto, redacción de secretos | SSRF guard, secret manager, PII, mTLS/NetworkPolicy, rotación de la admin key sin reinicio, auditoría de admin |
-| Despliegue | **beta** | Dockerfile multi-stage, manifiestos K8s (Deployment/HPA/PDB/ServiceMonitor) | Helm, Terraform, migraciones, e2e en kind, rollback documentado y probado |
-| Calidad | **beta** | tests unitarios/contrato, `-race` en CI, govulncheck y golangci-lint | Gate de cobertura, e2e con upstream falso, pruebas de carga versionadas, caos de Redis/proveedor |
-| Rendimiento | **prototipo** | benchmarks Go presentes; cifras históricas no reproducibles en este estado | Arnés de carga con upstream falso, hardware/fecha/comando, presupuesto de latencia y resultados publicados |
-| Documentación | **beta** | README, arquitectura, ADRs, runbook, seguridad, OpenAPI, roadmap | Guías de migración, troubleshooting probado, doc de API generada desde el contrato |
+| Resiliencia | **beta** | retry 3× con jitter, circuit 5→30 s, hedge 300 ms (no-stream), fallback antes del primer chunk SSE, streaming truncado honesto | Backpressure, bulkheads, timeouts por ruta, presupuesto de reintentos global, hedge en streaming |
+| Control plane | **prototipo** | YAML + `SIGHUP` + watcher con reintento + admin `:8081`; validación y rollback; ETag/If-Match, audit y rotación de admin key en caliente | Postgres, migraciones, CRUD tenants/keys/proveedores/rutas, versionado y auditoría persistente, coherencia entre réplicas |
+| Multi-tenancy | **beta** | API keys con scopes obligatorios/allowlist, expiración, pepper y throttle 401; `X-Tenant-ID` derivado de la key | CRUD, rotación con solape entre réplicas, cuotas por tenant/modelo, aislamiento verificable, límites de modelo por tenant |
+| Uso y coste | **prototipo** | budget mensual UTC con reservas-lease y reconciliación; catálogo por millón; cached tokens a tarifa de caché; `gateway_cost_usd_total` | Ledger append-only, reconciliación contra ledger, cuotas, facturación, exportación, precio efectivo por fecha |
+| Caché | **beta** | exacta en memoria/Redis, `max_bytes`/`max_ttl`, single-flight, namespace por identidad y forma, semántica opt-in con un solo embedding, stats Redis reales | Índice semántico compartido entre réplicas, invalidación, TTL por tenant, métricas de ahorro |
+| Observabilidad | **beta** | Prometheus (10 métricas, incl. TTFT/duración de stream), OTLP/gRPC, `slog` con `request_id`; `/metrics` | SLOs, dashboards, alertas como código, latencia de upstream separada, métricas de budget/cola/Redis, auth de `/metrics` |
+| Seguridad | **beta** | auth Bearer con scopes fail-closed, admin fail-closed/ETag/audit/rotación, pprof opt-in, bind loopback, pepper, throttle 401, strict mode y validación de `base_url` (https, metadata/privadas), redacción de userinfo | SSRF con DNS/redirect, secret manager, PII, mTLS, identidad de operador, `/metrics` auth |
+| Despliegue | **beta** | Dockerfile multi-stage, manifiestos K8s (Deployment/HPA/PDB/ServiceMonitor/NetworkPolicy/SA/topology), SBOM+cosign, perfil prod de Compose | Helm, Terraform, migraciones, e2e en kind, rollback probado |
+| Calidad | **beta** | tests unitarios/contrato, `-race` en CI, gate de cobertura 55 %, govulncheck, golangci-lint v2, job de integración Redis opt-in | e2e con upstream falso, conformance SDK, pruebas de carga versionadas, caos de Redis/proveedor |
+| Rendimiento | **prototipo** | microbenchmarks medidos (2026-11-13, hardware/comando publicados); sin load test e2e | Arnés de carga con upstream falso, presupuesto de latencia y resultados publicados |
+| Documentación | **beta** | README, arquitectura, ADRs 001–005, runbook, seguridad, OpenAPI 1.1.1, roadmap | Guías de migración, troubleshooting probado, doc de API generada desde el contrato |
 
 **Lectura:** el data plane está en beta alto; el control plane y el negocio (tenancy, uso, cuotas) están en prototipo. No tiene sentido añadir proveedores antes de resolver persistencia y cuotas: se multiplicaría la superficie sin poder cobrar ni auditar.
 
@@ -97,7 +97,7 @@ Esfuerzo orientativo para una persona con dedicación parcial: **S** ≤ 3 días
 - OpenAPI como fuente de verdad y chequeo de cambios incompatibles.
 - Suite de conformidad que arranque el gateway contra un upstream falso y ejecute `openai-python` y `openai-node` reales (chat, stream, tools, embeddings, errores).
 - Idempotency-Key en `POST /v1/chat/completions` y `/v1/embeddings` (Redis/Postgres, TTL 24 h, misma respuesta para la misma clave y cuerpo).
-- Tests de campos desconocidos, cuerpos >1 MiB, JSON trailing y `stream_options.include_usage`.
+- Tests de campos desconocidos (tolerados en data plane), cuerpos >8 MiB (413), JSON trailing y `stream_options.include_usage`.
 
 **Aceptación medible:** 100 % de los casos de la matriz de conformidad pasan en CI; una petición repetida con la misma `Idempotency-Key` no genera doble cargo en el ledger (cuando exista, fase 3).
 
@@ -163,7 +163,7 @@ Esfuerzo orientativo para una persona con dedicación parcial: **S** ≤ 3 días
 - **SSRF:** validar `base_url` (https por defecto, allowlist de hosts, bloqueo de IP privadas/loopback/link-local, no seguir redirects a hosts no permitidos, timeout de DNS).
 - **Secretos:** interfaz `SecretProvider` (env, archivo, Vault/AWS Secrets Manager); nunca secretos en el YAML versionado; rotación sin reinicio cuando el backend lo permita.
 - **PII:** hooks de redacción antes de logs y de caché; por defecto no registrar prompts ni respuestas.
-- **Admin:** auditoría de accesos, mTLS o NetworkPolicy, rotación de `ADMIN_API_KEY` sin reinicio (hoy exige reiniciar), `/metrics` autenticado o en un listener interno.
+- **Admin:** auditoría de accesos (implementada como log `admin_audit`, no persistente), mTLS o NetworkPolicy (NetworkPolicy ya existe), rotación de `ADMIN_API_KEY` sin reinicio (hecha), `/metrics` autenticado o en un listener interno (pendiente).
 - **Multi-tenant:** pruebas de que un tenant no puede leer caché, contadores ni budget de otro; límites de modelo y de tokens por tenant.
 
 **Aceptación medible:** suite de abuso (SSRF a `127.0.0.1`, `169.254.169.254`, redirect a interno) bloqueada; grep de logs de una suite de 1 000 peticiones no contiene claves ni prompts; rotación de admin key probada en caliente.
@@ -234,6 +234,20 @@ Prioridad: **P0** bloquea adopción; **P1** necesaria para operar; **P2** mejora
 | R-28 | SLOs, dashboards y alertas como código | 7 | P1 | Alto | M | Producto |
 | R-29 | Helm + Terraform + e2e kind | 8 | P1 | Alto | M | Producto |
 | R-30 | UI mínima de tenants/keys/consumo | 9 | P2 | Medio | M | Producto |
+
+**Estado del backlog a 2026-11-13.** Solo se marcan como cerrados o parciales los items tocados por esta sesión; el resto sigue pendiente.
+
+| ID | Estado | Evidencia / qué falta |
+|---|---|---|
+| R-01 | **Parcial** | `api/openapi.yaml` 1.1.1 actualizado y validado con PyYAML en local; falta el job de CI que valide el contrato y detecte cambios incompatibles (los workflows no se tocaron en esta sesión). |
+| R-04 | **Parcial** | Gate de cobertura al 55 % con `-coverpkg=./...` y job de integración Redis opt-in; falta el e2e con upstream falso. |
+| R-07 | **Parcial** | Keys de tenant y admin key se recargan en caliente; el solape entre réplicas y la revocación ≤ 5 s requieren control plane. |
+| R-09 | **Parcial** | Audit `admin_audit` con actor fingerprint, acción y detalle; es log de proceso, no tabla persistente ni identidad de operador. |
+| R-13 | **Parcial** | Catálogo versionado y tarifas por millón con cache read/write; falta precio efectivo por fecha. |
+| R-23 | **Parcial** | Strict valida https, hosts privados/loopback/link-local y metadata, con `allow_private`; faltan DNS pinning y allowlist de redirects. |
+| R-26 | **Parcial** | Admin key rota sin reiniciar; `/metrics` sigue sin autenticación. |
+
+Todo lo demás (R-02, R-03, R-05, R-06, R-08, R-10–R-12, R-14–R-22, R-24, R-25, R-27–R-30) sigue **pendiente**.
 
 **Fuera de alcance hasta que lo pidan clientes:** operador de Kubernetes, plugins WASM, facturación con Stripe, multi-región activo-activo, fine-tuning, batches, realtime API.
 
@@ -413,10 +427,31 @@ Un release se etiqueta solo si:
 
 ---
 
-## 9. Enlaces
+## 9. Estado de la sesión 2026-11-13
+
+Commits de la rama `docs/final` (docs) sobre `main` en `f8663d0`; los cambios de código ya estaban mergeados en `main`:
+
+| Área | Qué quedó cerrado | Dónde mirar |
+|---|---|---|
+| Streaming | `event: error` sin `[DONE]` en fallo mid-stream y en cierre sin evento terminal (`stream_truncated`); usage real; deadline rodante 60 s; `index` en choices/tool calls | `internal/proxy/handler.go`, `internal/provider/sse.go`, `tests/stream_usage_test.go` |
+| Errores | Mapeo 400/404/413/429/502/503/504, `Retry-After` hacia arriba, `param` en `unsupported_parameter` | `internal/proxy/errors.go`, `internal/translate/errors.go` |
+| Contrato | Campos desconocidos tolerados en data plane; `json_schema` passthrough; body 8 MiB | `internal/proxy/decode.go`, `internal/types/types.go`, `api/openapi.yaml` |
+| Límites | Bucket de tokens (`tokens_per_minute`/`token_burst`), overrides aislados, identidad autenticada, Redis | `internal/ratelimit/*`, `internal/proxy/middleware.go` |
+| Budget | Precio por token→por millón, leases TTL + reconciliación, `require_shared_store`, meses UTC, cached tokens | `internal/budget/budget.go`, `internal/pricing/*` |
+| Caché | `max_bytes`, `max_ttl`, single-flight, semántico sin doble embedding, stats Redis reales | `internal/cache/*` |
+| Hot reload | `auth.enabled`, CORS, `logging.level`, admin key/pepper; bind/port/pprof/formato requieren reinicio; watcher con reintento; Redis no bloquea | `cmd/gateway/main.go`, `internal/config/config.go` |
+| Auth/seguridad | Scopes fail-closed, allowlist, keys ≥32, pepper, throttle 401, strict mode, validación `base_url`, ETag/audit/rotación admin, pprof opt-in, bind loopback | `internal/auth/*`, `internal/admin/server.go`, `internal/config/config.go`, ADR-005 |
+| CI/deploy | golangci-lint v2, cobertura `-coverpkg` + gate 55 %, Redis service, multiarch+SBOM+cosign, NetworkPolicy/SA/topology, perfil prod, `GATEWAY_ENV`/`GATEWAY_REPLICAS`, ConfigMap con `redis_url` | `.github/workflows/*`, `deploy/k8s/*`, `docker-compose.yaml` |
+| Docs | README/RUNBOOK/ARCHITECTURE/OpenAPI/SECURITY/CONTRIBUTING/BENCH/ROADMAP sincronizados; ADR-005; cobertura medida 66.0 % y benchmarks locales | este repo |
+| Tests | Cobertura real 66.0 % (`-coverpkg=./...`, 2026-11-13, `f8663d0`); suite de integración Redis con `-tags=integration` (requiere `REDIS_URL`) | `go test ./... -coverpkg=./...`, `go test -tags=integration ./...` |
+
+**Lo que sigue pendiente y no se debe presentar como hecho:** Postgres/control plane persistente, CRUD de tenants/keys, ledger de uso y reconciliación, cuotas por tenant contra ledger, capability registry y fallback por capacidad, proveedor OpenAI-compatible genérico y adaptadores enterprise (Azure/Bedrock/Vertex), UI, SLOs medidos, load/chaos testing, `/metrics` autenticado, secret manager, PII, mTLS, Helm/Terraform y e2e en kind.
+
+## 10. Enlaces
 
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) — cómo funciona hoy.
 - [`RUNBOOK.md`](RUNBOOK.md) — operación e incidentes.
 - [`../SECURITY.md`](../SECURITY.md) — reporte y modelo de amenazas.
 - [`../api/openapi.yaml`](../api/openapi.yaml) — contrato HTTP.
 - [`adr/ADR-004-professionalization.md`](adr/ADR-004-professionalization.md) — decisiones de este plan.
+- [`adr/ADR-005-fail-closed-auth-and-strict-mode.md`](adr/ADR-005-fail-closed-auth-and-strict-mode.md) — auth fail-closed y modo strict implementados.
