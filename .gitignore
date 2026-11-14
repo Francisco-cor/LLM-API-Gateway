@@ -8,6 +8,13 @@ config.local.yaml
 coverage.out
 coverage.html
 *.test
+*.prof
+*.pprof
+cpu.out
+mem.out
+*.log
+.DS_Store
+*.swp
 /gateway
 sbom*.json
 AUDITORIA_Y_PLAN.md
