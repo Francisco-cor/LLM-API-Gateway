@@ -44,6 +44,15 @@ info:
     would lose a required capability instead of silently degrading the
     response.
 
+    **Idempotency.** `POST /v1/chat/completions` and `POST /v1/embeddings`
+    accept an optional `Idempotency-Key` header when `idempotency.enabled` is
+    true. A successful response is stored for `idempotency.ttl` and replayed
+    for the same key and byte-identical body (with `Idempotent-Replayed: true`);
+    reusing the key with a different body returns `409 idempotency_key_reuse`.
+    Concurrent duplicates wait for the leader; if it does not finish within
+    `idempotency.wait_timeout` the duplicate gets `409
+    idempotency_in_progress`. Streaming requests bypass idempotency.
+
     **Error mapping.** Upstream 400/422 → `400`; 404 → `404`; 413 → `413`;
     429 → `429`; 401/403 → `502`; 503/504 → `503`; other 5xx/network → `502`.
     `Retry-After` is rounded up to a whole second and never below 1.
@@ -94,6 +103,8 @@ paths:
         starts SSE. `Retry-After` is propagated, rounded up to seconds.
       security:
         - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -110,6 +121,8 @@ paths:
               $ref: '#/components/headers/X-Gateway-Provider'
             X-Cache:
               $ref: '#/components/headers/X-Cache'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/Idempotent-Replayed'
           content:
             application/json:
               schema:
@@ -136,6 +149,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '404':
           $ref: '#/components/responses/ModelNotFound'
         '413':
@@ -159,6 +174,8 @@ paths:
         caching applies when enabled; embeddings are not streamed.
       security:
         - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
         required: true
         content:
@@ -175,6 +192,8 @@ paths:
               $ref: '#/components/headers/X-Gateway-Provider'
             X-Cache:
               $ref: '#/components/headers/X-Cache'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/Idempotent-Replayed'
           content:
             application/json:
               schema:
@@ -185,6 +204,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '404':
           $ref: '#/components/responses/ModelNotFound'
         '413':
@@ -301,8 +322,9 @@ paths:
         `gateway_requests_total`, `gateway_request_duration_seconds`,
         `gateway_tokens_total`, `gateway_cost_usd_total`,
         `gateway_provider_errors_total`, `gateway_circuit_state`,
-        `gateway_cache_hits_total`, `gateway_cache_size` and
-        `gateway_capability_mismatches_total`.
+        `gateway_cache_hits_total`, `gateway_cache_size`,
+        `gateway_capability_mismatches_total` and
+        `gateway_idempotency_requests_total`.
       security: []
       responses:
         '200':
@@ -458,6 +480,10 @@ components:
       schema:
         type: string
         enum: [HIT, MISS]
+    Idempotent-Replayed:
+      description: Present and `true` when this response was replayed from the Idempotency-Key store.
+      schema:
+        type: boolean
     Retry-After:
       description: Seconds to wait before retrying.
       schema:
@@ -471,6 +497,25 @@ components:
       description: Remaining requests (always `0` on this 429 path).
       schema:
         type: integer
+
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Opaque key scoped to the authenticated tenant and path. When
+        `idempotency.enabled` is true, a successful response is stored and
+        replayed for a byte-identical body. Reusing the key with a different
+        body returns `409 idempotency_key_reuse`; a duplicate that arrives while
+        the first request is still running waits up to
+        `idempotency.wait_timeout`, then returns `409 idempotency_in_progress`.
+        Streaming chat requests bypass the store.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+        pattern: '^[\x21-\x7E]+$'
 
   responses:
     BadRequest:
@@ -538,6 +583,32 @@ components:
               message: 'API key is missing required scope: chat:write'
               type: insufficient_scope
               code: insufficient_scope
+    Conflict:
+      description: |
+        `Idempotency-Key` reused with a different request body
+        (`idempotency_key_reuse`), or a duplicate request arrived while the
+        first one is still running and did not finish within
+        `idempotency.wait_timeout` (`idempotency_in_progress`, with
+        `Retry-After: 1`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            keyReuse:
+              summary: Same key, different body
+              value:
+                error:
+                  message: Idempotency-Key was already used with a different request body
+                  type: invalid_request_error
+                  code: idempotency_key_reuse
+            inProgress:
+              summary: First request is still running
+              value:
+                error:
+                  message: a request with this Idempotency-Key is still in progress
+                  type: invalid_request_error
+                  code: idempotency_in_progress
     ModelNotFound:
       description: No configured provider serves the model.
       content:

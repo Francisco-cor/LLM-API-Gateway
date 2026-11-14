@@ -7,8 +7,8 @@
 # Negative values are rejected at load time.
 #
 # Hot reload (SIGHUP, admin PATCH, file watcher) applies auth, CORS, logging
-# level, provider keys, capability overrides, rate limits, cache, resilience and
-# the admin API key.
+# level, provider keys, capability overrides, rate limits, cache, idempotency,
+# resilience and the admin API key.
 # The HTTP bind address/port, admin bind/port, admin.pprof_enabled and
 # logging.format require a restart and are rejected with a clear error.
 server:
@@ -171,6 +171,21 @@ cache:
   semantic_embedding_model: text-embedding-3-small
   semantic_top_k: 3
   semantic_max_entries: 1000
+
+idempotency:
+  # Idempotency-Key is ignored until enabled. Successful non-streaming chat
+  # and embeddings responses are replayed for the same key and byte-identical
+  # body; a different body with the same key returns 409.
+  enabled: true
+  ttl: 10m
+  max_entries: 10000
+  max_bytes: 67108864
+  entry_max_bytes: 8388608
+  # How long a duplicate waits for the in-flight leader before 409
+  # idempotency_in_progress.
+  wait_timeout: 5s
+  # Redis lock lifetime for the in-flight leader (multi-replica dedupe).
+  lock_ttl: 2m
 
 health:
   readiness_cache_ttl: 15s

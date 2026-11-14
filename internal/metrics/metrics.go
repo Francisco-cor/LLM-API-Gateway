@@ -49,6 +49,12 @@ var (
 		Help: "Capability mismatches by provider, missing capability and action",
 	}, []string{"provider", "capability", "action"}) // action=request_rejected|fallback_skipped
 
+	// IdempotencyRequests counts Idempotency-Key outcomes.
+	IdempotencyRequests = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "gateway_idempotency_requests_total",
+		Help: "Idempotency-Key outcomes",
+	}, []string{"result"}) // result=miss|replay|conflict|in_progress|invalid|bypass
+
 	CacheSize = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "gateway_cache_size",
 		Help: "Current cache size (entries)",

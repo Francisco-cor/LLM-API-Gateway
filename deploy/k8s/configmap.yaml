@@ -68,6 +68,14 @@ data:
       max_size: 1000
       max_bytes: 67108864
       max_ttl: 1h
+    idempotency:
+      enabled: true
+      ttl: 10m
+      max_entries: 10000
+      max_bytes: 67108864
+      entry_max_bytes: 8388608
+      wait_timeout: 5s
+      lock_ttl: 2m
     health:
       readiness_cache_ttl: 30s
       check_timeout: 10s

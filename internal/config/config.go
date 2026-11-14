@@ -31,6 +31,7 @@ type Config struct {
 	Health        HealthConfig              `yaml:"health"`
 	Routing       RoutingConfig             `yaml:"routing"`
 	Admin         AdminConfig               `yaml:"admin"`
+	Idempotency   IdempotencyConfig         `yaml:"idempotency"`
 
 	// unresolved lists environment variables referenced by ${VAR} that were
 	// not set while loading. Validate uses it to fail on critical secrets
@@ -44,6 +45,18 @@ type AdminConfig struct {
 	APIKey        string `yaml:"api_key"`
 	AllowInsecure bool   `yaml:"allow_insecure"`
 	PprofEnabled  bool   `yaml:"pprof_enabled"`
+}
+
+// IdempotencyConfig bounds the Idempotency-Key response store. It is disabled
+// by default; the header is ignored until enabled.
+type IdempotencyConfig struct {
+	Enabled       bool          `yaml:"enabled"`
+	TTL           time.Duration `yaml:"ttl"`
+	MaxEntries    int           `yaml:"max_entries"`
+	MaxBytes      int64         `yaml:"max_bytes"`
+	EntryMaxBytes int64         `yaml:"entry_max_bytes"`
+	WaitTimeout   time.Duration `yaml:"wait_timeout"`
+	LockTTL       time.Duration `yaml:"lock_ttl"`
 }
 
 type RoutingConfig struct {
@@ -526,6 +539,18 @@ func (c *Config) Validate() error {
 	if c.Health.ReadinessCacheTTL < 0 || c.Health.CheckTimeout < 0 || c.Health.ProviderTimeout < 0 {
 		return fmt.Errorf("health timeouts must be >=0")
 	}
+	if c.Idempotency.TTL < 0 {
+		return fmt.Errorf("idempotency.ttl must be >=0")
+	}
+	if c.Idempotency.MaxEntries < 0 || c.Idempotency.MaxBytes < 0 || c.Idempotency.EntryMaxBytes < 0 {
+		return fmt.Errorf("idempotency max_entries/max_bytes/entry_max_bytes must be >=0")
+	}
+	if c.Idempotency.WaitTimeout < 0 || c.Idempotency.LockTTL < 0 {
+		return fmt.Errorf("idempotency wait_timeout/lock_ttl must be >=0")
+	}
+	if c.Idempotency.EntryMaxBytes > c.Idempotency.MaxBytes {
+		return fmt.Errorf("idempotency.entry_max_bytes must be <= idempotency.max_bytes")
+	}
 	for model, entries := range c.Routing.Weighted {
 		if model == "" {
 			return fmt.Errorf("routing.weighted key must be non-empty")
@@ -833,6 +858,24 @@ func setDefaults(cfg *Config) {
 		if v := os.Getenv("ADMIN_API_KEY"); v != "" {
 			cfg.Admin.APIKey = v
 		}
+	}
+	if cfg.Idempotency.TTL == 0 {
+		cfg.Idempotency.TTL = 10 * time.Minute
+	}
+	if cfg.Idempotency.MaxEntries == 0 {
+		cfg.Idempotency.MaxEntries = 10_000
+	}
+	if cfg.Idempotency.MaxBytes == 0 {
+		cfg.Idempotency.MaxBytes = 64 << 20
+	}
+	if cfg.Idempotency.EntryMaxBytes == 0 {
+		cfg.Idempotency.EntryMaxBytes = 8 << 20
+	}
+	if cfg.Idempotency.WaitTimeout == 0 {
+		cfg.Idempotency.WaitTimeout = 5 * time.Second
+	}
+	if cfg.Idempotency.LockTTL == 0 {
+		cfg.Idempotency.LockTTL = 2 * time.Minute
 	}
 	if cfg.Auth.KeyPepper == "" {
 		// Optional HMAC pepper for API key hashes at rest. Changing it

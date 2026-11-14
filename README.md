@@ -157,11 +157,12 @@ More runnable clients: [`examples/curl`](examples/curl), [`examples/openai-pytho
 | Health | Yes | `/health`, `/health/providers`, `/livez`, `/readyz` with drain semantics and cached provider checks; readiness survives client disconnects |
 | Observability | Yes | Prometheus metrics (incl. stream TTFT/duration), OTLP/gRPC traces, `slog` with `request_id`/tenant/provider/latency; **`/metrics` is unauthenticated** |
 | Auth | Yes | Static tenant keys, mandatory scopes (fail-closed), expiry, HMAC-SHA256 pepper (`auth.key_pepper` / `AUTH_KEY_PEPPER`), 32-char minimum in production, per-IP 401 throttle |
+| Idempotency | Yes | `Idempotency-Key` on non-streaming chat/embeddings; successful responses replayed, `409` on key reuse or in-flight duplicate; bounded local store, shared through Redis when configured |
 | HTTP hardening | Yes | **8 MiB** request cap (vision/audio), 8 MiB upstream cap, trailing-JSON rejection, CORS allowlist, `nosniff`/`DENY`/`no-referrer`; config and admin stay strict on unknown fields |
 | Deployment | Manifests | Dockerfile (non-root, read-only root FS in K8s), Deployment/HPA/PDB/ServiceMonitor/NetworkPolicy/ServiceAccount/topology spread; multi-arch image, SBOM and cosign signing on tag. **No Helm/Terraform** |
 | Persistence / tenancy / billing | **No** | Static YAML, no CRUD, no usage ledger, no reconciliation. See roadmap |
 
-Not implemented: `/v1/responses`, audio transcription, files/batches, Realtime, fine-tuning, prompt guardrails, PII redaction, idempotency keys, generic OpenAI-compatible provider, Azure/Bedrock/Vertex, UI, usage ledger, Postgres control plane.
+Not implemented: `/v1/responses`, audio transcription, files/batches, Realtime, fine-tuning, prompt guardrails, PII redaction, generic OpenAI-compatible provider, Azure/Bedrock/Vertex, UI, usage ledger, Postgres control plane.
 
 ---
 
@@ -217,6 +218,7 @@ Config is YAML with `${ENV}` expansion and strict unknown-field rejection at the
 | `rate_limit.budget.*` | `enabled`, `monthly_tokens`, `monthly_usd`, `cost_per_token_usd`, `require_shared_store`, `reservation_ttl`, `pricing.catalog`. |
 | `rate_limit.budget.pricing.catalog[]` | Rates **per 1M tokens**: input, output, embedding, optional `cache_read_*`/`cache_write_*`. Wildcards allowed. |
 | `cache.*` | `enabled`, `ttl`, `max_size`, `max_bytes`, `max_ttl`, `semantic_enabled`, `semantic_threshold`, `semantic_embedding_model`, `semantic_top_k`, `semantic_max_entries`. |
+| `idempotency.*` | `enabled`, `ttl`, `max_entries`, `max_bytes`, `entry_max_bytes`, `wait_timeout`, `lock_ttl`. Stores successful non-streaming chat/embeddings responses by `Idempotency-Key`; Redis shares them across replicas when configured. |
 | `health.*` | `readiness_cache_ttl`, `check_timeout`, `provider_timeout`, `skip_expensive_checks`. |
 | `auth.enabled/keys` | Static keys with `tenant`, mandatory `scopes`, `expires_at`. |
 | `auth.require_scopes` | Defaults to `true`. Set `false` only for a deliberate deny-all key. |
@@ -290,7 +292,7 @@ Built-in defaults already mark embedding and audio-only models as non-chat and r
 | `GET /admin/providers` | Provider list with effective per-model capabilities |
 | `GET /debug/pprof/*` | Only when `admin.pprof_enabled: true`, under the admin mux and admin auth |
 
-Hot reload covers providers, fallback, aliases, weights, capability overrides, limits, token limits, overrides, budget, pricing, cache, auth (including `auth.enabled` and the pepper), CORS, `logging.level`, the admin API key, health options and resilience. `PATCH /admin/config` exposes the subset listed above; auth, CORS and providers require a file reload (`SIGHUP`/`POST /admin/reload`). It does **not** cover `server.*`, `admin.port`, `admin.bind_address`, `admin.pprof_enabled` or `logging.format`; those require a restart and a reload that tries to change them is rejected (format only logs a warning and keeps the current handler). The file watcher retries a failed apply with backoff; a Redis outage does not block the rest of the reload.
+Hot reload covers providers, fallback, aliases, weights, capability overrides, limits, token limits, overrides, budget, pricing, cache, idempotency policy, auth (including `auth.enabled` and the pepper), CORS, `logging.level`, the admin API key, health options and resilience. `PATCH /admin/config` exposes the subset listed above; auth, CORS and providers require a file reload (`SIGHUP`/`POST /admin/reload`). It does **not** cover `server.*`, `admin.port`, `admin.bind_address`, `admin.pprof_enabled` or `logging.format`; those require a restart and a reload that tries to change them is rejected (format only logs a warning and keeps the current handler). The file watcher retries a failed apply with backoff; a Redis outage does not block the rest of the reload.
 
 Runbooks for Redis outage, provider 429/5xx, open circuits, exhausted budget, truncated streams, strict mode, admin key rotation, ETag conflicts, scopes and profiling: [`docs/RUNBOOK.md`](docs/RUNBOOK.md). Proposed SLOs and alert thresholds are there too; they are not measured yet.
 

@@ -23,6 +23,7 @@ import (
 	"github.com/fcordero/llm-api-gateway/internal/cache"
 	"github.com/fcordero/llm-api-gateway/internal/capability"
 	"github.com/fcordero/llm-api-gateway/internal/config"
+	"github.com/fcordero/llm-api-gateway/internal/idempotency"
 	"github.com/fcordero/llm-api-gateway/internal/logger"
 	"github.com/fcordero/llm-api-gateway/internal/pricing"
 	"github.com/fcordero/llm-api-gateway/internal/provider"
@@ -174,6 +175,10 @@ func main() {
 	mux.Handle("GET /metrics", proxy.NewMetricsHandler())
 
 	var handler http.Handler = mux
+	// Idempotency sits inside auth/rate-limit so keys are tenant-scoped and a
+	// replay still consumes the request bucket but never a provider call.
+	idemManager := idempotency.New(idempotencyConfig(cfg), redisStore)
+	handler = idempotency.Middleware(idemManager, handler)
 	// Keep this wrapper installed so admin/SIGHUP hot-reload can toggle the
 	// feature without rebuilding the HTTP server.
 	handler = proxy.RateLimitWithEnabled(limiter, overrideStore, rateLimitEnabled, handler)
@@ -261,6 +266,9 @@ func main() {
 
 		// atomically update registry in place
 		registry.ReloadWithCapabilities(newProviders, newCfg.ModelAliases, newWeighted, buildCapabilityTables(newCfg))
+
+		// update idempotency policy; entries are dropped if limits change
+		idemManager.UpdateConfig(idempotencyConfig(newCfg))
 
 		// update limiter and overrides
 		limiter.UpdateLimits(newCfg.RateLimit.RequestsPerMinute, newCfg.RateLimit.Burst)
@@ -633,6 +641,19 @@ func buildCapabilityTables(cfg *config.Config) map[string]capability.Table {
 		tables[name] = capability.NewTable(name, pc.Capabilities)
 	}
 	return tables
+}
+
+func idempotencyConfig(cfg *config.Config) idempotency.Config {
+	c := cfg.Idempotency
+	return idempotency.Config{
+		Enabled:       c.Enabled,
+		TTL:           c.TTL,
+		MaxEntries:    c.MaxEntries,
+		MaxBytes:      c.MaxBytes,
+		EntryMaxBytes: c.EntryMaxBytes,
+		WaitTimeout:   c.WaitTimeout,
+		LockTTL:       c.LockTTL,
+	}
 }
 
 // buildProviders constructs a Provider for each configured backend that has

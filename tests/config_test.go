@@ -119,6 +119,31 @@ func TestConfig_ProviderCapabilitiesRejectInvalidValues(t *testing.T) {
 	}
 }
 
+func TestConfig_IdempotencyDefaultsAndOverrides(t *testing.T) {
+	cfg, err := loadConfig(t, baseConfigYAML(`
+idempotency:
+  enabled: true
+  ttl: 30s
+`))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !cfg.Idempotency.Enabled || cfg.Idempotency.TTL != 30*time.Second {
+		t.Fatalf("idempotency = %+v", cfg.Idempotency)
+	}
+	if cfg.Idempotency.MaxEntries == 0 || cfg.Idempotency.MaxBytes == 0 || cfg.Idempotency.EntryMaxBytes == 0 {
+		t.Fatalf("idempotency defaults not applied: %+v", cfg.Idempotency)
+	}
+
+	invalid := strings.Replace(baseConfigYAML(""), "logging:", `idempotency:
+  max_bytes: 10
+  entry_max_bytes: 100
+logging:`, 1)
+	if _, err := loadConfig(t, invalid); err == nil {
+		t.Fatal("entry_max_bytes > max_bytes was accepted")
+	}
+}
+
 func TestConfig_AdminKeyRequiredUnlessInsecure(t *testing.T) {
 	t.Setenv("ADMIN_API_KEY", "")
 	content := strings.Replace(baseConfigYAML(""), "  api_key: admin-test-key\n", "", 1)

@@ -399,6 +399,7 @@ Métricas reales (`internal/metrics/metrics.go`):
 | `gateway_cache_hits_total` | counter | `result` (`hit\|miss`) | efectividad |
 | `gateway_cache_size` | gauge | — | entradas (memoria; Redis cuenta claves con SCAN cacheado 30 s) |
 | `gateway_capability_mismatches_total` | counter | `provider,capability,action` (`request_rejected\|fallback_skipped`) | 400 por capacidad o fallback descartado |
+| `gateway_idempotency_requests_total` | counter | `result` (`miss\|replay\|conflict\|in_progress\|invalid\|bypass`) | efectividad de `Idempotency-Key` |
 | `gateway_stream_ttft_seconds` | histogram | `provider` | time to first token SSE |
 | `gateway_stream_duration_seconds` | histogram | `provider` | duración del stream, incluidos los cortados |
 
@@ -440,6 +441,11 @@ ningún modelo con la capacidad requerida (tools, visión, audio, `json_schema` 
 `json_object`): revisa `providers.<name>.capabilities` y `model_aliases`.
 `action="request_rejected"` es un 400 `model_capability_mismatch`; si el modelo sí soporta
 la capacidad, corrige el override.
+
+`gateway_idempotency_requests_total{result="conflict"}` o `in_progress` indica clientes que
+reutilizan la misma `Idempotency-Key` con cuerpos distintos o que reintentan demasiado rápido;
+`result="miss"` con `replay` bajo significa que la ventana `idempotency.ttl` es corta para su
+patrón de reintentos.
 
 **No existe** hoy una métrica de budget restante, de tamaño de cola, de Redis up/down ni de latencia separada del upstream. No inventes paneles con esos nombres; están en el backlog (R-14, R-27, R-28).
 

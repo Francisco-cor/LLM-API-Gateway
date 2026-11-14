@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logged and counted in `gateway_capability_mismatches_total`. Weighted routing
   filters incompatible providers, and `GET /admin/providers` exposes the
   effective set per model.
+- **Idempotency-Key (R-03):** non-streaming chat and embeddings requests can
+  carry `Idempotency-Key`. A successful response is stored for
+  `idempotency.ttl` (bounded LRU, optional Redis for replicas) and replayed
+  with `Idempotent-Replayed: true`; reusing the key with a different body
+  returns `409 idempotency_key_reuse`, and a duplicate that cannot wait for the
+  in-flight leader returns `409 idempotency_in_progress` with `Retry-After: 1`.
+  Concurrent duplicates are coalesced with a local lock plus a Redis `SET NX`
+  lock; Redis failures degrade to per-process dedupe. Streaming bypasses the
+  store. New metric: `gateway_idempotency_requests_total`.
 - **OpenAPI contract gate in CI:** Redocly lints `api/openapi.yaml` with zero
   warnings allowed, and `oasdiff breaking --fail-on ERR` compares the spec with
   the PR base branch (or `HEAD^` on direct pushes). Breaking changes require the

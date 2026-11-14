@@ -16,7 +16,7 @@ No es todavía un **producto SaaS multi-tenant**. Le faltan las cosas que no se 
 - no hay **ledger de uso**: el budget se calcula con contadores mensuales en memoria/Redis, sin eventos auditables ni reconciliación;
 - el routing ya conoce capacidades por modelo (tools/visión/audio/JSON/embeddings) y las respeta en fallback, pero no hay routing por coste, latencia ni tenant;
 - el soporte multi-proveedor es **tres adaptadores hardcodeados** (`openai`, `anthropic`, `gemini`) en `cmd/gateway/main.go`, no un registro genérico;
-- no hay **idempotencia**, **límites de concurrencia/backpressure**, **SSRF guard** para `base_url`, **secret manager**, **PII**, **Helm/Terraform**, **UI**, **conformance con SDKs oficiales** ni **SLOs medidos**.
+- no hay **límites de concurrencia/backpressure**, **SSRF guard** para `base_url`, **secret manager**, **PII**, **Helm/Terraform**, **UI**, **conformance con SDKs oficiales** ni **SLOs medidos**.
 
 **Para enseñar en una entrevista:** excelente. Enseña decisiones reales de ingeniería y sus trade-offs.
 **Para vender como producto:** beta incompleto. Lo que hay que arreglar primero no es más código de proxy; es control plane, persistencia, cuotas y confianza operativa.
@@ -40,7 +40,7 @@ Niveles: **prototipo** (funciona en local, sin garantías), **beta** (usable con
 
 | Dimensión | Nivel | Evidencia verificable | Qué falta para profesional |
 |---|---|---|---|
-| Contrato HTTP OpenAI | **beta** | `POST /v1/chat/completions`, `/v1/embeddings`, `GET /v1/models`; contrato tolerante a campos desconocidos; `api/openapi.yaml` 1.1.1 con `param`, `index`, usage details y `json_schema` | Conformance contra SDKs oficiales en CI; idempotencia; versionado de contrato; `/v1/responses`, audio, batches fuera de alcance |
+| Contrato HTTP OpenAI | **beta** | `POST /v1/chat/completions`, `/v1/embeddings`, `GET /v1/models`; contrato tolerante a campos desconocidos; `api/openapi.yaml` 1.1.1 con `param`, `index`, usage details, `json_schema` e idempotencia | Conformance contra SDKs oficiales en CI; versionado de contrato; `/v1/responses`, audio, batches fuera de alcance |
 | Proveedores | **prototipo** | 3 adaptadores en `buildProviders`; interfaz `Provider` + `Embedder`; salud por proveedor | Registro genérico OpenAI-compatible, Azure/Bedrock/Vertex, presets (Groq, DeepSeek, OpenRouter, Ollama, vLLM), fixtures de contrato por proveedor |
 | Routing | **beta** | exacto, glob/regex, `routing.weighted`, aliases, auto-discovery, capability registry con fallback restringido | Routing por coste, latencia y tenant; canary por cabecera; presupuesto de contexto |
 | Resiliencia | **beta** | retry 3× con jitter, circuit 5→30 s, hedge 300 ms (no-stream), fallback antes del primer chunk SSE, streaming truncado honesto | Backpressure, bulkheads, timeouts por ruta, presupuesto de reintentos global, hedge en streaming |
@@ -240,6 +240,7 @@ Prioridad: **P0** bloquea adopción; **P1** necesaria para operar; **P2** mejora
 | ID | Estado | Evidencia / qué falta |
 |---|---|---|
 | R-01 | **Cerrado** | `redocly lint --max-problems 0` (OpenAPI 3.1, zero warnings) y `oasdiff breaking --fail-on ERR` contra la rama base del PR o `HEAD^` en push directo, en el job `openapi` de CI. Los cambios incompatibles intencionados requieren el marcador `[openapi-breaking-approved]`. Local: `make openapi-lint` / `make openapi-breaking`. |
+| R-03 | **Cerrado** | `internal/idempotency`: `Idempotency-Key` por tenant+ruta, fingerprint del body, replay de 2xx con `Idempotent-Replayed`, 409 `idempotency_key_reuse`/`in_progress`, single-flight local + lock Redis `SET NX`; store LRU acotado + Redis. Tests unitarios, de middleware y de integración cross-réplica. |
 | R-04 | **Parcial** | Gate de cobertura al 55 % con `-coverpkg=./...` y job de integración Redis opt-in; falta el e2e con upstream falso. |
 | R-07 | **Parcial** | Keys de tenant y admin key se recargan en caliente; el solape entre réplicas y la revocación ≤ 5 s requieren control plane. |
 | R-09 | **Parcial** | Audit `admin_audit` con actor fingerprint, acción y detalle; es log de proceso, no tabla persistente ni identidad de operador. |
@@ -250,7 +251,7 @@ Prioridad: **P0** bloquea adopción; **P1** necesaria para operar; **P2** mejora
 | R-23 | **Parcial** | Strict valida https, hosts privados/loopback/link-local y metadata, con `allow_private`; faltan DNS pinning y allowlist de redirects. |
 | R-26 | **Parcial** | Admin key rota sin reiniciar; `/metrics` sigue sin autenticación. |
 
-Todo lo demás (R-02, R-03, R-05, R-06, R-08, R-10–R-12, R-14, R-18–R-22, R-24, R-25, R-27–R-30) sigue **pendiente**.
+Todo lo demás (R-02, R-05, R-06, R-08, R-10–R-12, R-14, R-18–R-22, R-24, R-25, R-27–R-30) sigue **pendiente**.
 
 **Fuera de alcance hasta que lo pidan clientes:** operador de Kubernetes, plugins WASM, facturación con Stripe, multi-región activo-activo, fine-tuning, batches, realtime API.
 
@@ -445,6 +446,7 @@ Commits de la rama `docs/final` (docs) sobre `main` en `f8663d0`; los cambios de
 | Hot reload | `auth.enabled`, CORS, `logging.level`, admin key/pepper; bind/port/pprof/formato requieren reinicio; watcher con reintento; Redis no bloquea | `cmd/gateway/main.go`, `internal/config/config.go` |
 | Auth/seguridad | Scopes fail-closed, allowlist, keys ≥32, pepper, throttle 401, strict mode, validación `base_url`, ETag/audit/rotación admin, pprof opt-in, bind loopback | `internal/auth/*`, `internal/admin/server.go`, `internal/config/config.go`, ADR-005 |
 | Capacidades | `capability.Set/Table` con defaults por proveedor y overrides por modelo/glob; 400 `model_capability_mismatch` antes de llamar; fallback/hedge/streaming filtran por capacidad; `/admin/providers` expone el set; métrica `gateway_capability_mismatches_total` | `internal/capability/*`, `internal/proxy/router.go`, `internal/proxy/handler.go` |
+| Idempotencia | `Idempotency-Key` en chat no-stream y embeddings; replay 2xx con `Idempotent-Replayed`; 409 en reuso o duplicado en vuelo; store LRU acotado + Redis cross-réplica; métrica `gateway_idempotency_requests_total` | `internal/idempotency/*`, `cmd/gateway/main.go` |
 | CI/deploy | golangci-lint v2, cobertura `-coverpkg` + gate 55 %, Redis service, gate OpenAPI (Redocly cero warnings + oasdiff breaking), multiarch+SBOM+cosign, NetworkPolicy/SA/topology, perfil prod, `GATEWAY_ENV`/`GATEWAY_REPLICAS`, ConfigMap con `redis_url` | `.github/workflows/*`, `deploy/k8s/*`, `docker-compose.yaml` |
 | Docs | README/RUNBOOK/ARCHITECTURE/OpenAPI/SECURITY/CONTRIBUTING/BENCH/ROADMAP sincronizados; ADR-005; cobertura medida 66.0 % y benchmarks locales | este repo |
 | Tests | Cobertura real 66.0 % (`-coverpkg=./...`, 2026-11-13, `f8663d0`); suite de integración Redis con `-tags=integration` (requiere `REDIS_URL`) | `go test ./... -coverpkg=./...`, `go test -tags=integration ./...` |
