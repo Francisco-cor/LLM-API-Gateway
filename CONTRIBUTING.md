@@ -4,7 +4,7 @@ Thanks for taking the time to improve the gateway. This document describes how t
 
 ## Prerequisites
 
-- **Go 1.24** (`go.mod` pins the language version).
+- **Go 1.26** (`go.mod` pins the language version).
 - Optional: Docker + Docker Compose for the container profile.
 - Optional: Redis 7 for distributed rate limit/budget/cache.
 - Optional: `golangci-lint`, `govulncheck`, `air` for the local dev loop.

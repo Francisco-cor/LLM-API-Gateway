@@ -1,7 +1,7 @@
 # LLM API Gateway
 
 [![CI](https://github.com/Francisco-cor/LLM-API-Gateway/actions/workflows/ci.yaml/badge.svg)](https://github.com/Francisco-cor/LLM-API-Gateway/actions/workflows/ci.yaml)
-[![Go 1.24](https://img.shields.io/badge/go-1.24-blue.svg)](go.mod)
+[![Go 1.26](https://img.shields.io/badge/go-1.26-blue.svg)](go.mod)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 **One OpenAI-compatible endpoint in front of OpenAI, Anthropic and Gemini.** Point an OpenAI SDK at the gateway, keep your client code, and get fallback, streaming, rate limits, budgets, caching and observability without adopting a Python proxy stack.
@@ -279,7 +279,7 @@ Runbooks for Redis outage, provider 429/5xx, open circuits, exhausted budget, tr
 
 Microbenchmarks exist for the limiter, the in-memory cache and the cache-key builder. They measure those components, **not gateway throughput**, and the repository still has no committed end-to-end load test.
 
-Last measured locally on **2026-11-13**, commit `f8663d0`, inside `golang:1.24-alpine` on an **AMD Ryzen 5 3600X (12 threads)**, `go test ./tests -run '^$' -bench=. -benchmem -count=3`:
+Last measured locally on **2026-11-13**, commit `f8663d0`, inside `golang:1.24-alpine` (Go 1.24) on an **AMD Ryzen 5 3600X (12 threads)**, `go test ./tests -run '^$' -bench=. -benchmem -count=3`:
 
 | Benchmark | Range over 3 runs | Allocations |
 |---|---|---|
@@ -312,7 +312,7 @@ make vulncheck
 
 The contract suite runs against `httptest`-backed providers with no external network: response shape, SSE `[DONE]` and truncated-stream errors, the 400/404/413/429/502/503 mapping, unknown-model 404, tolerant unknown fields, validation and `Retry-After`. The Redis integration suite is opt-in with `-tags=integration` and requires `REDIS_URL`; if no integration-tagged files are present, the command still succeeds and runs the normal suite.
 
-CI runs tests with `-race`, measures coverage with `-coverpkg=./...`, enforces a **55 % floor**, runs golangci-lint v2 and govulncheck, and builds the image. This session measured **66.0 %** (`go test ./... -coverpkg=./...`, 2026-11-13, commit `f8663d0`, Go 1.24 in Docker). Coverage is a floor, not a quality claim.
+CI runs tests with `-race`, measures coverage with `-coverpkg=./...`, enforces a **55 % floor**, runs golangci-lint v2 and govulncheck, and builds the image. This session measured **66.3 %** (`go test ./... -coverpkg=./...`, 2026-11-13, Go 1.26 in Docker). Coverage is a floor, not a quality claim.
 
 ---
 
