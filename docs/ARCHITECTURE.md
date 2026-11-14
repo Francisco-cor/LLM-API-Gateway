@@ -1,6 +1,6 @@
 # Architecture — LLM API Gateway
 
-> **Version:** 1.2 · **Date:** 2026-11-13 · **Stack:** Go 1.24, `net/http`, `prometheus/client_golang`, `go-redis/v9`, OpenTelemetry, `yaml.v3`
+> **Version:** 1.2 · **Date:** 2026-11-13 · **Stack:** Go 1.26, `net/http`, `prometheus/client_golang`, `go-redis/v9`, OpenTelemetry, `yaml.v3`
 > This doc follows C4: Context → Container → Component. It describes what the code does today, including its limits.
 
 ---

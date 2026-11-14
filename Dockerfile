@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1.7
 # TODO(supply-chain): pin both base images by digest, e.g.
-#   FROM golang:1.24-alpine@sha256:<digest> AS builder
+#   FROM golang:1.26-alpine@sha256:<digest> AS builder
 # Digests are intentionally not invented here; resolve them with
-#   docker buildx imagetools inspect golang:1.24-alpine
+#   docker buildx imagetools inspect golang:1.26-alpine
 # and update this file (and Dependabot/digest automation) when pinning.
 
-ARG GO_VERSION=1.24
+ARG GO_VERSION=1.26
 
 FROM golang:${GO_VERSION}-alpine AS builder
 WORKDIR /src
