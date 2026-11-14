@@ -109,6 +109,17 @@ The current wiring is explicit in `cmd/gateway/main.go:buildProviders`. A new ad
 
 A generic OpenAI-compatible adapter and capability metadata are planned (roadmap R-18/R-15); until then, avoid adding provider-specific branches to the core handler.
 
+## API contract changes
+
+`api/openapi.yaml` is the public contract, not generated documentation: change it in the same commit as the Go handler. CI runs two gates in the `openapi` job:
+
+```bash
+make openapi-lint      # Redocly, zero warnings
+make openapi-breaking  # oasdiff vs origin/main (override with OPENAPI_BASE=...)
+```
+
+Removing a path, operation, required parameter, response code or widening a request/response schema is a breaking change. The gate fails unless the PR title/body or commit message carries `[openapi-breaking-approved]`; use that marker only for an intentional, documented break (CHANGELOG + migration note).
+
 ## Security
 
 Do not open a public issue for a vulnerability. Use the repository's **private security advisory** flow described in [`SECURITY.md`](SECURITY.md). Do not include secrets in a PR, an issue, a log excerpt or a test fixture. If you need to test a secret-handling path, use a dummy value and assert that it is redacted.

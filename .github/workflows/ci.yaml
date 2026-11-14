@@ -88,6 +88,77 @@ jobs:
           only-new-issues: false
           args: --timeout=5m
 
+  openapi:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Lint OpenAPI contract (zero warnings)
+        # The spec is reviewed surface, so warnings are failures here. Pin the
+        # image by digest; keep the tag for human readability.
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work \
+            redocly/cli:2.78.0@sha256:ab4ca2d6d1cfb316677b79ae6462132a7e4c496037b7eb405ca7d3818fe9346d \
+            lint api/openapi.yaml --max-problems 0
+      - name: Detect breaking OpenAPI changes
+        # Comparison baseline: the PR base branch, or the previous commit on a
+        # direct push. Intentional breaks must carry the explicit marker.
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$BASE_REF" ]; then
+            git fetch --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+            base_desc="origin/$BASE_REF"
+          elif git rev-parse --verify -q HEAD^ >/dev/null; then
+            base_desc="HEAD^"
+          else
+            echo "No base revision available; skipping the breaking-change check."
+            exit 0
+          fi
+
+          if ! git cat-file -e "$base_desc:api/openapi.yaml" 2>/dev/null; then
+            echo "No api/openapi.yaml at $base_desc; skipping the breaking-change check."
+            exit 0
+          fi
+
+          git show "$base_desc:api/openapi.yaml" > "$RUNNER_TEMP/openapi-base.yaml"
+          if cmp -s "$RUNNER_TEMP/openapi-base.yaml" api/openapi.yaml; then
+            echo "api/openapi.yaml is unchanged vs $base_desc."
+            exit 0
+          fi
+
+          mkdir -p "$RUNNER_TEMP/base"
+          mv "$RUNNER_TEMP/openapi-base.yaml" "$RUNNER_TEMP/base/openapi.yaml"
+          echo "Comparing api/openapi.yaml against $base_desc."
+
+          set +e
+          docker run --rm \
+            -v "$PWD/api:/head:ro" \
+            -v "$RUNNER_TEMP/base:/base:ro" \
+            tufin/oasdiff:v1.37.0@sha256:ff02af37a254b5199b9d72e7bba93dae5837a9119d59459168d1398893b47aea \
+            breaking --fail-on ERR --format githubactions \
+            /base/openapi.yaml /head/openapi.yaml
+          status=$?
+          set -e
+
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+          if printf '%s\n%s\n%s' "$PR_TITLE" "$PR_BODY" "$COMMIT_MESSAGE" | grep -qF '[openapi-breaking-approved]'; then
+            echo "::warning::Breaking OpenAPI changes accepted via the [openapi-breaking-approved] marker."
+            exit 0
+          fi
+          echo "::error::Breaking OpenAPI change detected. Only add [openapi-breaking-approved] to the PR title/body or commit message when the break is intentional."
+          exit "$status"
+
   vulncheck:
     runs-on: ubuntu-24.04
     permissions:

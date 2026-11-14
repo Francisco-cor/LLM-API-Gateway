@@ -54,9 +54,13 @@ servers:
     description: Admin API (loopback by default)
 tags:
   - name: OpenAI compatibility
+    description: OpenAI-compatible data plane endpoints.
   - name: Health
+    description: Probe and per-provider health endpoints on the public listener.
   - name: Admin
+    description: Control plane operations, served on the admin listener.
   - name: Observability
+    description: Prometheus exposition on the public listener.
 
 paths:
   /v1/chat/completions:
@@ -103,17 +107,20 @@ paths:
                 $ref: '#/components/schemas/ChatCompletionResponse'
             text/event-stream:
               schema:
-                type: string
+                $ref: '#/components/schemas/StreamChunk'
                 description: |
-                  SSE stream. Lines are `data: {json}` separated by a blank
-                  line. Terminal frames: `data: [DONE]` on success only. On a
-                  provider failure after headers, `event: error` with an OpenAI
-                  error body and no `[DONE]`; on a silent upstream close,
-                  `code: stream_truncated`, also with no `[DONE]`.
-              example: |
-                data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1760000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},"finish_reason":null}]}
+                  Each `data:` line carries this JSON object, except the
+                  terminal `data: [DONE]` (success only) and `event: error`
+                  frames, which carry an `ErrorResponse`. See the operation
+                  description for the framing rules.
 
-                data: [DONE]
+                  Wire example:
+
+                  ```
+                  data: {"id":"chatcmpl-1","object":"chat.completion.chunk","created":1760000000,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},"finish_reason":null}]}
+
+                  data: [DONE]
+                  ```
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -209,6 +216,7 @@ paths:
       description: |
         Returns gateway metadata. `ready` flips to false during graceful drain,
         but this endpoint (and `/livez`) still returns 200.
+      security: []
       responses:
         '200':
           description: Gateway status.
@@ -227,6 +235,7 @@ paths:
         `degraded`. With `health.skip_expensive_checks`, Anthropic is reported
         as `skipped`; this still degrades the aggregate because the aggregate
         requires every status to be `healthy`.
+      security: []
       responses:
         '200':
           description: Map of provider name to status, plus optional `overall`.
@@ -240,6 +249,7 @@ paths:
       operationId: getLivez
       summary: Kubernetes liveness probe
       description: Alias of `/health`; returns 200 while the process is alive.
+      security: []
       responses:
         '200':
           description: Alive.
@@ -257,6 +267,7 @@ paths:
         Provider results are cached for `health.readiness_cache_ttl`
         (15s default, 30s in the production profile). `skipped` counts as
         healthy here.
+      security: []
       responses:
         '200':
           description: Ready.
@@ -462,25 +473,22 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
-          example:
-            error:
-              message: 'invalid JSON body: unexpected end of JSON input'
-              type: invalid_request_error
-              code: invalid_request_error
-    UnsupportedParameter:
-      description: |
-        A caller-supplied parameter cannot be represented in the selected
-        provider's native API. The offending field is reported in `param`.
-      content:
-        application/json:
-          schema:
-            $ref: '#/components/schemas/ErrorResponse'
-          example:
-            error:
-              message: 'response_format.type: json_schema is not supported by this provider'
-              type: invalid_request_error
-              code: unsupported_parameter
-              param: response_format.type
+          examples:
+            invalidJSON:
+              summary: Invalid JSON body
+              value:
+                error:
+                  message: 'invalid JSON body: unexpected end of JSON input'
+                  type: invalid_request_error
+                  code: invalid_request_error
+            unsupportedParameter:
+              summary: Parameter cannot be represented by the selected provider
+              value:
+                error:
+                  message: 'response_format.type: json_schema is not supported by this provider'
+                  type: invalid_request_error
+                  code: unsupported_parameter
+                  param: response_format.type
     Unauthorized:
       description: Missing/invalid/expired API key.
       content:

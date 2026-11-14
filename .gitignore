@@ -7,6 +7,7 @@ dist/
 config.local.yaml
 coverage.out
 coverage.html
+tmp/
 *.test
 *.prof
 *.pprof

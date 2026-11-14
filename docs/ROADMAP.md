@@ -239,7 +239,7 @@ Prioridad: **P0** bloquea adopción; **P1** necesaria para operar; **P2** mejora
 
 | ID | Estado | Evidencia / qué falta |
 |---|---|---|
-| R-01 | **Parcial** | `api/openapi.yaml` 1.1.1 actualizado y validado con PyYAML en local; falta el job de CI que valide el contrato y detecte cambios incompatibles (los workflows no se tocaron en esta sesión). |
+| R-01 | **Cerrado** | `redocly lint --max-problems 0` (OpenAPI 3.1, zero warnings) y `oasdiff breaking --fail-on ERR` contra la rama base del PR o `HEAD^` en push directo, en el job `openapi` de CI. Los cambios incompatibles intencionados requieren el marcador `[openapi-breaking-approved]`. Local: `make openapi-lint` / `make openapi-breaking`. |
 | R-04 | **Parcial** | Gate de cobertura al 55 % con `-coverpkg=./...` y job de integración Redis opt-in; falta el e2e con upstream falso. |
 | R-07 | **Parcial** | Keys de tenant y admin key se recargan en caliente; el solape entre réplicas y la revocación ≤ 5 s requieren control plane. |
 | R-09 | **Parcial** | Audit `admin_audit` con actor fingerprint, acción y detalle; es log de proceso, no tabla persistente ni identidad de operador. |
@@ -416,7 +416,7 @@ Un release se etiqueta solo si:
 
 ## 8. Qué haría primero (orden de ejecución real)
 
-1. **R-01/R-02/R-04** (1 semana): congelar el contrato y la verdad reproducible. Barato y mejora todo lo demás.
+1. **R-02/R-04** (1 semana): congelar la conformidad con SDKs y el e2e; R-01 ya está cerrado. Barato y mejora todo lo demás.
 2. **R-05/R-06/R-07** (3–4 semanas): Postgres, tenants y keys. Sin esto no hay producto.
 3. **R-10/R-11/R-14** (2–3 semanas): ledger y cuotas. Es lo que convierte “gateway bonito” en “servicio facturable”.
 4. **R-15/R-16/R-18** (2–3 semanas): capacidades y proveedor genérico. Aquí el producto se vuelve útil fuera de OpenAI.
@@ -441,7 +441,7 @@ Commits de la rama `docs/final` (docs) sobre `main` en `f8663d0`; los cambios de
 | Caché | `max_bytes`, `max_ttl`, single-flight, semántico sin doble embedding, stats Redis reales | `internal/cache/*` |
 | Hot reload | `auth.enabled`, CORS, `logging.level`, admin key/pepper; bind/port/pprof/formato requieren reinicio; watcher con reintento; Redis no bloquea | `cmd/gateway/main.go`, `internal/config/config.go` |
 | Auth/seguridad | Scopes fail-closed, allowlist, keys ≥32, pepper, throttle 401, strict mode, validación `base_url`, ETag/audit/rotación admin, pprof opt-in, bind loopback | `internal/auth/*`, `internal/admin/server.go`, `internal/config/config.go`, ADR-005 |
-| CI/deploy | golangci-lint v2, cobertura `-coverpkg` + gate 55 %, Redis service, multiarch+SBOM+cosign, NetworkPolicy/SA/topology, perfil prod, `GATEWAY_ENV`/`GATEWAY_REPLICAS`, ConfigMap con `redis_url` | `.github/workflows/*`, `deploy/k8s/*`, `docker-compose.yaml` |
+| CI/deploy | golangci-lint v2, cobertura `-coverpkg` + gate 55 %, Redis service, gate OpenAPI (Redocly cero warnings + oasdiff breaking), multiarch+SBOM+cosign, NetworkPolicy/SA/topology, perfil prod, `GATEWAY_ENV`/`GATEWAY_REPLICAS`, ConfigMap con `redis_url` | `.github/workflows/*`, `deploy/k8s/*`, `docker-compose.yaml` |
 | Docs | README/RUNBOOK/ARCHITECTURE/OpenAPI/SECURITY/CONTRIBUTING/BENCH/ROADMAP sincronizados; ADR-005; cobertura medida 66.0 % y benchmarks locales | este repo |
 | Tests | Cobertura real 66.0 % (`-coverpkg=./...`, 2026-11-13, `f8663d0`); suite de integración Redis con `-tags=integration` (requiere `REDIS_URL`) | `go test ./... -coverpkg=./...`, `go test -tags=integration ./...` |
 

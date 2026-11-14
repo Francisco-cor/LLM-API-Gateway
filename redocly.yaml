@@ -1,0 +1,11 @@
+# Lint contract for api/openapi.yaml. CI runs:
+#   redocly lint api/openapi.yaml --max-problems 0
+extends:
+  - recommended
+rules:
+  # Localhost is the shipped default of a self-hosted gateway, so the spec
+  # documents the real default listeners rather than a public placeholder.
+  no-server-example.com: off
+  # /health, /health/providers, /livez, /readyz and /metrics have no 4xx by
+  # design: they are public probes/exposition endpoints.
+  operation-4xx-response: off

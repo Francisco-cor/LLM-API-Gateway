@@ -1,7 +1,10 @@
-.PHONY: build run test test-race test-integration cover lint lint-fix bench vulncheck sbom docker-build docker docker-run clean dev
+.PHONY: build run test test-race test-integration cover lint lint-fix bench vulncheck sbom docker-build docker docker-run clean dev openapi-lint openapi-breaking
 
 GO ?= go
 LINT_VERSION ?= v2.15.0
+REDOCLY_IMAGE ?= redocly/cli:2.78.0
+OASDIFF_IMAGE ?= tufin/oasdiff:v1.37.0
+OPENAPI_BASE ?= origin/main
 
 build:
 	$(GO) build -trimpath -o bin/gateway ./cmd/gateway
@@ -41,6 +44,21 @@ lint-fix:
 
 bench:
 	$(GO) test ./... -bench=. -benchmem
+
+# Contract gates for api/openapi.yaml. Both run in Docker so the host needs no
+# Node/Go toolchain.
+openapi-lint:
+	docker run --rm -v "$(CURDIR):/work" -w /work $(REDOCLY_IMAGE) \
+		lint api/openapi.yaml --max-problems 0
+
+# Compare the working tree against OPENAPI_BASE (default origin/main). Fails on
+# breaking changes. Intentional breaks must carry [openapi-breaking-approved]
+# in the PR title/body or commit message, which CI checks.
+openapi-breaking:
+	@mkdir -p tmp
+	@git show "$(OPENAPI_BASE):api/openapi.yaml" > tmp/openapi-base.yaml
+	docker run --rm -v "$(CURDIR)/tmp:/base:ro" -v "$(CURDIR)/api:/head:ro" \
+		$(OASDIFF_IMAGE) breaking --fail-on ERR /base/openapi-base.yaml /head/openapi.yaml
 
 vulncheck:
 	@command -v govulncheck >/dev/null 2>&1 || { \

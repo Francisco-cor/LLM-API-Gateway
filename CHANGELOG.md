@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Nothing yet. The next milestone is the Postgres control plane and the usage
+### Added
+
+- **OpenAPI contract gate in CI:** Redocly lints `api/openapi.yaml` with zero
+  warnings allowed, and `oasdiff breaking --fail-on ERR` compares the spec with
+  the PR base branch (or `HEAD^` on direct pushes). Breaking changes require the
+  explicit `[openapi-breaking-approved]` marker. Local equivalents:
+  `make openapi-lint` and `make openapi-breaking`.
+- **Spec fixes for the stricter lint:** health probes declare `security: []`,
+  tags have descriptions, the SSE schema references `StreamChunk`, and
+  `unsupported_parameter` is documented as a `BadRequest` example instead of an
+  unused response component.
+
+Nothing else yet. The next milestone is the Postgres control plane and the usage
 ledger; see `docs/ROADMAP.md`.
 
 ## [v1.1.1] - 2026-11-13
