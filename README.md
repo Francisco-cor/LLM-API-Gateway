@@ -158,6 +158,7 @@ More runnable clients: [`examples/curl`](examples/curl), [`examples/openai-pytho
 | Observability | Yes | Prometheus metrics (incl. stream TTFT/duration), OTLP/gRPC traces, `slog` with `request_id`/tenant/provider/latency; **`/metrics` is unauthenticated** |
 | Auth | Yes | Static tenant keys, mandatory scopes (fail-closed), expiry, HMAC-SHA256 pepper (`auth.key_pepper` / `AUTH_KEY_PEPPER`), 32-char minimum in production, per-IP 401 throttle |
 | Idempotency | Yes | `Idempotency-Key` on non-streaming chat/embeddings; successful responses replayed, `409` on key reuse or in-flight duplicate; bounded local store, shared through Redis when configured |
+| Conformance | Yes | Official `openai` Python and Node SDKs against the real gateway + fake upstream: chat, streaming usage, tools, embeddings, models, 404 mapping, idempotency (`make conformance`) |
 | HTTP hardening | Yes | **8 MiB** request cap (vision/audio), 8 MiB upstream cap, trailing-JSON rejection, CORS allowlist, `nosniff`/`DENY`/`no-referrer`; config and admin stay strict on unknown fields |
 | Deployment | Manifests | Dockerfile (non-root, read-only root FS in K8s), Deployment/HPA/PDB/ServiceMonitor/NetworkPolicy/ServiceAccount/topology spread; multi-arch image, SBOM and cosign signing on tag. **No Helm/Terraform** |
 | Persistence / tenancy / billing | **No** | Static YAML, no CRUD, no usage ledger, no reconciliation. See roadmap |

@@ -118,6 +118,8 @@ make openapi-lint      # Redocly, zero warnings
 make openapi-breaking  # oasdiff vs origin/main (override with OPENAPI_BASE=...)
 ```
 
+Run `make conformance` after changing the wire contract: it drives the real gateway with the pinned official OpenAI Python and Node SDKs against a fake upstream (chat, streaming usage, tools, embeddings, models, 404 and idempotency).
+
 Removing a path, operation, required parameter, response code or widening a request/response schema is a breaking change. The gate fails unless the PR title/body or commit message carries `[openapi-breaking-approved]`; use that marker only for an intentional, documented break (CHANGELOG + migration note).
 
 ## Security

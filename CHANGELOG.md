@@ -30,6 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Concurrent duplicates are coalesced with a local lock plus a Redis `SET NX`
   lock; Redis failures degrade to per-process dedupe. Streaming bypasses the
   store. New metric: `gateway_idempotency_requests_total`.
+- **Official SDK conformance (R-02):** a new CI job builds the real gateway
+  and drives it with pinned `openai==3.51.0` (Python) and `openai@7.57.0`
+  (Node) against a stdlib fake upstream. It covers chat, streaming with usage,
+  tools, embeddings, `/v1/models`, 404 mapping and idempotency replay. Local
+  entry point: `make conformance`.
 - **OpenAPI contract gate in CI:** Redocly lints `api/openapi.yaml` with zero
   warnings allowed, and `oasdiff breaking --fail-on ERR` compares the spec with
   the PR base branch (or `HEAD^` on direct pushes). Breaking changes require the

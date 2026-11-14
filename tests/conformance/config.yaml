@@ -1,0 +1,43 @@
+# Test-only configuration for the official-SDK conformance job. Keys are
+# intentionally public dummy values; never reuse them outside this harness.
+
+server:
+  port: 18080
+  read_timeout: 10s
+  write_timeout: 30s
+
+providers:
+  openai:
+    api_key: test-upstream-key
+    base_url: http://127.0.0.1:18081/v1
+    timeout: 5s
+    models:
+      - gpt-4o
+      - gpt-4o-mini
+      - text-embedding-3-small
+    allow_private: true
+
+fallback_chain: [openai]
+
+auth:
+  enabled: true
+  keys:
+    - key: conformance-tenant-key-0123456789abcdef0123456789abcdef
+      tenant: conformance
+      scopes: ["chat:write", "embeddings:write", "models:read"]
+
+admin:
+  port: 18082
+  bind_address: 127.0.0.1
+  api_key: conformance-admin-key-0123456789abcdef0123456789abcdef
+
+idempotency:
+  enabled: true
+  ttl: 1m
+
+cache:
+  enabled: false
+
+logging:
+  level: warn
+  format: text

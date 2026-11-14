@@ -1,4 +1,4 @@
-.PHONY: build run test test-race test-integration cover lint lint-fix bench vulncheck sbom docker-build docker docker-run clean dev openapi-lint openapi-breaking
+.PHONY: build run test test-race test-integration cover lint lint-fix bench vulncheck sbom docker-build docker docker-run clean dev openapi-lint openapi-breaking conformance
 
 GO ?= go
 LINT_VERSION ?= v2.15.0
@@ -59,6 +59,11 @@ openapi-breaking:
 	@git show "$(OPENAPI_BASE):api/openapi.yaml" > tmp/openapi-base.yaml
 	docker run --rm -v "$(CURDIR)/tmp:/base:ro" -v "$(CURDIR)/api:/head:ro" \
 		$(OASDIFF_IMAGE) breaking --fail-on ERR /base/openapi-base.yaml /head/openapi.yaml
+
+# Official OpenAI SDK conformance (Python + Node) against the real gateway and
+# a stdlib fake upstream. Requires python3 and node on the host.
+conformance: build
+	./tests/conformance/run.sh
 
 vulncheck:
 	@command -v govulncheck >/dev/null 2>&1 || { \
