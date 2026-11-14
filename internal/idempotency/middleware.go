@@ -80,11 +80,20 @@ func Middleware(m *Manager, next http.Handler) http.Handler {
 			return
 		}
 
-		defer reservation.Abort()
+		if reservation == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		defer func() {
+			if reservation != nil {
+				reservation.Abort()
+			}
+		}()
 		metrics.IdempotencyRequests.WithLabelValues("miss").Inc()
 		cw := &captureWriter{w: w, max: m.Config().EntryMaxBytes}
 		next.ServeHTTP(cw, r)
-		if cw.storable() {
+		if reservation != nil && cw.storable() {
 			// The client may disconnect right after reading the response;
 			// storing it must still succeed. Redis operations have their own
 			// short timeout.
